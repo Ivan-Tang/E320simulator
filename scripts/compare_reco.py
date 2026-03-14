@@ -1,9 +1,10 @@
 """
-Compare baseline vs GNN reconstruction on the same simulated dataset.
+Compare baseline, Kalman, and GNN reconstruction on the same simulated dataset.
 
 Inputs  (all parquet files)
 ------
   --baseline    sim_baseline.parquet     (from run_baseline_on_sim.py)
+  --kalman      sim_kalman_reco.parquet  (from run_kalman_on_sim.py)
   --gnn         sim_gnn_reco.parquet     (from run_gnn_on_sim.py)
   --tracks      sim_tracks.parquet       (truth)
 
@@ -19,6 +20,7 @@ Usage
 -----
     python -m scripts.compare_reco \\
         --baseline /data/sim_baseline.parquet \\
+        --kalman   /data/sim_kalman_reco.parquet \\
         --gnn      /data/sim_gnn_reco.parquet \\
         --tracks   /data/sim_tracks.parquet   \\
         --outdir   /data/plots/
@@ -168,14 +170,21 @@ def per_event_efficiency(reco: pl.DataFrame, tracks: pl.DataFrame) -> pl.DataFra
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Plotting
+# Plotting  (N-method comparison)
 # ──────────────────────────────────────────────────────────────────────────────
 
-_COLORS = {"Baseline": "#4878CF", "GNN": "#D65F5F"}
+_COLORS = {
+    "Baseline": "#4878CF",
+    "Kalman":   "#8172B2",
+    "GNN":      "#D65F5F",
+}
+_MARKERS = {"Baseline": "o", "Kalman": "D", "GNN": "s"}
 
 
 def _bar_comparison(ax, names, values, title, ylabel, fmt=".1f"):
-    bars = ax.bar(names, values, color=[_COLORS[n] for n in names], width=0.4)
+    n = len(names)
+    w = min(0.6, 0.8 / n)
+    bars = ax.bar(names, values, color=[_COLORS.get(n_, "#999999") for n_ in names], width=w)
     ax.set_title(title)
     ax.set_ylabel(ylabel)
     for bar, val in zip(bars, values):
@@ -183,14 +192,16 @@ def _bar_comparison(ax, names, values, title, ylabel, fmt=".1f"):
             bar.get_x() + bar.get_width() / 2,
             bar.get_height() + 0.5,
             f"{val:{fmt}}",
-            ha="center", va="bottom", fontsize=11, fontweight="bold",
+            ha="center", va="bottom", fontsize=10, fontweight="bold",
         )
-    ax.set_ylim(0, max(values) * 1.25)
+    ax.set_ylim(0, max(values) * 1.25 if max(values) > 0 else 1)
 
 
-def plot_summary(metrics_bl: dict, metrics_gnn: dict, outpath: str) -> None:
+def plot_summary(method_metrics: dict[str, dict], outpath: str) -> None:
+    names = list(method_metrics.keys())
     fig, axes = plt.subplots(2, 3, figsize=(16, 9))
-    fig.suptitle("Baseline vs GNN reconstruction comparison", fontsize=14, fontweight="bold")
+    fig.suptitle("Reconstruction comparison: " + " vs ".join(names),
+                 fontsize=14, fontweight="bold")
 
     pairs = [
         ("efficiency_%",   "Track efficiency (%)",  "Efficiency (%)"),
@@ -201,8 +212,8 @@ def plot_summary(metrics_bl: dict, metrics_gnn: dict, outpath: str) -> None:
         ("rms_median_um",  "Median RMS (µm)",        "µm"),
     ]
     for ax, (key, title, ylabel) in zip(axes.flat, pairs):
-        vals = [metrics_bl[key], metrics_gnn[key]]
-        _bar_comparison(ax, ["Baseline", "GNN"], vals, title, ylabel)
+        vals = [method_metrics[n][key] for n in names]
+        _bar_comparison(ax, names, vals, title, ylabel)
 
     plt.tight_layout()
     fig.savefig(outpath, dpi=120)
@@ -210,44 +221,44 @@ def plot_summary(metrics_bl: dict, metrics_gnn: dict, outpath: str) -> None:
     plt.close(fig)
 
 
-def plot_distributions(kept_bl: pl.DataFrame, kept_gnn: pl.DataFrame, outpath: str) -> None:
-    chi2_bl  = kept_bl["chi2"].to_numpy()
-    chi2_gnn = kept_gnn["chi2"].to_numpy()
-    rms_bl   = kept_bl["rms"].to_numpy() * 1e3    # µm
-    rms_gnn  = kept_gnn["rms"].to_numpy() * 1e3
+def plot_distributions(kept_by_method: dict[str, pl.DataFrame], outpath: str) -> None:
+    names = list(kept_by_method.keys())
 
-    nl_bl  = kept_bl["n_layers"].to_numpy()
-    nl_gnn = kept_gnn["n_layers"].to_numpy()
+    chi2_data = {n: kept_by_method[n]["chi2"].to_numpy() for n in names}
+    rms_data  = {n: kept_by_method[n]["rms"].to_numpy() * 1e3 for n in names}
+    nl_data   = {n: kept_by_method[n]["n_layers"].to_numpy() for n in names}
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 4))
     fig.suptitle("Track quality distributions", fontsize=13)
 
-    kw = dict(bins=50, density=True, alpha=0.65, histtype="stepfilled")
-    chi2_max = min(np.percentile(np.concatenate([chi2_bl, chi2_gnn]), 99), 20)
+    kw = dict(bins=50, density=True, alpha=0.55, histtype="stepfilled")
+    all_chi2 = np.concatenate(list(chi2_data.values()))
+    chi2_max = min(np.percentile(all_chi2, 99), 20)
 
-    axes[0].hist(chi2_bl,  **kw, color=_COLORS["Baseline"], label="Baseline",
-                 range=(0, chi2_max))
-    axes[0].hist(chi2_gnn, **kw, color=_COLORS["GNN"],      label="GNN",
-                 range=(0, chi2_max))
+    for n in names:
+        axes[0].hist(chi2_data[n], **kw, color=_COLORS.get(n, "#999999"),
+                     label=n, range=(0, chi2_max))
     axes[0].set_xlabel("χ² / dof"); axes[0].set_ylabel("Density")
     axes[0].set_title("χ² distribution"); axes[0].legend()
 
-    rms_max = min(np.percentile(np.concatenate([rms_bl, rms_gnn]), 99), 200)
-    axes[1].hist(rms_bl,  **kw, color=_COLORS["Baseline"], label="Baseline",
-                 range=(0, rms_max))
-    axes[1].hist(rms_gnn, **kw, color=_COLORS["GNN"],      label="GNN",
-                 range=(0, rms_max))
+    all_rms = np.concatenate(list(rms_data.values()))
+    rms_max = min(np.percentile(all_rms, 99), 200)
+    for n in names:
+        axes[1].hist(rms_data[n], **kw, color=_COLORS.get(n, "#999999"),
+                     label=n, range=(0, rms_max))
     axes[1].set_xlabel("RMS (µm)"); axes[1].set_ylabel("Density")
     axes[1].set_title("Residual RMS distribution"); axes[1].legend()
 
-    nl_vals = sorted(set(nl_bl.tolist() + nl_gnn.tolist()))
-    x = np.arange(len(nl_vals))
-    w = 0.35
-    cnt_bl  = np.array([(nl_bl  == v).sum() for v in nl_vals])
-    cnt_gnn = np.array([(nl_gnn == v).sum() for v in nl_vals])
-    axes[2].bar(x - w/2, cnt_bl  / cnt_bl.sum()  * 100, w, color=_COLORS["Baseline"], label="Baseline")
-    axes[2].bar(x + w/2, cnt_gnn / cnt_gnn.sum() * 100, w, color=_COLORS["GNN"],      label="GNN")
-    axes[2].set_xticks(x); axes[2].set_xticklabels(nl_vals)
+    all_nl = sorted(set(v for arr in nl_data.values() for v in arr.tolist()))
+    x_pos = np.arange(len(all_nl))
+    n_m = len(names)
+    w = min(0.8 / n_m, 0.35)
+    for mi, n in enumerate(names):
+        cnt = np.array([(nl_data[n] == v).sum() for v in all_nl])
+        frac = cnt / cnt.sum() * 100 if cnt.sum() > 0 else cnt
+        offset = (mi - (n_m - 1) / 2) * w
+        axes[2].bar(x_pos + offset, frac, w, color=_COLORS.get(n, "#999999"), label=n)
+    axes[2].set_xticks(x_pos); axes[2].set_xticklabels(all_nl)
     axes[2].set_xlabel("n_layers"); axes[2].set_ylabel("Fraction (%)")
     axes[2].set_title("Hits per track"); axes[2].legend()
 
@@ -257,38 +268,41 @@ def plot_distributions(kept_bl: pl.DataFrame, kept_gnn: pl.DataFrame, outpath: s
     plt.close(fig)
 
 
-def plot_per_event(ev_bl: pl.DataFrame, ev_gnn: pl.DataFrame, outpath: str) -> None:
-    # align on common events
-    joined = (
-        ev_bl.select(["event_id", "eff_%", "n_fake"])
-             .rename({"eff_%": "eff_bl", "n_fake": "fake_bl"})
-             .join(
-                 ev_gnn.select(["event_id", "eff_%", "n_fake"])
-                       .rename({"eff_%": "eff_gnn", "n_fake": "fake_gnn"}),
-                 on="event_id", how="full"
-             )
-             .fill_null(0)
-             .sort("event_id")
-    )
+def plot_per_event(ev_by_method: dict[str, pl.DataFrame], outpath: str) -> None:
+    names = list(ev_by_method.keys())
 
-    eids    = joined["event_id"].to_numpy()
-    eff_bl  = joined["eff_bl"].to_numpy()
-    eff_gnn = joined["eff_gnn"].to_numpy()
-    fk_bl   = joined["fake_bl"].to_numpy()
-    fk_gnn  = joined["fake_gnn"].to_numpy()
+    # Start from the first method and successively join the rest
+    base_name = names[0]
+    joined = (
+        ev_by_method[base_name]
+        .select(["event_id", "eff_%", "n_fake"])
+        .rename({"eff_%": f"eff_{base_name}", "n_fake": f"fake_{base_name}"})
+    )
+    for n in names[1:]:
+        joined = joined.join(
+            ev_by_method[n]
+            .select(["event_id", "eff_%", "n_fake"])
+            .rename({"eff_%": f"eff_{n}", "n_fake": f"fake_{n}"}),
+            on="event_id", how="full",
+        ).fill_null(0)
+    joined = joined.sort("event_id")
+
+    eids = joined["event_id"].to_numpy()
 
     fig, axes = plt.subplots(2, 1, figsize=(14, 7), sharex=True)
     fig.suptitle("Per-event comparison", fontsize=13)
 
-    axes[0].plot(eids, eff_bl,  "o-", ms=3, lw=0.8, color=_COLORS["Baseline"], label="Baseline")
-    axes[0].plot(eids, eff_gnn, "s-", ms=3, lw=0.8, color=_COLORS["GNN"],      label="GNN")
-    axes[0].axhline(np.mean(eff_bl),  ls="--", lw=1, color=_COLORS["Baseline"], alpha=0.7)
-    axes[0].axhline(np.mean(eff_gnn), ls="--", lw=1, color=_COLORS["GNN"],      alpha=0.7)
+    for n in names:
+        c = _COLORS.get(n, "#999999")
+        m = _MARKERS.get(n, "o")
+        eff = joined[f"eff_{n}"].to_numpy()
+        fk  = joined[f"fake_{n}"].to_numpy()
+        axes[0].plot(eids, eff, f"{m}-", ms=3, lw=0.8, color=c, label=n)
+        axes[0].axhline(np.mean(eff), ls="--", lw=1, color=c, alpha=0.7)
+        axes[1].plot(eids, fk,  f"{m}-", ms=3, lw=0.8, color=c, label=n)
+
     axes[0].set_ylabel("Efficiency (%)"); axes[0].set_ylim(-5, 115)
     axes[0].legend(); axes[0].set_title("Track efficiency per event")
-
-    axes[1].plot(eids, fk_bl,  "o-", ms=3, lw=0.8, color=_COLORS["Baseline"], label="Baseline")
-    axes[1].plot(eids, fk_gnn, "s-", ms=3, lw=0.8, color=_COLORS["GNN"],      label="GNN")
     axes[1].set_xlabel("event_id"); axes[1].set_ylabel("# fake tracks")
     axes[1].legend(); axes[1].set_title("Fake tracks per event")
 
@@ -299,10 +313,11 @@ def plot_per_event(ev_bl: pl.DataFrame, ev_gnn: pl.DataFrame, outpath: str) -> N
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Summary table printer
+# Summary table printer  (N-method)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def print_table(metrics_bl: dict, metrics_gnn: dict) -> None:
+def print_table(method_metrics: dict[str, dict]) -> None:
+    names = list(method_metrics.keys())
     rows = [
         ("Truth tracks",        "n_truth",          ""),
         ("Signal tracks",       "n_signal",         ""),
@@ -320,7 +335,8 @@ def print_table(metrics_bl: dict, metrics_gnn: dict) -> None:
     ]
 
     w = 24
-    hdr = f"{'Metric':<{w}}  {'Baseline':>12}  {'GNN':>12}"
+    col_w = 12
+    hdr = f"{'Metric':<{w}}" + "".join(f"  {n:>{col_w}}" for n in names)
     sep = "─" * len(hdr)
     print("\n" + sep)
     print(hdr)
@@ -329,16 +345,14 @@ def print_table(metrics_bl: dict, metrics_gnn: dict) -> None:
         if key is None:
             print(label)
             continue
-        vb  = metrics_bl[key]
-        vg  = metrics_gnn[key]
-        fmt = ".2f" if isinstance(vb, float) else "d"
-        delta = vg - vb if isinstance(vb, float) else vg - vb
-        sign  = "+" if delta >= 0 else ""
-        print(
-            f"{label:<{w}}  {vb:>10.{2 if isinstance(vb,float) else 0}f}{unit:>2}  "
-            f"{vg:>10.{2 if isinstance(vg,float) else 0}f}{unit:>2}  "
-            f"({sign}{delta:.2f})"
-        )
+        parts = f"{label:<{w}}"
+        for n in names:
+            v = method_metrics[n][key]
+            if isinstance(v, float):
+                parts += f"  {v:>{col_w - 2}.2f}{unit:>2}"
+            else:
+                parts += f"  {v:>{col_w - 2}d}{unit:>2}"
+        print(parts)
     print(sep + "\n")
 
 
@@ -348,55 +362,76 @@ def print_table(metrics_bl: dict, metrics_gnn: dict) -> None:
 
 def compare(
     baseline_path: str,
-    gnn_path:      str,
     tracks_path:   str,
+    kalman_path:   str | None = None,
+    gnn_path:      str | None = None,
     outdir:        str | None = None,
-) -> tuple[dict, dict]:
+) -> dict[str, dict]:
     print("[compare] loading data …")
-    bl     = pl.read_parquet(baseline_path)
-    gnn    = pl.read_parquet(gnn_path)
     tracks = pl.read_parquet(tracks_path)
-    print(f"  baseline  : {len(bl):,} candidates")
-    print(f"  gnn       : {len(gnn):,} candidates")
     print(f"  tracks    : {len(tracks):,} truth tracks")
 
-    print("[compare] computing metrics …")
-    m_bl  = compute_metrics(bl,  tracks)
-    m_gnn = compute_metrics(gnn, tracks)
+    # Build ordered dict of method_name → reco DataFrame
+    reco_dfs: dict[str, pl.DataFrame] = {}
 
-    print_table(m_bl, m_gnn)
+    bl = pl.read_parquet(baseline_path)
+    reco_dfs["Baseline"] = bl
+    print(f"  baseline  : {len(bl):,} candidates")
+
+    if kalman_path is not None:
+        km = pl.read_parquet(kalman_path)
+        reco_dfs["Kalman"] = km
+        print(f"  kalman    : {len(km):,} candidates")
+
+    if gnn_path is not None:
+        gnn = pl.read_parquet(gnn_path)
+        reco_dfs["GNN"] = gnn
+        print(f"  gnn       : {len(gnn):,} candidates")
+
+    print("[compare] computing metrics …")
+    method_metrics: dict[str, dict] = {}
+    for name, rdf in reco_dfs.items():
+        method_metrics[name] = compute_metrics(rdf, tracks)
+
+    print_table(method_metrics)
 
     if outdir is None:
         outdir = str(Path(baseline_path).parent)
     os.makedirs(outdir, exist_ok=True)
     print(f"[compare] saving figures to {outdir}/")
 
-    plot_summary(m_bl, m_gnn,
+    plot_summary(method_metrics,
                  os.path.join(outdir, "comparison_summary.png"))
 
+    kept_by_method = {n: rdf.filter(pl.col("is_kept")) for n, rdf in reco_dfs.items()}
     plot_distributions(
-        bl.filter(pl.col("is_kept")),
-        gnn.filter(pl.col("is_kept")),
+        kept_by_method,
         os.path.join(outdir, "chi2_rms_distributions.png"),
     )
 
-    ev_bl  = per_event_efficiency(bl,  tracks)
-    ev_gnn = per_event_efficiency(gnn, tracks)
-    plot_per_event(ev_bl, ev_gnn,
+    ev_by_method = {n: per_event_efficiency(rdf, tracks) for n, rdf in reco_dfs.items()}
+    plot_per_event(ev_by_method,
                    os.path.join(outdir, "per_event_efficiency.png"))
 
-    return m_bl, m_gnn
+    return method_metrics
 
 
 def _cli() -> None:
-    parser = argparse.ArgumentParser(description="Compare baseline vs GNN reconstruction")
+    parser = argparse.ArgumentParser(
+        description="Compare reconstruction methods (Baseline, Kalman, GNN)"
+    )
     parser.add_argument("--baseline", required=True, help="sim_baseline.parquet")
-    parser.add_argument("--gnn",      required=True, help="sim_gnn_reco.parquet")
+    parser.add_argument("--kalman",   default=None,  help="sim_kalman_reco.parquet")
+    parser.add_argument("--gnn",      default=None,  help="sim_gnn_reco.parquet")
     parser.add_argument("--tracks",   required=True, help="sim_tracks.parquet")
     parser.add_argument("--outdir",   default=None,  help="Directory for figures")
     args = parser.parse_args()
 
-    compare(args.baseline, args.gnn, args.tracks, args.outdir)
+    compare(
+        args.baseline, args.tracks,
+        kalman_path=args.kalman, gnn_path=args.gnn,
+        outdir=args.outdir,
+    )
 
 
 if __name__ == "__main__":
