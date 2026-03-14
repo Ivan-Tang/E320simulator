@@ -20,6 +20,7 @@ from src.baseline import (
     _fit_and_score,
     _shared_hit_rejection,
 )
+from src.kalman_tracker import KalmanConfig, _process_event_kalman
 from src.train import TrainConfig, load_checkpoint
 
 
@@ -154,6 +155,46 @@ def time_hough_per_event(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Per-event timing:  Kalman
+# ──────────────────────────────────────────────────────────────────────────────
+
+def time_kalman_per_event(
+    clusters_df: pl.DataFrame,
+    cfg: KalmanConfig,
+) -> list[float]:
+    """Measure per-event timing for Kalman filter method."""
+
+    event_times = []
+
+    eid_arr = clusters_df["event_id"].to_numpy()
+    x_arr = clusters_df["x_trk_mm"].to_numpy()
+    y_arr = clusters_df["y_trk_mm"].to_numpy()
+    z_arr = clusters_df["z_trk_mm"].to_numpy()
+    lid_arr = clusters_df["layer_id"].to_numpy().astype(np.int8)
+    nid_arr = clusters_df["node_id"].to_numpy()
+
+    unique_events, starts = np.unique(eid_arr, return_index=True)
+    counts = np.diff(np.append(starts, len(eid_arr)))
+
+    for i in range(len(unique_events)):
+        s, c_ = int(starts[i]), int(counts[i])
+        eid = int(unique_events[i])
+        xv = x_arr[s : s + c_]
+        yv = y_arr[s : s + c_]
+        zv = z_arr[s : s + c_]
+        lv = lid_arr[s : s + c_]
+        nv = nid_arr[s : s + c_]
+
+        t_start = time.perf_counter()
+        candidates = _process_event_kalman(eid, xv, yv, zv, lv, nv, cfg)
+        t_elapsed = time.perf_counter() - t_start
+
+        event_times.append(t_elapsed * 1000)  # convert to ms
+
+    return event_times
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Per-event timing:  GNN
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -272,7 +313,7 @@ def compare_timing(
     gnn_threshold: float = 0.5,
     gnn_device: str = "cpu",
 ):
-    """Compare timing between baseline, Hough, and GNN methods."""
+    """Compare timing between baseline, Hough, Kalman, and GNN methods."""
     
     print(f"\n{'='*70}")
     print(f"  Timing comparison on {suffix} set")
@@ -294,7 +335,12 @@ def compare_timing(
     # Time Hough method
     print("Timing Hough method...")
     hough_cfg = HoughConfig()
+    kalman_cfg = KalmanConfig()
     hough_times = time_hough_per_event(clusters_df, hough_cfg)
+
+    # Time Kalman method
+    print("Timing Kalman method...")
+    kalman_times = time_kalman_per_event(clusters_df, kalman_cfg)
 
     # Time GNN method
     run_gnn = checkpoint_path is not None
@@ -308,6 +354,7 @@ def compare_timing(
     # ── Compute statistics ────────────────────────────────────────────────────
     baseline_times = np.array(baseline_times)
     hough_times = np.array(hough_times)
+    kalman_times = np.array(kalman_times)
     if run_gnn:
         gnn_times = np.array(gnn_times)
     
@@ -325,6 +372,7 @@ def compare_timing(
 
     _print_stats("Baseline method", baseline_times)
     _print_stats("Hough method", hough_times)
+    _print_stats("Kalman method", kalman_times)
     if run_gnn:
         _print_stats("GNN method", gnn_times)
 
@@ -334,17 +382,21 @@ def compare_timing(
     print(f"{'='*70}")
     bl_mean = baseline_times.mean()
     hg_mean = hough_times.mean()
+    km_mean = kalman_times.mean()
     print(f"\n  Hough  vs Baseline : {bl_mean / hg_mean:.2f}x")
+    print(f"  Kalman vs Baseline : {bl_mean / km_mean:.2f}x")
+    print(f"  Kalman vs Hough    : {hg_mean / km_mean:.2f}x")
     if run_gnn:
         gn_mean = gnn_times.mean()
         print(f"  GNN    vs Baseline : {bl_mean / gn_mean:.2f}x")
         print(f"  GNN    vs Hough    : {hg_mean / gn_mean:.2f}x")
+        print(f"  GNN    vs Kalman   : {km_mean / gn_mean:.2f}x")
 
     # ── build list of all methods for plotting ────────────────────────────────
-    method_names  = ["Baseline", "Hough"]
-    method_times  = [baseline_times, hough_times]
-    method_colors = ["#4C72B0", "#DD8452"]
-    method_colors_light = ["#A6C8E0", "#F4C7A3"]
+    method_names  = ["Baseline", "Hough", "Kalman"]
+    method_times  = [baseline_times, hough_times, kalman_times]
+    method_colors = ["#4C72B0", "#DD8452", "#8172B2"]
+    method_colors_light = ["#A6C8E0", "#F4C7A3", "#C4B8E0"]
     if run_gnn:
         method_names.append("GNN")
         method_times.append(gnn_times)
@@ -420,6 +472,7 @@ def compare_timing(
         'event_index': range(len(baseline_times)),
         'baseline_time_ms': baseline_times,
         'hough_time_ms': hough_times,
+        'kalman_time_ms': kalman_times,
     }
     if run_gnn:
         timing_data['gnn_time_ms'] = gnn_times
