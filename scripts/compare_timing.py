@@ -310,6 +310,7 @@ def compare_timing(
     data_dir: str,
     suffix: str = "test",
     checkpoint_path: str | None = None,
+    output_dir: str = "",
     gnn_threshold: float = 0.5,
     gnn_device: str = "cpu",
 ):
@@ -461,7 +462,7 @@ def compare_timing(
     plt.tight_layout()
     
     # Save figure
-    output_path = os.path.join(data_dir, f'timing_comparison_{suffix}.png')
+    output_path = os.path.join(output_dir, f'timing_comparison_{suffix}.png')
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     print(f"\nPlot saved to: {output_path}")
     
@@ -485,6 +486,7 @@ def compare_timing(
 if __name__ == "__main__":
     data_dir        = "/Users/IvanTang/hep/data_Run502/simulation/"
     checkpoint_path = "/Users/IvanTang/hep/data_Run502/runs/gnn/best_model.pt"
+    output_dir      = "/Users/IvanTang/hep/data_Run502/outputs/plots/"
     
     # Compare on test set (can also run on 'train')
-    compare_timing(data_dir, suffix="test", checkpoint_path=checkpoint_path)
+    compare_timing(data_dir, suffix="test", checkpoint_path=checkpoint_path, output_dir=output_dir)
