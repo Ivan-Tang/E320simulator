@@ -80,6 +80,9 @@ class SimConfig:
     ty_range: tuple[float, float] = (-0.015, 0.015)   # dy/dz
     pz_range: tuple[float, float] = (1.5, 4.0)        # GeV, placeholder
 
+    # -- multiple scattering --
+    multiple_scattering_mrad: float = 0.2
+
     # -- measurement smearing --
     sigma_x_mm: float = SIGMA_X_MM
     sigma_y_mm: float = SIGMA_Y_MM
@@ -323,15 +326,31 @@ def _generate_truth_track(rng: np.random.Generator, cfg: SimConfig) -> dict:
     }
 
 
-def _intersect_layers(track: dict) -> list[tuple[int, float, float, float]]:
-    """Propagate straight-line track to each layer; return hits inside active area."""
+def _intersect_layers(track: dict, rng: np.random.Generator, cfg: SimConfig) -> list[tuple[int, float, float, float]]:
+    """Propagate straight-line track to each layer with optional multiple scattering; return hits inside active area."""
     hits: list[tuple[int, float, float, float]] = []
-    x0, y0, tx, ty = track["x0"], track["y0"], track["tx"], track["ty"]
-    for lid, z in enumerate(Z_LAYERS):
-        x = x0 + tx * z
-        y = y0 + ty * z
+    
+    x = track["x0"]
+    y = track["y0"]
+    tx = track["tx"]
+    ty = track["ty"]
+    current_z = 0.0
+
+    for lid, next_z in enumerate(Z_LAYERS):
+        dz = next_z - current_z
+        x += tx * dz
+        y += ty * dz
+        current_z = next_z
+        
         if -X_HALF <= x <= X_HALF and -Y_HALF <= y <= Y_HALF:
-            hits.append((lid, x, y, z))
+            hits.append((lid, x, y, current_z))
+            
+        # Apply multiple scattering after passing through the layer
+        if cfg.multiple_scattering_mrad > 0:
+            ms_rad = cfg.multiple_scattering_mrad * 1e-3
+            tx += rng.normal(0, ms_rad)
+            ty += rng.normal(0, ms_rad)
+
     return hits
 
 
@@ -367,7 +386,7 @@ def _simulate_event(
 
     for _ in range(n_sig):
         tr = _generate_truth_track(rng, cfg)
-        truth_hits = _intersect_layers(tr)
+        truth_hits = _intersect_layers(tr, rng, cfg)
 
         if len(truth_hits) < cfg.min_layers_hit:
             continue
@@ -624,7 +643,8 @@ if __name__ == "__main__":
     parser.add_argument("--n-events", type=int, default=10000)
     parser.add_argument("--mean-n-signal", type=float, default=0.12)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--background", choices=["none", "data", "synthetic"], default="none")
+    parser.add_argument("--ms-mrad", type=float, default=0.2, help="Multiple scattering standard deviation in mrad")
+    parser.add_argument("--background", choices=["none", "data", "synthetic"], default="synthetic")
     parser.add_argument(
         "--bg-data-path",
         type=str,
@@ -632,7 +652,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--cluster-size", choices=["fixed", "empirical"], default="fixed")
     parser.add_argument(
-        "--synthetic-bg-n-per-layer", type=int, default=50,
+        "--synthetic-bg-n-per-layer", type=int, default=700,
         help="Number of background clusters per layer per event (synthetic mode)",
     )
     parser.add_argument("--output-dir", type=str, default="/Users/IvanTang/hep/data_Run502/simulation")
@@ -648,6 +668,7 @@ if __name__ == "__main__":
         cluster_size_mode=args.cluster_size,
         synthetic_bg_n_per_layer=args.synthetic_bg_n_per_layer,
         mode=args.mode,
+        multiple_scattering_mrad=args.ms_mrad,
     )
     if cfg.cluster_size_mode == "empirical":
         cfg.background_data_path = args.bg_data_path
