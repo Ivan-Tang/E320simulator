@@ -31,8 +31,8 @@ from src.geometry import E320PrototypeGeometry, SENSOR_TO_LAYER
 class BaselineConfig:
     """Tunable knobs for every pipeline stage."""
     # edge building
-    slope_x_max: float = 0.02
-    slope_y_max: float = 0.02
+    slope_x_max: float = 0.2 # sqrt(15^2 + 7^2) / 80 mm / mm = 0.2
+    slope_y_max: float = 0.2
     knn_k: int = 10
     # chain seeding
     dslope_x_max: float = 0.001
