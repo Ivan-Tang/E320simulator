@@ -335,12 +335,12 @@ def compare_timing(
     # Time Hough method
     print("Timing Hough method...")
     hough_cfg = HoughConfig()
-    kalman_cfg = KalmanConfig()
     hough_times = time_hough_per_event(clusters_df, hough_cfg)
 
     # Time Kalman method
-    print("Timing Kalman method...")
-    kalman_times = time_kalman_per_event(clusters_df, kalman_cfg)
+    #print("Timing Kalman method...")
+    #kalman_cfg = KalmanConfig()
+    #kalman_times = time_kalman_per_event(clusters_df, kalman_cfg)
 
     # Time GNN method
     run_gnn = checkpoint_path is not None
@@ -354,7 +354,7 @@ def compare_timing(
     # ── Compute statistics ────────────────────────────────────────────────────
     baseline_times = np.array(baseline_times)
     hough_times = np.array(hough_times)
-    kalman_times = np.array(kalman_times)
+    #kalman_times = np.array(kalman_times)
     if run_gnn:
         gnn_times = np.array(gnn_times)
     
@@ -372,7 +372,7 @@ def compare_timing(
 
     _print_stats("Baseline method", baseline_times)
     _print_stats("Hough method", hough_times)
-    _print_stats("Kalman method", kalman_times)
+    #_print_stats("Kalman method", kalman_times)
     if run_gnn:
         _print_stats("GNN method", gnn_times)
 
@@ -382,19 +382,19 @@ def compare_timing(
     print(f"{'='*70}")
     bl_mean = baseline_times.mean()
     hg_mean = hough_times.mean()
-    km_mean = kalman_times.mean()
+    #km_mean = kalman_times.mean()
     print(f"\n  Hough  vs Baseline : {bl_mean / hg_mean:.2f}x")
-    print(f"  Kalman vs Baseline : {bl_mean / km_mean:.2f}x")
-    print(f"  Kalman vs Hough    : {hg_mean / km_mean:.2f}x")
+    #print(f"  Kalman vs Baseline : {bl_mean / km_mean:.2f}x")
+    #print(f"  Kalman vs Hough    : {hg_mean / km_mean:.2f}x")
     if run_gnn:
         gn_mean = gnn_times.mean()
         print(f"  GNN    vs Baseline : {bl_mean / gn_mean:.2f}x")
         print(f"  GNN    vs Hough    : {hg_mean / gn_mean:.2f}x")
-        print(f"  GNN    vs Kalman   : {km_mean / gn_mean:.2f}x")
+        #print(f"  GNN    vs Kalman   : {km_mean / gn_mean:.2f}x")
 
     # ── build list of all methods for plotting ────────────────────────────────
-    method_names  = ["Baseline", "Hough", "Kalman"]
-    method_times  = [baseline_times, hough_times, kalman_times]
+    method_names  = ["Baseline", "Hough"]
+    method_times  = [baseline_times, hough_times]
     method_colors = ["#4C72B0", "#DD8452", "#8172B2"]
     method_colors_light = ["#A6C8E0", "#F4C7A3", "#C4B8E0"]
     if run_gnn:
@@ -472,7 +472,7 @@ def compare_timing(
         'event_index': range(len(baseline_times)),
         'baseline_time_ms': baseline_times,
         'hough_time_ms': hough_times,
-        'kalman_time_ms': kalman_times,
+        #'kalman_time_ms': kalman_times,
     }
     if run_gnn:
         timing_data['gnn_time_ms'] = gnn_times
