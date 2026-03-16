@@ -249,9 +249,20 @@ def _fit_and_score(
         xs, ys, zs = x[idx], y[idx], z[idx]
         n_pts = len(idx)
 
-        A = np.column_stack([zs, np.ones(n_pts)])
-        (a_x, b_x), *_ = np.linalg.lstsq(A, xs, rcond=None)
-        (a_y, b_y), *_ = np.linalg.lstsq(A, ys, rcond=None)
+        points = np.column_stack([xs, ys, zs])
+        centroid = np.mean(points, axis=0)
+        centered = points - centroid
+        _, _, vh = np.linalg.svd(centered, full_matrices=False)
+        direction = vh[0]
+
+        if direction[2] == 0:
+            a_x, a_y = 0.0, 0.0
+        else:
+            a_x = direction[0] / direction[2]
+            a_y = direction[1] / direction[2]
+            
+        b_x = centroid[0] - a_x * centroid[2]
+        b_y = centroid[1] - a_y * centroid[2]
 
         dx = xs - (a_x * zs + b_x)
         dy = ys - (a_y * zs + b_y)
