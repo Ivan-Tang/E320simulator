@@ -120,17 +120,19 @@ def _build_edges(
         e_src = ai[ia]
         e_dst = bi[ib]
 
-        # KNN: keep at most k nearest per source node
+        # KNN: keep at most k nearest per source node (vectorised, no Python loop)
         if cfg.knn_k > 0:
             e_dr = np.sqrt(dx[ia, ib] ** 2 + dy[ia, ib] ** 2)
-            keep = np.ones(len(e_src), dtype=bool)
-            for s in np.unique(e_src):
-                m = e_src == s
-                if m.sum() <= cfg.knn_k:
-                    continue
-                idx = np.where(m)[0]
-                order = np.argsort(e_dr[idx])
-                keep[idx[order[cfg.knn_k :]]] = False
+            # Sort edges by (src, dr); lexsort uses last key as primary.
+            order = np.lexsort((e_dr, e_src))
+            _, group_starts, counts = np.unique(
+                e_src[order], return_index=True, return_counts=True
+            )
+            # Within-group rank (0 = closest neighbour).
+            ranks_in_sorted = np.arange(len(order)) - np.repeat(group_starts, counts)
+            rank = np.empty(len(order), dtype=np.int64)
+            rank[order] = ranks_in_sorted
+            keep = rank < cfg.knn_k
             e_src, e_dst = e_src[keep], e_dst[keep]
             e_sx, e_sy = e_sx[keep], e_sy[keep]
 
