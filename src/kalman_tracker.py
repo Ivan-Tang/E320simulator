@@ -157,44 +157,42 @@ def _build_seeds(
     x1, y1, z1, n1 = x[m1], y[m1], z[m1], nid[m1]
 
     R_mat = _R(cfg)
+
+    # Vectorised pair filtering — no Python double loop.
+    dz_mat  = z1[None, :] - z0[:, None]          # (N0, N1)
+    dx_mat  = x1[None, :] - x0[:, None]
+    dy_mat  = y1[None, :] - y0[:, None]
+
+    valid   = np.abs(dz_mat) >= 1e-9
+    safe_dz = np.where(valid, dz_mat, 1.0)        # avoid division by zero
+    sx_mat  = dx_mat / safe_dz
+    sy_mat  = dy_mat / safe_dz
+
+    mask = valid & (np.abs(sx_mat) <= cfg.slope_x_max) & (np.abs(sy_mat) <= cfg.slope_y_max)
+    ii, jj = np.where(mask)
+    if len(ii) == 0:
+        return []
+
+    sx_vals  = sx_mat[ii, jj]
+    sy_vals  = sy_mat[ii, jj]
+    dz_vals  = dz_mat[ii, jj]
+
+    # χ² from layer-0 residual (vectorised)
+    dx0      = x0[ii] - (x1[jj] - sx_vals * dz_vals)
+    dy0      = y0[ii] - (y1[jj] - sy_vals * dz_vals)
+    chi2_vals = dx0 ** 2 / R_mat[0, 0] + dy0 ** 2 / R_mat[1, 1]
+
+    # Covariance is identical for every seed; copy once per seed.
+    sig_s    = cfg.seed_slope_sigma
+    base_cov = np.diag([cfg.sigma_x_mm ** 2, sig_s ** 2,
+                        cfg.sigma_y_mm ** 2, sig_s ** 2])
+
     seeds: list[tuple[np.ndarray, np.ndarray, list[int], list[int], float]] = []
-
-    for i in range(len(x0)):
-        for j in range(len(x1)):
-            dz = z1[j] - z0[i]
-            if abs(dz) < 1e-9:
-                continue
-            sx = (x1[j] - x0[i]) / dz
-            sy = (y1[j] - y0[i]) / dz
-            if abs(sx) > cfg.slope_x_max or abs(sy) > cfg.slope_y_max:
-                continue
-
-            # initial state at z of layer 1
-            state = np.array([x1[j], sx, y1[j], sy], dtype=np.float64)
-
-            # initial covariance: position from measurement, slope from estimate
-            sig_s = cfg.seed_slope_sigma
-            cov = np.diag([
-                cfg.sigma_x_mm ** 2,
-                sig_s ** 2,
-                cfg.sigma_y_mm ** 2,
-                sig_s ** 2,
-            ])
-
-            # χ² contribution: compute from layer 0 residual
-            pred_x0 = x1[j] - sx * dz
-            pred_y0 = y1[j] - sy * dz
-            dx0 = x0[i] - pred_x0
-            dy0 = y0[i] - pred_y0
-            chi2_seed = dx0 ** 2 / R_mat[0, 0] + dy0 ** 2 / R_mat[1, 1]
-
-            seeds.append((
-                state,
-                cov,
-                [int(n0[i]), int(n1[j])],
-                [0, 1],
-                chi2_seed,
-            ))
+    for k in range(len(ii)):
+        i, j  = int(ii[k]), int(jj[k])
+        state = np.array([x1[j], sx_vals[k], y1[j], sy_vals[k]], dtype=np.float64)
+        seeds.append((state, base_cov.copy(), [int(n0[i]), int(n1[j])], [0, 1],
+                      float(chi2_vals[k])))
 
     return seeds
 
