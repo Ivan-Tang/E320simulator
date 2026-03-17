@@ -12,10 +12,10 @@ import polars as pl
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.simulator import SimConfig, simulate, SyntheticBackgroundPool
-from scripts.run_baseline_on_sim import evaluate_baseline_on_sim
-from scripts.run_hough_on_sim import evaluate_hough_on_sim
-from scripts.run_gnn_on_sim import run_gnn_reco
-from scripts.compare_reco import compute_metrics
+from E320simulator.scripts.run_baseline import evaluate_baseline_on_sim
+from E320simulator.scripts.run_hough import evaluate_hough_on_sim
+from E320simulator.scripts.run_model import run_model_reco
+from E320simulator.scripts.compare_reco import compute_metrics
 
 
 def run_experiment(
@@ -69,12 +69,13 @@ def run_experiment(
     print("\n[4] Running GNN reco...")
     t0 = time.time()
     if checkpoint_path and os.path.exists(checkpoint_path):
-        gnn_res = run_gnn_reco(
-            clusters_df=clusters_df, 
-            tracks_df=tracks_df, 
-            checkpoint_path=checkpoint_path, 
+        gnn_res = run_model_reco(
+            clusters_df=clusters_df,
+            tracks_df=tracks_df,
+            mode="edge",
+            edge_checkpoint=checkpoint_path,
+            edge_threshold=0.5,
             device=device,
-            threshold=0.5
         )
         gnn_time = time.time() - t0
         gnn_metrics = compute_metrics(gnn_res, tracks_df) if len(gnn_res) > 0 else {}
