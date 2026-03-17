@@ -1,26 +1,46 @@
 import os
+from collections import Counter
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
 import numpy as np
 import polars as pl
-from collections import Counter
+from src.hough_baseline import HoughConfig, _process_event_hough
 
-from src.hough_baseline import (
-    HoughConfig,
-    _process_event_hough,
-)
+
+def _process_and_match_event_hough(
+    eid: int, xv, yv, zv, lv, nv, tv, cfg: HoughConfig,
+) -> list[dict]:
+    """Run Hough reco for one event and match candidates to truth tracks."""
+    candidates = _process_event_hough(eid, xv, yv, zv, lv, nv, cfg)
+    if not candidates:
+        return []
+
+    nid_to_local = {int(n): j for j, n in enumerate(nv)}
+    for ci, cand in enumerate(candidates):
+        node_tids = [int(tv[nid_to_local[n]]) for n in cand["node_ids"]]
+        counter = Counter(t for t in node_tids if t >= 0)
+        if counter:
+            best_tid, best_count = counter.most_common(1)[0]
+            cand["matched_track_id"] = best_tid if best_count >= 4 else -1
+            cand["n_matched"] = best_count
+        else:
+            cand["matched_track_id"] = -1
+            cand["n_matched"] = 0
+    return candidates
 
 
 def evaluate_hough_on_sim(
     clusters_df: pl.DataFrame,
     tracks_df: pl.DataFrame,
+    cfg: HoughConfig | None = None,
 ) -> pl.DataFrame:
     """Run the Hough track finder on simulated clusters and evaluate.
 
     Returns the result DataFrame with an extra ``matched_track_id``
     column indicating which truth track (if any) was reconstructed.
     """
-
-    cfg = HoughConfig()
-    all_candidates: list[dict] = []
+    if cfg is None:
+        cfg = HoughConfig()
 
     eid_arr = clusters_df["event_id"].to_numpy()
     x_arr = clusters_df["x_trk_mm"].to_numpy()
@@ -33,35 +53,26 @@ def evaluate_hough_on_sim(
     unique_events, starts = np.unique(eid_arr, return_index=True)
     counts = np.diff(np.append(starts, len(eid_arr)))
 
+    # Build per-event argument tuples (copy slices for process safety)
+    event_args = []
     for i in range(len(unique_events)):
         s, c_ = int(starts[i]), int(counts[i])
-        eid = int(unique_events[i])
-        xv = x_arr[s : s + c_]
-        yv = y_arr[s : s + c_]
-        zv = z_arr[s : s + c_]
-        lv = lid_arr[s : s + c_]
-        nv = nid_arr[s : s + c_]
-        tv = tid_arr[s : s + c_]
+        event_args.append((
+            int(unique_events[i]),
+            x_arr[s:s+c_].copy(),
+            y_arr[s:s+c_].copy(),
+            z_arr[s:s+c_].copy(),
+            lid_arr[s:s+c_].copy(),
+            nid_arr[s:s+c_].copy(),
+            tid_arr[s:s+c_].copy(),
+            cfg,
+        ))
 
-        candidates = _process_event_hough(eid, xv, yv, zv, lv, nv, cfg)
-        if not candidates:
-            continue
-
-        nid_to_local = {int(n): j for j, n in enumerate(nv)}
-
-        # Match each kept candidate to truth tracks
-        for ci, cand in enumerate(candidates):
-            # find majority truth track_id among nodes
-            node_tids = [int(tv[nid_to_local[n]]) for n in cand["node_ids"]]
-            counter = Counter(t for t in node_tids if t >= 0)
-            if counter:
-                best_tid, best_count = counter.most_common(1)[0]
-                cand["matched_track_id"] = best_tid if best_count >= 4 else -1
-                cand["n_matched"] = best_count
-            else:
-                cand["matched_track_id"] = -1
-                cand["n_matched"] = 0
-        all_candidates.extend(candidates)
+    all_candidates: list[dict] = []
+    with ProcessPoolExecutor(max_workers=cfg.n_workers) as pool:
+        futures = [pool.submit(_process_and_match_event_hough, *args) for args in event_args]
+        for f in as_completed(futures):
+            all_candidates.extend(f.result())
 
     if not all_candidates:
         return pl.DataFrame()

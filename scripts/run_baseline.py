@@ -1,20 +1,53 @@
 import os
+from collections import Counter
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
 import numpy as np
-import polars as pl        
+import polars as pl
 from src.baseline import BaselineConfig, _build_edges, _build_chains, _fit_and_score, _shared_hit_rejection
+
+
+def _process_and_match_event(
+    eid: int, xv, yv, zv, lv, nv, tv, cfg: BaselineConfig,
+) -> list[dict]:
+    """Run baseline reco for one event and match candidates to truth tracks."""
+    src, dst, sl, dl, sx, sy = _build_edges(xv, yv, zv, lv, nv, cfg)
+    if len(src) == 0:
+        return []
+    chains = _build_chains(src, dst, sl, dl, sx, sy, cfg)
+    if not chains:
+        return []
+    nid_to_local = {int(n): j for j, n in enumerate(nv)}
+    candidates = _fit_and_score(chains, xv, yv, zv, nid_to_local)
+    candidates = _shared_hit_rejection(candidates)
+
+    for ci, cand in enumerate(candidates):
+        cand["event_id"] = eid
+        cand["candidate_id"] = ci
+        node_tids = [int(tv[nid_to_local[n]]) for n in cand["node_ids"]]
+        counter = Counter(t for t in node_tids if t >= 0)
+        if counter:
+            best_tid, best_count = counter.most_common(1)[0]
+            cand["matched_track_id"] = best_tid if best_count >= 4 else -1
+            cand["n_matched"] = best_count
+        else:
+            cand["matched_track_id"] = -1
+            cand["n_matched"] = 0
+    return candidates
+
 
 def evaluate_baseline_on_sim(
     clusters_df: pl.DataFrame,
     tracks_df: pl.DataFrame,
+    cfg: BaselineConfig | None = None,
 ) -> pl.DataFrame:
     """Run the baseline track finder on simulated clusters and evaluate.
 
     Returns the baseline result DataFrame with an extra ``matched_track_id``
     column indicating which truth track (if any) was reconstructed.
     """
-
-    cfg = BaselineConfig()
-    all_candidates: list[dict] = []
+    if cfg is None:
+        cfg = BaselineConfig()
 
     eid_arr = clusters_df["event_id"].to_numpy()
     x_arr = clusters_df["x_trk_mm"].to_numpy()
@@ -27,42 +60,26 @@ def evaluate_baseline_on_sim(
     unique_events, starts = np.unique(eid_arr, return_index=True)
     counts = np.diff(np.append(starts, len(eid_arr)))
 
+    # Build per-event argument tuples (copy slices for process safety)
+    event_args = []
     for i in range(len(unique_events)):
         s, c_ = int(starts[i]), int(counts[i])
-        eid = int(unique_events[i])
-        xv = x_arr[s : s + c_]
-        yv = y_arr[s : s + c_]
-        zv = z_arr[s : s + c_]
-        lv = lid_arr[s : s + c_]
-        nv = nid_arr[s : s + c_]
-        tv = tid_arr[s : s + c_]
+        event_args.append((
+            int(unique_events[i]),
+            x_arr[s:s+c_].copy(),
+            y_arr[s:s+c_].copy(),
+            z_arr[s:s+c_].copy(),
+            lid_arr[s:s+c_].copy(),
+            nid_arr[s:s+c_].copy(),
+            tid_arr[s:s+c_].copy(),
+            cfg,
+        ))
 
-        src, dst, sl, dl, sx, sy = _build_edges(xv, yv, zv, lv, nv, cfg)
-        if len(src) == 0:
-            continue
-        chains = _build_chains(src, dst, sl, dl, sx, sy, cfg)
-        if not chains:
-            continue
-        nid_to_local = {int(n): j for j, n in enumerate(nv)}
-        candidates = _fit_and_score(chains, xv, yv, zv, nid_to_local)
-        candidates = _shared_hit_rejection(candidates)
-
-        # Match each kept candidate to truth tracks
-        for ci, cand in enumerate(candidates):
-            cand["event_id"] = eid
-            cand["candidate_id"] = ci
-            # find majority truth track_id among nodes
-            node_tids = [int(tv[nid_to_local[n]]) for n in cand["node_ids"]]
-            from collections import Counter
-            counter = Counter(t for t in node_tids if t >= 0)
-            if counter:
-                best_tid, best_count = counter.most_common(1)[0]
-                cand["matched_track_id"] = best_tid if best_count >= 4 else -1
-                cand["n_matched"] = best_count
-            else:
-                cand["matched_track_id"] = -1
-                cand["n_matched"] = 0
-        all_candidates.extend(candidates)
+    all_candidates: list[dict] = []
+    with ProcessPoolExecutor(max_workers=cfg.n_workers) as pool:
+        futures = [pool.submit(_process_and_match_event, *args) for args in event_args]
+        for f in as_completed(futures):
+            all_candidates.extend(f.result())
 
     if not all_candidates:
         return pl.DataFrame()

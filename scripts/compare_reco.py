@@ -14,7 +14,7 @@ Usage
 -----
     python -m scripts.compare_reco \
         --tracks   /data/sim_tracks.parquet   \
-        --reco Baseline=/data/sim_baseline.parquet Kalman=/data/sim_kalman_reco.parquet GNN=/data/sim_gnn_reco.parquet
+        --reco Baseline=/data/sim_baseline.parquet Hough=/data/sim_hough_reco.parquet GNN=/data/sim_gnn_reco.parquet
 """
 from __future__ import annotations
 
@@ -38,7 +38,7 @@ def compute_metrics(reco: pl.DataFrame, tracks: pl.DataFrame) -> dict:
     Parameters
     ----------
     reco:
-        Output of evaluate_baseline_on_sim / run_gnn_reco.
+        Output of evaluate_baseline_on_sim / run_edge_classifier_reco.
         Required columns: is_kept, matched_track_id, n_layers, chi2, rms.
     tracks:
         Truth track table with columns: track_id, event_id, is_signal.

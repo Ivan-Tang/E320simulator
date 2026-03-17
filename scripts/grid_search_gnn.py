@@ -62,7 +62,7 @@ def _parse_args() -> argparse.Namespace:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Per-event tensor builder  (mirrors run_gnn_on_sim._event_to_tensors)
+# Per-event tensor builder  (same logic as run_model._build_gnn_tensors)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _build_tensors(
