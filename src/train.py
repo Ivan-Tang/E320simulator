@@ -1,15 +1,14 @@
-"""
-Edge-classification GNN training pipeline.
+"""Unified training entry for ML models in E320simulator.
+
+Tasks
+-----
+1) edge      : edge-classification (GNN / MLP)
+2) embedder  : metric-learning hit embedder
 
 Usage (script)
 --------------
-    python -m src.train [--model gnn|mlp] [--epochs 20] [--checkpoint runs/exp1]
-
-Usage (from notebook / other code)
------------------------------------
-    from src.train import TrainConfig, train
-    cfg = TrainConfig(model_type="gnn", n_epochs=30, checkpoint_dir="runs/exp1")
-    results = train(edges_df, cfg)
+    python -m src.train --task edge --clusters /path/to/sim_clusters.parquet
+    python -m src.train --task embedder --clusters /path/to/sim_clusters.parquet
 """
 from __future__ import annotations
 
@@ -28,8 +27,12 @@ import torch.nn as nn
 import torch.optim as optim
 from sklearn.metrics import average_precision_score, roc_auc_score
 
-from src.models import EdgeMLP, InteractionNet
+from src.models import (
+    EdgeMLP, InteractionNet, TransformerEdgeClassifier, TrackFormerSeed,
+    ResGNN, MPNN, AGNN, EggNet, HierarchicalGNN,
+)
 from src.losses import FocalLoss
+from src.train_embedder import EmbedderTrainConfig, train_embedder
 from src.utils import (
     EDGE_FEAT_COLS,
     NODE_FEAT_COLS_SRC,
@@ -46,9 +49,26 @@ from src.utils import (
 @dataclass
 class TrainConfig:
     # model
-    model_type: Literal["gnn", "mlp"] = "gnn"
+    model_type: Literal["gnn", "mlp", "transformer", "trackformer", "resgnn", "mpnn", "agnn", "eggnet", "hgnn"] = "gnn"
     hidden: int = 64
-    n_mp: int = 2                        # message-passing rounds (gnn only)
+    n_mp: int = 2                        # message-passing rounds (gnn / hgnn interaction iters)
+
+    # eggnet-specific parameters
+    n_gnns_per_iter: int = 2             # inner GNN rounds per iteration (eggnet only)
+    recurrent: bool = True               # share weights across iterations (eggnet only)
+
+    # hgnn-specific parameters
+    n_hierarchical_iters: int = 3        # hierarchical message-passing rounds (hgnn only)
+    n_detector_layers: int = 5           # number of detector layers, default E320
+
+    # transformer-specific parameters
+    d_model: int = 256
+    n_heads: int = 8
+    n_encoder_layers: int = 6
+    n_decoder_layers: int = 6
+    dim_feedforward: int = 1024
+    dropout: float = 0.1
+    max_seeds: int = 100
 
     # loss
     focal_alpha: float = 0.995
@@ -93,7 +113,50 @@ def _resolve_device(cfg: TrainConfig) -> torch.device:
 def _build_model(cfg: TrainConfig) -> nn.Module:
     if cfg.model_type == "mlp":
         return EdgeMLP(hidden=cfg.hidden)
-    return InteractionNet(hidden=cfg.hidden, n_mp=cfg.n_mp)
+    if cfg.model_type == "gnn":
+        return InteractionNet(hidden=cfg.hidden, n_mp=cfg.n_mp)
+    if cfg.model_type == "resgnn":
+        return ResGNN(hidden=cfg.hidden, n_graph_iters=cfg.n_mp)
+    if cfg.model_type == "mpnn":
+        return MPNN(hidden=cfg.hidden, n_graph_iters=cfg.n_mp)
+    if cfg.model_type == "agnn":
+        return AGNN(hidden=cfg.hidden, n_graph_iters=cfg.n_mp)
+    if cfg.model_type == "eggnet":
+        return EggNet(
+            hidden=cfg.hidden,
+            n_iters=cfg.n_mp,
+            n_gnns_per_iter=cfg.n_gnns_per_iter,
+            recurrent=cfg.recurrent,
+        )
+    if cfg.model_type == "transformer":
+        return TransformerEdgeClassifier(
+            node_dim=NODE_DIM,
+            edge_dim=EDGE_DIM,
+            d_model=cfg.d_model,
+            n_heads=cfg.n_heads,
+            n_encoder_layers=cfg.n_encoder_layers,
+            dim_feedforward=cfg.dim_feedforward,
+            dropout=cfg.dropout,
+        )
+    if cfg.model_type == "trackformer":
+        return TrackFormerSeed(
+            node_dim=NODE_DIM,
+            d_model=cfg.d_model,
+            n_heads=cfg.n_heads,
+            n_encoder_layers=cfg.n_encoder_layers,
+            n_decoder_layers=cfg.n_decoder_layers,
+            dim_feedforward=cfg.dim_feedforward,
+            max_seeds=cfg.max_seeds,
+            dropout=cfg.dropout,
+        )
+    if cfg.model_type == "hgnn":
+        return HierarchicalGNN(
+            hidden_dim=cfg.hidden,
+            n_interaction_iters=cfg.n_mp,
+            n_hierarchical_iters=cfg.n_hierarchical_iters,
+            n_layers=cfg.n_detector_layers,
+        )
+    raise ValueError(f"Unknown model_type: {cfg.model_type}")
 
 
 def _compute_normalisation(
@@ -353,17 +416,60 @@ def load_checkpoint(
     }
 
 
+def train_model(
+    clusters_df: pl.DataFrame,
+    task: Literal["edge", "embedder"] = "edge",
+    edge_cfg: TrainConfig | None = None,
+    embed_cfg: EmbedderTrainConfig | None = None,
+) -> dict:
+    """Unified programmatic training API.
+
+    Parameters
+    ----------
+    clusters_df:
+        Simulator cluster table.
+    task:
+        - ``edge``: build candidate edges and train edge classifier.
+        - ``embedder``: build hit pairs and train metric-learning embedder.
+    """
+    if task == "edge":
+        edges_df = build_labeled_edges_from_sim(clusters_df)
+        return train(edges_df, edge_cfg)
+
+    if embed_cfg is None:
+        embed_cfg = EmbedderTrainConfig()
+    return train_embedder(clusters_df, embed_cfg)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # CLI entry-point
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _cli() -> None:
-    parser = argparse.ArgumentParser(description="Train edge-classification GNN")
+    parser = argparse.ArgumentParser(description="Unified trainer for edge models and embedder")
     parser.add_argument("--clusters", required=True, help="Path to sim_clusters.parquet")
-    parser.add_argument("--model",    default="gnn", choices=["gnn", "mlp"])
+    parser.add_argument("--task", default="edge", choices=["edge", "embedder"],
+                        help="Training task: edge classifier or hit embedder")
+
+    # edge-model options
+    parser.add_argument("--model",    default="gnn", choices=["gnn", "mlp", "resgnn", "mpnn", "agnn", "eggnet"],
+                        help="Edge model type (used when --task=edge)")
     parser.add_argument("--epochs",   type=int, default=50)
     parser.add_argument("--hidden",   type=int, default=64)
     parser.add_argument("--n_mp",     type=int, default=2)
+    parser.add_argument("--n_gnns_per_iter", type=int, default=2,
+                        help="Inner GNN rounds per iteration (eggnet only)")
+    parser.add_argument("--no-recurrent", action="store_true",
+                        help="Disable weight sharing across iterations (eggnet only)")
+    parser.add_argument("--layers",   type=int, default=3,
+                        help="Embedder MLP depth (used when --task=embedder)")
+    parser.add_argument("--emb-dim",  type=int, default=8,
+                        help="Embedding dimension (used when --task=embedder)")
+    parser.add_argument("--nb-particles-per-sample", type=int, default=2000,
+                        help="Pair sampling count per event for embedder training")
+    parser.add_argument("--max-pairs", type=int, default=500000,
+                        help="Maximum sampled pairs for embedder training")
+    parser.add_argument("--val-fraction", type=float, default=0.2)
     parser.add_argument("--lr",       type=float, default=3e-4)
     parser.add_argument("--device",   default="auto")
     parser.add_argument("--checkpoint", default=None, help="Directory to save checkpoints")
@@ -372,19 +478,39 @@ def _cli() -> None:
     clusters_df = pl.read_parquet(args.clusters)
     print(f"[cli] loaded {len(clusters_df):,} clusters")
 
-    edges_df = build_labeled_edges_from_sim(clusters_df)
-    print(f"[cli] built {len(edges_df):,} candidate edges")
+    if args.task == "edge":
+        edges_df = build_labeled_edges_from_sim(clusters_df)
+        print(f"[cli] built {len(edges_df):,} candidate edges")
 
-    cfg = TrainConfig(
-        model_type     = args.model,
-        n_epochs       = args.epochs,
-        hidden         = args.hidden,
-        n_mp           = args.n_mp,
-        lr             = args.lr,
-        device         = args.device,
-        checkpoint_dir = args.checkpoint,
+        cfg = TrainConfig(
+            model_type       = args.model,
+            n_epochs         = args.epochs,
+            hidden           = args.hidden,
+            n_mp             = args.n_mp,
+            n_gnns_per_iter  = args.n_gnns_per_iter,
+            recurrent        = not args.no_recurrent,
+            lr               = args.lr,
+            val_fraction     = args.val_fraction,
+            device           = args.device,
+            checkpoint_dir   = args.checkpoint,
+        )
+        train(edges_df, cfg)
+        return
+
+    embed_cfg = EmbedderTrainConfig(
+        n_epochs=args.epochs,
+        batch_size=4096,
+        emb_dim=args.emb_dim,
+        hidden_dim=args.hidden,
+        n_layers=args.layers,
+        nb_particles_per_sample=args.nb_particles_per_sample,
+        max_pairs=args.max_pairs,
+        val_fraction=args.val_fraction,
+        lr=args.lr,
+        checkpoint_dir=args.checkpoint,
+        device=args.device,
     )
-    train(edges_df, cfg)
+    train_embedder(clusters_df, embed_cfg)
 
 
 if __name__ == "__main__":
