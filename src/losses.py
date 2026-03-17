@@ -2,6 +2,29 @@ import torch
 from torch import Tensor
 import torch.nn as nn
 
+class HingeLoss(nn.Module):
+    """Wrapper of ``torch.nn.functional.hinge_embedding_loss`` for pair distance learning.
+
+    Expected inputs
+    ---------------
+    pred_distance: non-negative pairwise distance between embedded hit pairs
+    target: binary labels in {0, 1} where 1 means same track
+    """
+
+    def __init__(self, margin: float = 1.0):
+        super().__init__()
+        self.margin = margin
+
+    def forward(self, pred_distance: Tensor, target: Tensor) -> Tensor:
+        # torch hinge embedding loss expects target in {-1, +1}
+        signed_target = (2 * target.float()) - 1.0
+        return nn.functional.hinge_embedding_loss(
+            pred_distance,
+            signed_target,
+            margin=self.margin,
+        )
+
+
 class FocalLoss(nn.Module):
     """Binary focal loss for severe class imbalance.
 
