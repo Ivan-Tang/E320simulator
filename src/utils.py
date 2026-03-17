@@ -15,6 +15,193 @@ import torch
 from torch import Tensor
 from src.baseline import BaselineConfig, _build_edges
 
+
+# Default layer adjacency table for E320-style data.
+# Row format: [volume_id, layer_id].
+# For E320 simulator hits, volume_id is treated as 0 and layer_id in [0..4].
+ALL_LAYERS = np.array([
+    [0, 0],
+    [0, 1],
+    [0, 2],
+    [0, 3],
+    [0, 4],
+], dtype=np.int32)
+
+
+def is_match(
+    hit_id_a: int,
+    hit_id_b: int,
+    vols: np.ndarray,
+    layers: np.ndarray,
+    all_layers: np.ndarray = ALL_LAYERS,
+) -> bool:
+    """Check whether two hits lie on adjacent detector layers.
+
+    Adjacency is defined by consecutive entries in ``all_layers``.
+    """
+    va, la = int(vols[hit_id_a]), int(layers[hit_id_a])
+    vb, lb = int(vols[hit_id_b]), int(layers[hit_id_b])
+
+    matches = np.where((all_layers[:, 0] == va) & (all_layers[:, 1] == la))[0]
+    if len(matches) == 0:
+        return False
+
+    i = int(matches[0])
+    lower_ok = i > 0 and np.array_equal(np.array([vb, lb]), all_layers[i - 1])
+    upper_ok = (i + 1) < len(all_layers) and np.array_equal(np.array([vb, lb]), all_layers[i + 1])
+    return bool(lower_ok or upper_ok)
+
+
+def get_true_pairs_layerwise(
+    hits: list | np.ndarray,
+    where_track: list[int],
+    vols: np.ndarray,
+    layers: np.ndarray,
+    all_layers: np.ndarray = ALL_LAYERS,
+) -> tuple[list, list]:
+    """Build positive pairs (target=1) from adjacent layers of one particle."""
+    hits_a: list = []
+    hits_b: list = []
+    n = len(where_track)
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            ha = where_track[i]
+            hb = where_track[j]
+            if is_match(ha, hb, vols, layers, all_layers=all_layers):
+                # keep both directions
+                hits_a.append(hits[ha])
+                hits_b.append(hits[hb])
+                hits_a.append(hits[hb])
+                hits_b.append(hits[ha])
+    return hits_a, hits_b
+
+
+def get_false_pairs(
+    hits: list | np.ndarray,
+    where_track: list[int],
+    particle_ids: np.ndarray,
+    pid: int,
+    nb_false_pairs: int,
+    rng: np.random.Generator,
+) -> tuple[list, list]:
+    """Build negative pairs (target=0) by pairing current-track hits with other particles."""
+    if nb_false_pairs <= 0:
+        return [], []
+
+    where_not_track = np.where(particle_ids != pid)[0]
+    if len(where_not_track) == 0 or len(where_track) == 0:
+        return [], []
+
+    neg_idx = rng.choice(where_not_track, size=nb_false_pairs, replace=(len(where_not_track) < nb_false_pairs))
+    pos_idx = rng.choice(np.array(where_track), size=nb_false_pairs, replace=True)
+
+    h_a = [hits[int(i)] for i in pos_idx]
+    h_b = [hits[int(j)] for j in neg_idx]
+    return h_a, h_b
+
+
+def get_pairs_one_pid(
+    hits: list | np.ndarray,
+    particle_ids: np.ndarray,
+    pid: int,
+    z: np.ndarray,
+    vols: np.ndarray,
+    layers: np.ndarray,
+    rng: np.random.Generator,
+    all_layers: np.ndarray = ALL_LAYERS,
+) -> tuple[list, list, list[int]]:
+    """Build balanced (positive + negative) pairs for one particle id."""
+    del z  # kept for compatibility with prior API shape
+
+    where_track = list(np.where(particle_ids == pid)[0])
+    if len(where_track) < 2:
+        return [], [], []
+
+    h_true_a, h_true_b = get_true_pairs_layerwise(
+        hits, where_track, vols, layers, all_layers=all_layers
+    )
+    target_true = [1] * len(h_true_a)
+
+    if len(h_true_a) == 0:
+        return [], [], []
+
+    h_false_a, h_false_b = get_false_pairs(
+        hits, where_track, particle_ids, pid, len(h_true_a), rng
+    )
+    target_false = [0] * len(h_false_a)
+
+    return h_true_a + h_false_a, h_true_b + h_false_b, target_true + target_false
+
+
+def build_pairs(
+    hits: list | np.ndarray,
+    particle_ids: list | np.ndarray,
+    vols: list | np.ndarray,
+    layers: list | np.ndarray,
+    nb_particles_per_sample: int = 2000,
+    *,
+    rng: np.random.Generator | None = None,
+    all_layers: np.ndarray = ALL_LAYERS,
+) -> tuple[list, list, list[int]]:
+    """Construct hit-pair dataset for embedding training.
+
+    Strategy
+    --------
+    - Positive pairs: same particle, adjacent detector layers (via ``all_layers``)
+    - Negative pairs: current particle hit paired with another particle hit
+      while keeping class counts balanced per particle.
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    hits_arr = list(hits)
+    pids = np.asarray(particle_ids)
+    vols_arr = np.asarray(vols)
+    layers_arr = np.asarray(layers)
+
+    if len(hits_arr) != len(pids) or len(hits_arr) != len(vols_arr) or len(hits_arr) != len(layers_arr):
+        raise ValueError("hits, particle_ids, vols, layers must have the same length")
+
+    # In this repository signal track ids are >= 0 and background is -1.
+    unique_pids = [int(p) for p in np.unique(pids) if int(p) >= 0]
+    if not unique_pids:
+        return [], [], []
+
+    unique_pids = list(rng.permutation(unique_pids))
+    n_to_sample = min(int(nb_particles_per_sample), len(unique_pids))
+
+    hits_a: list = []
+    hits_b: list = []
+    target: list[int] = []
+
+    hits_np = np.asarray(hits)
+    z = hits_np[:, 2] if hits_np.ndim == 2 and hits_np.shape[1] > 2 else np.zeros(len(hits_arr), dtype=np.float32)
+
+    for i in range(n_to_sample):
+        pid = unique_pids[i]
+        h_a, h_b, t = get_pairs_one_pid(
+            hits_arr,
+            pids,
+            pid,
+            z,
+            vols_arr,
+            layers_arr,
+            rng,
+            all_layers=all_layers,
+        )
+        hits_a.extend(h_a)
+        hits_b.extend(h_b)
+        target.extend(t)
+
+    return hits_a, hits_b, target
+
+
+def build_paris(*args, **kwargs):
+    """Backward-compatible alias (typo kept for compatibility)."""
+    return build_pairs(*args, **kwargs)
+
+
 # dataset builder
 def build_labeled_edges_from_sim(
     clusters_df: pl.DataFrame,
