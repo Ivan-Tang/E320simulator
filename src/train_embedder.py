@@ -457,7 +457,7 @@ def infer_embedding_neighbors(
 
 def _cli() -> None:
     parser = argparse.ArgumentParser(description="Train metric-learning embedder for E320simulator")
-    parser.add_argument("--clusters", default="../data_Run502/simulation/sim_clusters_train.parquet")
+    parser.add_argument("--clusters", default=None)
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=4096)
     parser.add_argument("--emb-dim", type=int, default=8)
@@ -465,11 +465,15 @@ def _cli() -> None:
     parser.add_argument("--layers", type=int, default=3)
     parser.add_argument("--nb-particles-per-sample", type=int, default=2000)
     parser.add_argument("--max-pairs", type=int, default=500000)
-    parser.add_argument("--checkpoint", default="../data_Run502/runs/embedder")
+    parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "mps", "cuda"])
     args = parser.parse_args()
 
-    clusters_df = pl.read_parquet(args.clusters)
+    from src.config import SIM_DIR, RUNS_DIR
+    clusters_path = args.clusters or str(SIM_DIR / "sim_clusters_train.parquet")
+    checkpoint_dir = args.checkpoint or str(RUNS_DIR / "embedder")
+
+    clusters_df = pl.read_parquet(clusters_path)
 
     cfg = EmbedderTrainConfig(
         n_epochs=args.epochs,
@@ -479,7 +483,7 @@ def _cli() -> None:
         n_layers=args.layers,
         nb_particles_per_sample=args.nb_particles_per_sample,
         max_pairs=args.max_pairs,
-        checkpoint_dir=args.checkpoint,
+        checkpoint_dir=checkpoint_dir,
         device=args.device,
     )
     train_embedder(clusters_df, cfg)

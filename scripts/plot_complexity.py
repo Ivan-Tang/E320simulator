@@ -5,6 +5,7 @@
 """
 import numpy as np
 import matplotlib.pyplot as plt
+from src.config import OUTPUTS_DIR
 
 
 def baseline_time_complexity(N, k=10, L=5):
@@ -102,7 +103,7 @@ def plot_complexity():
     plt.tight_layout()
     
     # 保存
-    output_path = '/Users/IvanTang/hep/data_Run502/outputs/complexity_comparison.png'
+    output_path = str(OUTPUTS_DIR / "complexity_comparison.png")
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     print(f"Complexity comparison plot saved to: {output_path}")
     plt.close()
@@ -204,7 +205,7 @@ def plot_breakdown():
     
     plt.tight_layout()
     
-    output_path = '/Users/IvanTang/hep/data_Run502/outputs/complexity_breakdown.png'
+    output_path = str(OUTPUTS_DIR / "complexity_breakdown.png")
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     print(f"\nStage breakdown plot saved to: {output_path}")
     plt.close()

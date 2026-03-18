@@ -35,10 +35,7 @@ from scripts.compare_reco import compare
 
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-_BASE = Path.home() / "hep/data_Run502"
-SIM_DIR        = _BASE / "simulation"
-RUNS_DIR       = _BASE / "runs"
-OUT_DIR        = _BASE / "outputs"
+from src.config import DATA_ROOT, SIM_DIR, RUNS_DIR, OUTPUTS_DIR as OUT_DIR
 
 TRAIN_CLUSTERS = SIM_DIR / "sim_clusters_train.parquet"
 TEST_CLUSTERS  = SIM_DIR / "sim_clusters_test.parquet"

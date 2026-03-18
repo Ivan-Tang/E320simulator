@@ -5,6 +5,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
 import polars as pl
 from src.hough_baseline import HoughConfig, _process_event_hough
+from src.config import SIM_DIR
 
 
 def _process_and_match_event_hough(
@@ -100,7 +101,7 @@ def evaluate_hough_on_sim(
 
 
 if __name__ == "__main__":
-    data_dir = "/Users/IvanTang/hep/data_Run502/simulation/"
+    data_dir = str(SIM_DIR) + "/"
     suffixs = ["train", "test"]
 
     for suffix in suffixs:

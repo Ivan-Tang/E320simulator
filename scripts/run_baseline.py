@@ -5,6 +5,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
 import polars as pl
 from src.baseline import BaselineConfig, _build_edges, _build_chains, _fit_and_score, _shared_hit_rejection
+from src.config import SIM_DIR
 
 
 def _process_and_match_event(
@@ -107,7 +108,7 @@ def evaluate_baseline_on_sim(
     return result
 
 if __name__ == '__main__':
-    data_dir = '/Users/IvanTang/hep/data_Run502/simulation/'
+    data_dir = str(SIM_DIR) + "/"
     suffixs = ['train', 'test']
     from time import time
     for suffix in suffixs:

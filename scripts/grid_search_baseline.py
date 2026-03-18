@@ -20,17 +20,16 @@ import numpy as np
 import polars as pl
 import matplotlib.pyplot as plt
 
-sys.path.insert(0, "/Users/IvanTang/hep/E320simulator")
 from src.baseline import BaselineConfig, _build_edges, _build_chains, _fit_and_score, _shared_hit_rejection
+from src.config import SIM_DIR
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Data loading
 # ──────────────────────────────────────────────────────────────────────────────
-SIM_DIR = "/Users/IvanTang/hep/data_Run502/simulation"
 
-clusters_df = pl.read_parquet(f"{SIM_DIR}/sim_clusters_train.parquet")
-tracks_df = pl.read_parquet(f"{SIM_DIR}/sim_tracks_train.parquet")
+clusters_df = pl.read_parquet(SIM_DIR / "sim_clusters_train.parquet")
+tracks_df = pl.read_parquet(SIM_DIR / "sim_tracks_train.parquet")
 
 # Pre-extract numpy arrays (shared across all parameter combos)
 eid_arr = clusters_df["event_id"].to_numpy()

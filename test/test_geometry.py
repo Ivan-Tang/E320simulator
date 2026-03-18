@@ -3,6 +3,7 @@ import polars as pl
 import numpy as np
 import math
 from pathlib import Path
+from src.config import HIT_LEVEL_PARQUET
 from src.geometry import (
     E320PrototypeGeometry, 
     SENSOR_TO_LAYER, 
@@ -167,7 +168,7 @@ class TestGeometryWithRealData:
     
     @pytest.fixture
     def data_path(self):
-        return Path('/Users/IvanTang/hep/data_Run502/hit_level.parquet')
+        return HIT_LEVEL_PARQUET
     
     @pytest.fixture
     def geometry(self):
@@ -254,7 +255,7 @@ class TestGeometryWithRealData:
 
 if __name__ == "__main__":
     # Run basic demonstration
-    data_path = Path('/Users/IvanTang/hep/data_Run502/hit_level.parquet')
+    data_path = HIT_LEVEL_PARQUET
     
     if data_path.exists():
         print("Running basic data processing demo with polars...")

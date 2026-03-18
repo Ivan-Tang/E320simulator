@@ -518,8 +518,9 @@ def run_kalman(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-DATA_PATH = "/Users/IvanTang/hep/data_Run502/hit_level.parquet"
-RESULT_PATH = "/Users/IvanTang/hep/data_Run502/kalman.parquet"
+from src.config import DATA_ROOT, HIT_LEVEL_PARQUET
+DATA_PATH = str(HIT_LEVEL_PARQUET)
+RESULT_PATH = str(DATA_ROOT / "kalman.parquet")
 
 if __name__ == "__main__":
     result = run_kalman(DATA_PATH)

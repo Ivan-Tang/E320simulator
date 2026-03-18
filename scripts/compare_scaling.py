@@ -12,6 +12,7 @@ import polars as pl
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.simulator import SimConfig, simulate, SyntheticBackgroundPool
+from src.config import DATA_ROOT, RUNS_DIR, OUTPUTS_DIR
 from E320simulator.scripts.run_baseline import evaluate_baseline_on_sim
 from E320simulator.scripts.run_hough import evaluate_hough_on_sim
 from E320simulator.scripts.run_model import run_model_reco
@@ -149,8 +150,8 @@ def main():
     parser = argparse.ArgumentParser(description="Benchmark Baseline vs Hough vs GNN scaling")
     parser.add_argument("--events", type=int, default=500, help="Number of events per simulation run")
     parser.add_argument("--device", type=str, default="cpu", help="Device for GNN inference")
-    parser.add_argument("--checkpoint", type=str, default="/Users/IvanTang/hep/data_Run502/runs/gnn/best_model.pt", help="Path to GNN model checkpoint")
-    parser.add_argument("--output-dir", type=str, default="/Users/IvanTang/hep/data_Run502/outputs/plots/", help="Output directory for plots")
+    parser.add_argument("--checkpoint", type=str, default=str(RUNS_DIR / "gnn/best_model.pt"), help="Path to GNN model checkpoint")
+    parser.add_argument("--output-dir", type=str, default=str(OUTPUTS_DIR / "plots/"), help="Output directory for plots")
     args = parser.parse_args()
     
     # ── Sweep 1: Background scaling ──────────────────────────────────────────

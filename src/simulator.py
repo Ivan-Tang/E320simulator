@@ -638,6 +638,7 @@ def simulate_train_test(
 # ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import argparse
+    from src.config import HIT_LEVEL_PROCESSED, SIM_DIR
 
     parser = argparse.ArgumentParser(description="E320 cluster-level fast simulator")
     parser.add_argument("--n-events", type=int, default=10000)
@@ -648,14 +649,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--bg-data-path",
         type=str,
-        default="/Users/IvanTang/hep/data_Run502/processed/hit_level.parquet",
+        default=str(HIT_LEVEL_PROCESSED),
     )
     parser.add_argument("--cluster-size", choices=["fixed", "empirical"], default="fixed")
     parser.add_argument(
         "--synthetic-bg-n-per-layer", type=int, default=700,
         help="Number of background clusters per layer per event (synthetic mode)",
     )
-    parser.add_argument("--output-dir", type=str, default="/Users/IvanTang/hep/data_Run502/simulation")
+    parser.add_argument("--output-dir", type=str, default=str(SIM_DIR))
     parser.add_argument("--mode", type=str, choices=["train", "test", "both"], default="both")
     args = parser.parse_args()
 

@@ -41,11 +41,11 @@ from src.baseline import (
     _shared_hit_rejection,
 )
 from src.train import load_checkpoint
+from src.config import SIM_DIR
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Paths (override via CLI or edit here)
 # ──────────────────────────────────────────────────────────────────────────────
-SIM_DIR         = "/Users/IvanTang/hep/data_Run502/simulation"
 CHECKPOINT_PATH = "runs/exp_gnn_v1/best_model.pt"
 DEVICE          = "cpu"   # "cpu" | "mps" | "cuda"
 

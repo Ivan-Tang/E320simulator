@@ -13,6 +13,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.hough_baseline import HoughConfig, _process_event_hough
+from src.config import SIM_DIR, RUNS_DIR, OUTPUTS_DIR
 from src.baseline import (
     BaselineConfig,
     _build_edges,
@@ -431,9 +432,9 @@ def compare_timing(
 
 
 if __name__ == "__main__":
-    data_dir        = "/Users/IvanTang/hep/data_Run502/simulation/"
-    checkpoint_path = "/Users/IvanTang/hep/data_Run502/runs/gnn/best_model.pt"
-    output_dir      = "/Users/IvanTang/hep/data_Run502/outputs/plots/"
+    data_dir        = str(SIM_DIR) + "/"
+    checkpoint_path = str(RUNS_DIR / "gnn/best_model.pt")
+    output_dir      = str(OUTPUTS_DIR / "plots/")
     
     # Compare on test set (can also run on 'train')
     compare_timing(data_dir, suffix="test", checkpoint_path=checkpoint_path, output_dir=output_dir)
