@@ -10,7 +10,7 @@ ML (train on train, evaluate on test):
 
 Usage:
     cd /Users/IvanTang/hep/E320simulator
-    python scripts/run_benchmark.py [--device mps] [--epochs 50] [--force-retrain]
+    python scripts/run_benchmark.py [--device mps] [--epochs 200] [--workers 1] [--force-retrain]
 """
 from __future__ import annotations
 
@@ -23,12 +23,16 @@ import polars as pl
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from src.baseline import BaselineConfig
+from src.hough_baseline import HoughConfig
 from src.train import TrainConfig, train
 from src.utils import build_labeled_edges_from_sim
 from scripts.run_baseline import evaluate_baseline_on_sim
 from scripts.run_hough import evaluate_hough_on_sim
 from scripts.run_model import run_edge_classifier_reco
 from scripts.compare_reco import compare
+
+
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 _BASE = Path.home() / "hep/data_Run502"
@@ -60,7 +64,8 @@ def train_ml_model(
         print(f"  checkpoint exists → skipping training: {ckpt_path}")
         return str(ckpt_path)
 
-    print(f"  Building labeled edges from train clusters...")
+    print(f"  Building labeled edges from {clusters_df['event_id'].n_unique():,} events "
+          f"({len(clusters_df):,} clusters)...")
     edges_df = build_labeled_edges_from_sim(clusters_df)
     print(f"  Built {len(edges_df):,} candidate edges")
 
@@ -80,7 +85,12 @@ def train_ml_model(
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def main(device: str = "mps", force_retrain: bool = False, epochs: int = 50) -> None:
+def main(
+    device: str = "mps",
+    force_retrain: bool = False,
+    epochs: int = 200,
+    workers: int = 1,
+) -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     print("=" * 65)
@@ -88,9 +98,16 @@ def main(device: str = "mps", force_retrain: bool = False, epochs: int = 50) -> 
     clusters_train = pl.read_parquet(TRAIN_CLUSTERS)
     clusters_test  = pl.read_parquet(TEST_CLUSTERS)
     tracks_test    = pl.read_parquet(TEST_TRACKS)
-    print(f"  Train clusters : {len(clusters_train):,}")
-    print(f"  Test  clusters : {len(clusters_test):,}")
+
+    print(f"  Train clusters : {len(clusters_train):,}  "
+          f"({clusters_train['event_id'].n_unique():,} events)")
+    print(f"  Test  clusters : {len(clusters_test):,}  "
+          f"({clusters_test['event_id'].n_unique():,} events)")
     print(f"  Test  tracks   : {len(tracks_test):,}")
+    print(f"  workers        : {workers}")
+
+    baseline_cfg = BaselineConfig(n_workers=workers)
+    hough_cfg    = HoughConfig(n_workers=workers)
 
     reco_paths: dict[str, str] = {}
 
@@ -99,8 +116,8 @@ def main(device: str = "mps", force_retrain: bool = False, epochs: int = 50) -> 
     print("Non-ML algorithms (test set only)")
 
     for name, fn in [
-        ("Baseline", lambda: evaluate_baseline_on_sim(clusters_test, tracks_test)),
-        ("Hough",    lambda: evaluate_hough_on_sim(clusters_test, tracks_test)),
+        ("Baseline", lambda: evaluate_baseline_on_sim(clusters_test, tracks_test, baseline_cfg)),
+        ("Hough",    lambda: evaluate_hough_on_sim(clusters_test, tracks_test, hough_cfg)),
     ]:
         print(f"\n[{name}]")
         t0 = time.perf_counter()
@@ -137,7 +154,7 @@ def main(device: str = "mps", force_retrain: bool = False, epochs: int = 50) -> 
         try:
             result = run_edge_classifier_reco(
                 clusters_test, tracks_test, ckpt_path,
-                threshold=0.5, device=device,
+                threshold=0.1, device=device,
             )
         except Exception as e:
             print(f"  [ERROR] inference failed: {e}")
@@ -157,9 +174,16 @@ def main(device: str = "mps", force_retrain: bool = False, epochs: int = 50) -> 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Benchmark E320 tracking algorithms")
-    parser.add_argument("--device",        default="mps", choices=["cpu", "cuda", "mps"])
-    parser.add_argument("--epochs",        type=int,  default=50)
+    parser.add_argument("--device",           default="mps", choices=["cpu", "cuda", "mps"])
+    parser.add_argument("--epochs",           type=int, default=200)
+    parser.add_argument("--workers",       type=int, default=1,
+                        help="Parallel workers for non-ML algorithms (default 1 to limit memory)")
     parser.add_argument("--force-retrain", action="store_true",
                         help="Re-train even if checkpoint already exists")
     args = parser.parse_args()
-    main(device=args.device, force_retrain=args.force_retrain, epochs=args.epochs)
+    main(
+        device=args.device,
+        force_retrain=args.force_retrain,
+        epochs=args.epochs,
+        workers=args.workers,
+    )
