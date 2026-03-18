@@ -43,11 +43,21 @@ def compute_metrics(reco: pl.DataFrame, tracks: pl.DataFrame) -> dict:
     tracks:
         Truth track table with columns: track_id, event_id, is_signal.
     """
+    n_truth  = tracks.height
+    n_signal = tracks.filter(pl.col("is_signal")).height
+
+    if reco.is_empty() or "is_kept" not in reco.columns:
+        return {
+            "n_truth": n_truth, "n_signal": n_signal, "n_kept": 0,
+            "n_matched": 0, "n_unique_matched": 0, "n_fake": 0,
+            "efficiency_%": 0.0, "signal_eff_%": 0.0, "fake_rate_%": 0.0,
+            "chi2_median": float("nan"), "chi2_p95": float("nan"),
+            "rms_median_um": float("nan"), "n_layers_mean": float("nan"),
+        }
+
     kept = reco.filter(pl.col("is_kept"))
 
     n_kept   = kept.height
-    n_truth  = tracks.height
-    n_signal = tracks.filter(pl.col("is_signal")).height
 
     matched    = kept.filter(pl.col("matched_track_id") >= 0)
     n_matched  = matched.height
