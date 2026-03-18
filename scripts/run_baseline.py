@@ -60,18 +60,18 @@ def evaluate_baseline_on_sim(
     unique_events, starts = np.unique(eid_arr, return_index=True)
     counts = np.diff(np.append(starts, len(eid_arr)))
 
-    # Build per-event argument tuples (copy slices for process safety)
+    # Build per-event argument tuples
     event_args = []
     for i in range(len(unique_events)):
         s, c_ = int(starts[i]), int(counts[i])
         event_args.append((
             int(unique_events[i]),
-            x_arr[s:s+c_].copy(),
-            y_arr[s:s+c_].copy(),
-            z_arr[s:s+c_].copy(),
-            lid_arr[s:s+c_].copy(),
-            nid_arr[s:s+c_].copy(),
-            tid_arr[s:s+c_].copy(),
+            x_arr[s:s+c_],
+            y_arr[s:s+c_],
+            z_arr[s:s+c_],
+            lid_arr[s:s+c_],
+            nid_arr[s:s+c_],
+            tid_arr[s:s+c_],
             cfg,
         ))
 
