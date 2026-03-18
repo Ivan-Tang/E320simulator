@@ -89,7 +89,8 @@ class InteractionNet(nn.Module):
     3. MP rounds × n_mp:
        a. edge update : MLP([h_i, h_j, h_edge]) → h_edge'
        b. node update : MLP([h_node, mean(h_edge' from incident edges)]) → h_node'
-    4. EdgeDecoder  : [h_i, h_j, h_edge] → sigmoid score
+    4. emb_output   : hidden → emb_dim  (L2-normalised, stored as last_embeddings)
+    5. EdgeDecoder  : [h_i, h_j, h_edge] → sigmoid score
     """
 
     def __init__(
@@ -98,6 +99,7 @@ class InteractionNet(nn.Module):
         edge_dim: int = EDGE_DIM,
         hidden: int = 64,
         n_mp: int = 2,
+        emb_dim: int = 8,
     ):
         super().__init__()
         self.hidden = hidden
@@ -112,6 +114,10 @@ class InteractionNet(nn.Module):
         self.nodeMLPs = nn.ModuleList([
             MLP(2 * hidden, hidden, hidden, n_layers=2) for _ in range(n_mp)
         ])
+
+        # Intermediate embedding output (L2-normalised in forward)
+        self.emb_output = MLP(hidden, hidden, emb_dim, n_layers=2)
+        self.last_embeddings: Tensor | None = None
 
         # Decoder
         self.decoder = MLP(3 * hidden, hidden, 1, n_layers=2)
@@ -142,13 +148,14 @@ class InteractionNet(nn.Module):
 
             h_n = nodeMLP(torch.cat([h_n, agg], dim=-1))  # (N, H)
 
+        self.last_embeddings = F.normalize(self.emb_output(h_n), dim=-1)  # (N, emb_dim)
         score = self.decoder(torch.cat([h_n[src], h_n[dst], h_e], dim=-1))  # (E, 1)
         return score.squeeze(-1).sigmoid()
 
 
 class ResGNN(nn.Module):
     """ResGNN model from exatrkx-ctd2020.
-    
+
     Sparse message-passing graph neural network for segment classification.
     Uses edge and node networks with residual connections.
     """
@@ -162,7 +169,7 @@ class ResGNN(nn.Module):
         super().__init__()
         self.n_graph_iters = n_graph_iters
         self.hidden_dim = hidden
-        
+
         self.node_encoder = MLP(node_dim, hidden, hidden, n_layers=2)
         self.edge_network = MLP(2 * hidden, hidden, 1, n_layers=4)
         self.node_network = MLP(3 * hidden, hidden, hidden, n_layers=4)
@@ -177,23 +184,23 @@ class ResGNN(nn.Module):
         N = node_feat.shape[0]
 
         x = self.node_encoder(node_feat)
-        
+
         for i in range(self.n_graph_iters):
             x0 = x
             edge_inputs = torch.cat([x[src], x[dst]], dim=-1)
             e = torch.sigmoid(self.edge_network(edge_inputs).squeeze(-1))
-            
+
             mi = torch.zeros((N, self.hidden_dim), device=x.device, dtype=x.dtype)
             mo = torch.zeros((N, self.hidden_dim), device=x.device, dtype=x.dtype)
-            
+
             mi.index_add_(0, dst, e.unsqueeze(-1) * x[src])
             mo.index_add_(0, src, e.unsqueeze(-1) * x[dst])
-            
+
             node_inputs = torch.cat([mi, mo, x], dim=-1)
             x = self.node_network(node_inputs)
-            
+
             x = x + x0
-            
+
         edge_inputs = torch.cat([x[src], x[dst]], dim=-1)
         return self.edge_network(edge_inputs).squeeze(-1).sigmoid()
 
@@ -210,12 +217,12 @@ class MPNN(nn.Module):
         super().__init__()
         self.n_graph_iters = n_graph_iters
         self.hidden_dim = hidden
-        
+
         self.node_encoder = MLP(node_dim, hidden, hidden, n_layers=2)
         self.edge_network = MLP(2 * hidden, hidden, hidden, n_layers=4)
         self.node_network = MLP(2 * hidden, hidden, hidden, n_layers=4)
         self.edge_classifier = MLP(2 * hidden, hidden, 1, n_layers=2)
-        
+
     def forward(
         self,
         node_feat: Tensor,   # (N, node_dim)
@@ -224,22 +231,22 @@ class MPNN(nn.Module):
     ) -> Tensor:             # (E,)
         send_idx = torch.cat([edge_index[0], edge_index[1]], dim=0)
         recv_idx = torch.cat([edge_index[1], edge_index[0]], dim=0)
-        
+
         x = self.node_encoder(node_feat)
         N = node_feat.shape[0]
-        
+
         for i in range(self.n_graph_iters):
             x0 = x
             edge_inputs = torch.cat([x[send_idx], x[recv_idx]], dim=-1)
             e = self.edge_network(edge_inputs)
-            
+
             aggr_messages = torch.zeros((N, self.hidden_dim), device=x.device, dtype=x.dtype)
             aggr_messages.index_add_(0, recv_idx, e)
-            
+
             node_inputs = torch.cat([x, aggr_messages], dim=-1)
             x = self.node_network(node_inputs)
             x = x + x0
-            
+
         start_idx, end_idx = edge_index
         clf_inputs = torch.cat([x[start_idx], x[end_idx]], dim=-1)
         return self.edge_classifier(clf_inputs).squeeze(-1).sigmoid()
@@ -811,21 +818,22 @@ class HierarchicalGNN(nn.Module):
     to the supernode of its layer; the super-graph is a bidirectional chain
     connecting adjacent layers.
 
-    Architecture
-    ------------
-    1. Node encoder + edge encoder
-    2. n_interaction_iters × InteractionGNNCell   (hit-level message passing)
-    3. Supernode construction:
-       - supernode[l] = mean of updated hit features on layer l
-       - bipartite graph : hit i → supernode layer_ids[i]   (uniform weights)
-       - super-graph     : chain 0↔1↔2↔3↔4   (bidirectional)
-    4. n_hierarchical_iters × HierarchicalGNNCell (hits ↔ supernodes)
-    5. Edge decoder : [n_i, n_j, e] → sigmoid score
+    Follows the original two-stage design more closely:
+    1. InteractionGNN block → intermediate L2-normalized embeddings (emb_dim)
+    2. Cosine-similarity soft bipartite weights (hit ↔ layer-mean embedding)
+    3. HierarchicalGNN block with hits, edges, supernodes and superedges
+    4. Edge decoder → sigmoid score
+
+    The intermediate embeddings are stored as ``last_embeddings`` after each
+    forward pass for optional embedding (HingeLoss) training.
 
     Parameters
     ----------
     n_layers : int
         Number of detector layers (5 for E320).
+    emb_dim : int
+        Dimension of intermediate L2-normalized embeddings (default 8, same as
+        the original paper).
     """
 
     def __init__(
@@ -836,10 +844,12 @@ class HierarchicalGNN(nn.Module):
         n_interaction_iters: int = 3,
         n_hierarchical_iters: int = 3,
         n_layers: int = 5,
+        emb_dim: int = 8,
     ):
         super().__init__()
         H = hidden_dim
         self.n_layers = n_layers
+        self.emb_dim = emb_dim
 
         self.node_encoder = MLP(node_dim, H, H, n_layers=3)
         self.edge_encoder = MLP(edge_dim, H, H, n_layers=2)
@@ -847,6 +857,10 @@ class HierarchicalGNN(nn.Module):
         self.interaction_cells = nn.ModuleList([
             InteractionGNNCell(H) for _ in range(n_interaction_iters)
         ])
+
+        # Intermediate embedding output: hidden → emb_dim, then L2-normalized.
+        # Mirrors the original paper's per-hit embedding space used for clustering.
+        self.emb_output = MLP(H, H, emb_dim, n_layers=3)
 
         # Supernode encoder: mean of per-layer hit features → supernode repr
         self.supernode_encoder = MLP(H, H, H, n_layers=2)
@@ -859,10 +873,18 @@ class HierarchicalGNN(nn.Module):
 
         self.edge_decoder = MLP(3 * H, H, 1, n_layers=2)
 
+        # Set during forward; used by training loop for optional embedding loss.
+        self.last_embeddings: Tensor | None = None
+
     def _build_super_structure(
-        self, h_n: Tensor, node_feat: Tensor
+        self, h_n: Tensor, node_feat: Tensor, embeddings: Tensor
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-        """Construct supernodes, superedges and bipartite graph from layer IDs."""
+        """Construct supernodes, superedges and bipartite graph from layer IDs.
+
+        Bipartite weights are computed via cosine similarity between each hit's
+        intermediate embedding and the mean embedding of its detector layer,
+        matching the spirit of the original paper's dynamic graph construction.
+        """
         N, H = h_n.shape
         dev, dtype = h_n.device, h_n.dtype
         S = self.n_layers
@@ -877,15 +899,28 @@ class HierarchicalGNN(nn.Module):
         ])  # (2, N)
 
         # Supernode initial features: mean of hit representations per layer
-        sn_agg = torch.zeros(S, H, device=dev, dtype=dtype)
         counts = torch.zeros(S, device=dev, dtype=dtype)
-        sn_agg.index_add_(0, layer_ids, h_n)
         counts.index_add_(0, layer_ids, torch.ones(N, device=dev, dtype=dtype))
         counts.clamp_(min=1.0)
+
+        sn_agg = torch.zeros(S, H, device=dev, dtype=dtype)
+        sn_agg.index_add_(0, layer_ids, h_n)
         h_sn = self.supernode_encoder(sn_agg / counts.unsqueeze(-1))  # (S, H)
 
-        # Bipartite weights: uniform 1/count so messages sum to mean
-        bipartite_weights = (1.0 / counts[layer_ids]).unsqueeze(-1)  # (N, 1)
+        # Soft bipartite weights via cosine similarity of intermediate embeddings.
+        # Compute L2-normalised layer-mean embeddings.
+        emb_agg = torch.zeros(S, self.emb_dim, device=dev, dtype=dtype)
+        emb_agg.index_add_(0, layer_ids, embeddings)
+        emb_layer = F.normalize(emb_agg / counts.unsqueeze(-1), dim=-1)  # (S, emb_dim)
+
+        # Cosine similarity ∈ [0, 1] between each hit embedding and its layer mean.
+        cos_sim = (embeddings * emb_layer[layer_ids]).sum(dim=-1, keepdim=True).clamp(min=0.0)  # (N, 1)
+
+        # Normalise per layer so that aggregated messages approximate a mean.
+        cos_sum = torch.zeros(S, 1, device=dev, dtype=dtype)
+        cos_sum.index_add_(0, layer_ids, cos_sim)
+        cos_mean = (cos_sum / counts.unsqueeze(-1))[layer_ids]  # (N, 1)
+        bipartite_weights = cos_sim / cos_mean.clamp(min=1e-8)  # (N, 1)
 
         # Super-graph: bidirectional chain 0↔1↔…↔(S-1)
         fwd = torch.arange(S - 1, device=dev)
@@ -915,9 +950,13 @@ class HierarchicalGNN(nn.Module):
         for cell in self.interaction_cells:
             h_n, h_e = cell(h_n, h_e, edge_index)
 
-        # Build hierarchical structure (layer-based supernodes)
+        # Intermediate L2-normalised embeddings (mirrors original paper Stage 1 output)
+        embeddings = F.normalize(self.emb_output(h_n), dim=-1)  # (N, emb_dim)
+        self.last_embeddings = embeddings  # expose for optional embedding loss
+
+        # Build hierarchical structure with embedding-based soft bipartite weights
         h_sn, h_se, bipartite_graph, bipartite_weights, super_graph = \
-            self._build_super_structure(h_n, node_feat)
+            self._build_super_structure(h_n, node_feat, embeddings)
 
         # Hierarchical message passing
         for cell in self.hierarchical_cells:
