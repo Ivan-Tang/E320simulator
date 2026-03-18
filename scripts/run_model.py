@@ -27,7 +27,7 @@ from src.baseline import (
     _fit_and_score,
     _shared_hit_rejection,
 )
-from src.train import load_checkpoint
+from src.train import load_checkpoint, _augment_with_embedder
 from src.train_embedder import infer_embedding_neighbors
 
 
@@ -177,6 +177,7 @@ def run_edge_classifier_reco(
 
     ckpt = load_checkpoint(checkpoint_path, device=device)
     model = ckpt["model"]
+    embedder_info = ckpt.get("embedder_info")
     device_t = torch.device(device)
     node_mean = ckpt["node_mean"].to(device_t)
     node_std  = ckpt["node_std"].to(device_t)
@@ -219,7 +220,16 @@ def run_edge_classifier_reco(
             e_src, e_dst, e_sl, e_sx, e_sy,
             nid_to_local,
         )
-        nf = (nf.to(device_t) - node_mean) / node_std
+        # Augment node features with pretrained embedder output (two-stage pipeline)
+        if embedder_info is not None:
+            nf = _augment_with_embedder(nf, embedder_info)
+        # Normalise only the base node features; embedder output is kept as-is
+        base_dim = node_mean.shape[0]
+        if nf.shape[1] > base_dim:
+            nf = torch.cat([(nf[:, :base_dim].to(device_t) - node_mean) / node_std,
+                            nf[:, base_dim:].to(device_t)], dim=-1)
+        else:
+            nf = (nf.to(device_t) - node_mean) / node_std
         ef = (ef.to(device_t) - edge_mean) / edge_std
 
         with torch.no_grad():
