@@ -31,10 +31,12 @@ from src.models import (
     EdgeMLP, InteractionNet, TransformerEdgeClassifier, TrackFormerSeed,
     ResGNN, MPNN, AGNN, EggNet, HierarchicalGNN,
 )
-from src.losses import FocalLoss
+from src.losses import FocalLoss, HingeLoss
 from src.train_embedder import EmbedderTrainConfig, train_embedder
 from src.utils import (
+    EDGE_DIM,
     EDGE_FEAT_COLS,
+    NODE_DIM,
     NODE_FEAT_COLS_SRC,
     build_labeled_edges_from_sim,
     edge_label_stats,
@@ -60,6 +62,8 @@ class TrainConfig:
     # hgnn-specific parameters
     n_hierarchical_iters: int = 3        # hierarchical message-passing rounds (hgnn only)
     n_detector_layers: int = 5           # number of detector layers, default E320
+    hgnn_emb_dim: int = 8               # intermediate embedding dimension (hgnn only)
+    hgnn_emb_loss_weight: float = 0.0   # weight for HingeLoss on intermediate embeddings (0=disabled)
 
     # transformer-specific parameters
     d_model: int = 256
@@ -92,6 +96,9 @@ class TrainConfig:
     checkpoint_dir: str | None = None   # save best model here
     log_every: int = 1                  # print val metrics every N epochs
 
+    # pretrained embedder for feature augmentation (two-stage pipeline)
+    embedder_checkpoint: str | None = None  # path to best_embedder.pt; raw features are augmented with embedder output
+
     # hardware
     device: str = "auto"                 # "auto" | "cpu" | "mps" | "cuda"
 
@@ -110,19 +117,52 @@ def _resolve_device(cfg: TrainConfig) -> torch.device:
     return torch.device("cpu")
 
 
-def _build_model(cfg: TrainConfig) -> nn.Module:
+def _load_embedder(cfg: TrainConfig) -> dict | None:
+    """Load pretrained embedder for feature augmentation (two-stage pipeline)."""
+    if cfg.embedder_checkpoint is None:
+        return None
+    from src.train_embedder import load_embedder_checkpoint
+    info = load_embedder_checkpoint(cfg.embedder_checkpoint, device="cpu")
+    # Cache tensors for fast augmentation
+    info["_emb_mean"] = torch.tensor(info["mean"], dtype=torch.float32)
+    info["_emb_std"] = torch.tensor(info["std"], dtype=torch.float32)
+    # Infer embedding dimension from model output layer
+    info["_emb_dim"] = list(info["model"].mlp.children())[-1].out_features
+    return info
+
+
+def _augment_with_embedder(
+    raw_nf: torch.Tensor,
+    embedder_info: dict,
+) -> torch.Tensor:
+    """Compute pretrained embedder output and concatenate to node features.
+
+    The embedder uses its own normalisation (stored at training time).
+    Returns ``[raw_nf, embedder_output]`` of shape ``(N, node_dim + emb_dim)``.
+    """
+    model = embedder_info["model"].eval()
+    emb_mean = embedder_info["_emb_mean"]
+    emb_std = embedder_info["_emb_std"]
+    with torch.no_grad():
+        nf_norm = (raw_nf - emb_mean) / emb_std
+        emb = model(nf_norm)  # (N, emb_dim)
+    return torch.cat([raw_nf, emb], dim=-1)
+
+
+def _build_model(cfg: TrainConfig, node_dim: int = NODE_DIM) -> nn.Module:
     if cfg.model_type == "mlp":
-        return EdgeMLP(hidden=cfg.hidden)
+        return EdgeMLP(node_dim=node_dim, hidden=cfg.hidden)
     if cfg.model_type == "gnn":
-        return InteractionNet(hidden=cfg.hidden, n_mp=cfg.n_mp)
+        return InteractionNet(node_dim=node_dim, hidden=cfg.hidden, n_mp=cfg.n_mp)
     if cfg.model_type == "resgnn":
-        return ResGNN(hidden=cfg.hidden, n_graph_iters=cfg.n_mp)
+        return ResGNN(node_dim=node_dim, hidden=cfg.hidden, n_graph_iters=cfg.n_mp)
     if cfg.model_type == "mpnn":
-        return MPNN(hidden=cfg.hidden, n_graph_iters=cfg.n_mp)
+        return MPNN(node_dim=node_dim, hidden=cfg.hidden, n_graph_iters=cfg.n_mp)
     if cfg.model_type == "agnn":
-        return AGNN(hidden=cfg.hidden, n_graph_iters=cfg.n_mp)
+        return AGNN(node_dim=node_dim, hidden=cfg.hidden, n_graph_iters=cfg.n_mp)
     if cfg.model_type == "eggnet":
         return EggNet(
+            node_dim=node_dim,
             hidden=cfg.hidden,
             n_iters=cfg.n_mp,
             n_gnns_per_iter=cfg.n_gnns_per_iter,
@@ -130,7 +170,7 @@ def _build_model(cfg: TrainConfig) -> nn.Module:
         )
     if cfg.model_type == "transformer":
         return TransformerEdgeClassifier(
-            node_dim=NODE_DIM,
+            node_dim=node_dim,
             edge_dim=EDGE_DIM,
             d_model=cfg.d_model,
             n_heads=cfg.n_heads,
@@ -140,7 +180,7 @@ def _build_model(cfg: TrainConfig) -> nn.Module:
         )
     if cfg.model_type == "trackformer":
         return TrackFormerSeed(
-            node_dim=NODE_DIM,
+            node_dim=node_dim,
             d_model=cfg.d_model,
             n_heads=cfg.n_heads,
             n_encoder_layers=cfg.n_encoder_layers,
@@ -151,10 +191,12 @@ def _build_model(cfg: TrainConfig) -> nn.Module:
         )
     if cfg.model_type == "hgnn":
         return HierarchicalGNN(
+            node_dim=node_dim,
             hidden_dim=cfg.hidden,
             n_interaction_iters=cfg.n_mp,
             n_hierarchical_iters=cfg.n_hierarchical_iters,
             n_layers=cfg.n_detector_layers,
+            emb_dim=cfg.hgnn_emb_dim,
         )
     raise ValueError(f"Unknown model_type: {cfg.model_type}")
 
@@ -180,7 +222,13 @@ def _normalise(
     edge_mean: torch.Tensor,
     edge_std: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    return (nf - node_mean) / node_std, (ef - edge_mean) / edge_std
+    # Only normalise the first NODE_DIM columns; extra columns (embedder output) are kept as-is.
+    base_dim = node_mean.shape[0]
+    if nf.shape[1] > base_dim:
+        nf = torch.cat([(nf[:, :base_dim] - node_mean) / node_std, nf[:, base_dim:]], dim=-1)
+    else:
+        nf = (nf - node_mean) / node_std
+    return nf, (ef - edge_mean) / edge_std
 
 
 def _evaluate(
@@ -191,12 +239,15 @@ def _evaluate(
     node_std: torch.Tensor,
     edge_mean: torch.Tensor,
     edge_std: torch.Tensor,
+    embedder_info: dict | None = None,
 ) -> dict[str, float]:
     model.eval()
     all_scores, all_labels = [], []
     with torch.no_grad():
         for _, ev_df in df.group_by("event_id"):
             nf, ei, ef, lab, _ = event_to_tensors(ev_df)
+            if embedder_info is not None:
+                nf = _augment_with_embedder(nf, embedder_info)
             nf, ef = _normalise(nf, ef, node_mean, node_std, edge_mean, edge_std)
             scores = model(nf.to(device), ei.to(device), ef.to(device)).cpu().numpy()
             all_scores.append(scores)
@@ -268,9 +319,17 @@ def train(
     # ── normalisation ────────────────────────────────────────────────────────
     node_mean, node_std, edge_mean, edge_std = _compute_normalisation(train_df)
 
+    # ── pretrained embedder (two-stage pipeline) ─────────────────────────────
+    embedder_info = _load_embedder(cfg)
+    node_dim_eff = NODE_DIM
+    if embedder_info is not None:
+        node_dim_eff = NODE_DIM + embedder_info["_emb_dim"]
+        print(f"[train] embedder augmentation: node_dim {NODE_DIM} → {node_dim_eff}")
+
     # ── model / optimiser ────────────────────────────────────────────────────
-    model     = _build_model(cfg).to(device)
+    model     = _build_model(cfg, node_dim=node_dim_eff).to(device)
     criterion = FocalLoss(alpha=cfg.focal_alpha, gamma=cfg.focal_gamma)
+    emb_criterion = HingeLoss(margin=1.0) if cfg.model_type == "hgnn" and cfg.hgnn_emb_loss_weight > 0 else None
     optimizer = optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=cfg.n_epochs, eta_min=cfg.lr_eta_min
@@ -303,6 +362,8 @@ def train(
             if cfg.skip_zero_pos_events and lab.sum() == 0:
                 continue
 
+            if embedder_info is not None:
+                nf = _augment_with_embedder(nf, embedder_info)
             nf, ef = _normalise(nf, ef, node_mean, node_std, edge_mean, edge_std)
             nf  = nf.to(device)
             ei  = ei.to(device)
@@ -312,6 +373,13 @@ def train(
             optimizer.zero_grad()
             pred = model(nf, ei, ef)
             loss = criterion(pred, lab)
+            # Optional embedding loss for HGNN (two-stage training from Liu et al. 2023)
+            if emb_criterion is not None and hasattr(model, "last_embeddings") and model.last_embeddings is not None:
+                emb = model.last_embeddings          # (N, emb_dim), L2-normalised
+                e_src = emb[ei[0]]                   # (E, emb_dim)
+                e_dst = emb[ei[1]]                   # (E, emb_dim)
+                dist = (e_src - e_dst).norm(dim=-1)  # (E,)
+                loss = loss + cfg.hgnn_emb_loss_weight * emb_criterion(dist, lab)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
             optimizer.step()
@@ -329,6 +397,7 @@ def train(
             metrics = _evaluate(
                 model, val_df, device,
                 node_mean, node_std, edge_mean, edge_std,
+                embedder_info=embedder_info,
             )
             row.update(metrics)
             elapsed = time.time() - t0
@@ -355,6 +424,7 @@ def train(
                             "node_std":   node_std,
                             "edge_mean":  edge_mean,
                             "edge_std":   edge_std,
+                            "node_dim":   node_dim_eff,
                         },
                         best_path,
                     )
@@ -401,11 +471,18 @@ def load_checkpoint(
         else:
             cfg = TrainConfig()
 
-    model = _build_model(cfg)
+    # Determine effective node_dim (may be augmented with embedder features)
+    node_dim = ckpt.get("node_dim", NODE_DIM)
+    embedder_info = None
+    if cfg.embedder_checkpoint:
+        embedder_info = _load_embedder(cfg)
+        node_dim = NODE_DIM + embedder_info["_emb_dim"]
+
+    model = _build_model(cfg, node_dim=node_dim)
     model.load_state_dict(ckpt["model_state"])
     model.to(device).eval()
 
-    return {
+    result = {
         "model":     model,
         "node_mean": ckpt["node_mean"],
         "node_std":  ckpt["node_std"],
@@ -414,6 +491,9 @@ def load_checkpoint(
         "epoch":     ckpt["epoch"],
         "best_ap":   ckpt["best_ap"],
     }
+    if embedder_info is not None:
+        result["embedder_info"] = embedder_info
+    return result
 
 
 def train_model(
@@ -473,6 +553,8 @@ def _cli() -> None:
     parser.add_argument("--lr",       type=float, default=3e-4)
     parser.add_argument("--device",   default="auto")
     parser.add_argument("--checkpoint", default=None, help="Directory to save checkpoints")
+    parser.add_argument("--embedder-checkpoint", default=None,
+                        help="Path to pretrained embedder .pt for node feature augmentation")
     args = parser.parse_args()
 
     clusters_df = pl.read_parquet(args.clusters)
@@ -493,6 +575,7 @@ def _cli() -> None:
             val_fraction     = args.val_fraction,
             device           = args.device,
             checkpoint_dir   = args.checkpoint,
+            embedder_checkpoint = args.embedder_checkpoint,
         )
         train(edges_df, cfg)
         return
