@@ -220,14 +220,11 @@ def run_edge_classifier_reco(
             e_src, e_dst, e_sl, e_sx, e_sy,
             nid_to_local,
         )
-        # Augment node features with pretrained embedder output (two-stage pipeline)
+        # Two-stage pipeline: replace raw node features with pretrained embedder output.
         if embedder_info is not None:
-            nf = _augment_with_embedder(nf, embedder_info)
-        # Normalise only the base node features; embedder output is kept as-is
-        base_dim = node_mean.shape[0]
-        if nf.shape[1] > base_dim:
-            nf = torch.cat([(nf[:, :base_dim].to(device_t) - node_mean) / node_std,
-                            nf[:, base_dim:].to(device_t)], dim=-1)
+            nf = _augment_with_embedder(nf, embedder_info)  # (N, emb_dim)
+            # Embedder applies its own normalisation internally; skip raw-feature normalisation.
+            nf = nf.to(device_t)
         else:
             nf = (nf.to(device_t) - node_mean) / node_std
         ef = (ef.to(device_t) - edge_mean) / edge_std

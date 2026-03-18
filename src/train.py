@@ -135,18 +135,18 @@ def _augment_with_embedder(
     raw_nf: torch.Tensor,
     embedder_info: dict,
 ) -> torch.Tensor:
-    """Compute pretrained embedder output and concatenate to node features.
+    """Replace raw node features with pretrained embedder output.
 
-    The embedder uses its own normalisation (stored at training time).
-    Returns ``[raw_nf, embedder_output]`` of shape ``(N, node_dim + emb_dim)``.
+    The embedder is applied with its own normalisation (stored at training time).
+    Returns shape ``(N, emb_dim)`` — the embedding REPLACES the raw features;
+    it is not concatenated to them.
     """
     model = embedder_info["model"].eval()
     emb_mean = embedder_info["_emb_mean"]
     emb_std = embedder_info["_emb_std"]
     with torch.no_grad():
         nf_norm = (raw_nf - emb_mean) / emb_std
-        emb = model(nf_norm)  # (N, emb_dim)
-    return torch.cat([raw_nf, emb], dim=-1)
+        return model(nf_norm)  # (N, emb_dim)
 
 
 def _build_model(cfg: TrainConfig, node_dim: int = NODE_DIM) -> nn.Module:
@@ -222,11 +222,10 @@ def _normalise(
     edge_mean: torch.Tensor,
     edge_std: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # Only normalise the first NODE_DIM columns; extra columns (embedder output) are kept as-is.
-    base_dim = node_mean.shape[0]
-    if nf.shape[1] > base_dim:
-        nf = torch.cat([(nf[:, :base_dim] - node_mean) / node_std, nf[:, base_dim:]], dim=-1)
-    else:
+    # When an embedder is used, nf is already the embedder output and does not match
+    # node_mean (which covers the original 7-dim raw features). Skip node normalisation
+    # in that case; the embedder applies its own normalisation internally.
+    if nf.shape[1] == node_mean.shape[0]:
         nf = (nf - node_mean) / node_std
     return nf, (ef - edge_mean) / edge_std
 
@@ -323,8 +322,8 @@ def train(
     embedder_info = _load_embedder(cfg)
     node_dim_eff = NODE_DIM
     if embedder_info is not None:
-        node_dim_eff = NODE_DIM + embedder_info["_emb_dim"]
-        print(f"[train] embedder augmentation: node_dim {NODE_DIM} → {node_dim_eff}")
+        node_dim_eff = embedder_info["_emb_dim"]
+        print(f"[train] embedder pipeline: node_dim {NODE_DIM} → {node_dim_eff} (embedder replaces raw features)")
 
     # ── model / optimiser ────────────────────────────────────────────────────
     model     = _build_model(cfg, node_dim=node_dim_eff).to(device)
