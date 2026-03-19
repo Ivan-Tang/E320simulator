@@ -27,6 +27,7 @@ from typing import Literal
 
 import numpy as np
 import polars as pl
+from src.config import HIT_LEVEL_PROCESSED
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -154,12 +155,18 @@ class SyntheticBackgroundPool:
     """Generates background clusters uniformly on each layer's active area."""
 
     def __init__(self, n_per_layer: int = 50, use_alignment: bool = True,
-                 cluster_size_mode: str = "fixed"):
+                 cluster_size_mode: str = "fixed",
+                 background_data_path: str | None = None):
         from src.geometry import E320PrototypeGeometry
 
         self.n_per_layer = n_per_layer
         self.cluster_size_mode = cluster_size_mode
         self.geom = E320PrototypeGeometry(use_alignment=use_alignment)
+
+        self._cluster_size_table = None
+        if cluster_size_mode == "empirical":
+            path = background_data_path or str(HIT_LEVEL_PROCESSED)
+            self._cluster_size_table = _load_cluster_size_table(path)
 
     def sample(self, rng: np.random.Generator) -> dict[str, np.ndarray]:
         """Generate one synthetic background event."""
@@ -187,7 +194,8 @@ class SyntheticBackgroundPool:
             layer_ids[sl] = lid
 
         # build a minimal config proxy for _sample_cluster_size
-        _cfg_proxy = SimConfig(cluster_size_mode=self.cluster_size_mode)
+        _cfg_proxy = SimConfig(cluster_size_mode=self.cluster_size_mode,
+                               _cluster_size_table=self._cluster_size_table)
         sx, sy, sz = _sample_cluster_size(rng, total, _cfg_proxy)
         size_x = sx.astype(np.int32)
         size_y = sy.astype(np.int32)
@@ -513,7 +521,7 @@ def simulate(
     bg_pool: BackgroundPool | SyntheticBackgroundPool | None = _bg_pool
     if bg_pool is None and cfg.background_mode == "data":
         if cfg.background_data_path is None:
-            raise ValueError("background_mode='data' requires background_data_path")
+            cfg.background_data_path = str(HIT_LEVEL_PROCESSED)
         full_pool = BackgroundPool(cfg.background_data_path)
         train_pool, test_pool = full_pool.split(cfg.train_test_split, cfg.seed)
         bg_pool = test_pool if cfg.mode == "test" else train_pool
@@ -521,16 +529,14 @@ def simulate(
         bg_pool = SyntheticBackgroundPool(
             n_per_layer=cfg.synthetic_bg_n_per_layer,
             cluster_size_mode=cfg.cluster_size_mode,
+            background_data_path=cfg.background_data_path,
         )
 
     # Optionally load cluster-size table
     if cfg.cluster_size_mode == "empirical":
-        path = cfg.background_data_path
-        if path is None:
-            raise ValueError(
-                "cluster_size_mode='empirical' requires background_data_path"
-            )
-        cfg._cluster_size_table = _load_cluster_size_table(path)
+        if cfg.background_data_path is None:
+            cfg.background_data_path = str(HIT_LEVEL_PROCESSED)
+        cfg._cluster_size_table = _load_cluster_size_table(cfg.background_data_path)
 
     # ── Generate events ──────────────────────────────────────────────
     all_tracks: list[dict] = []
@@ -604,7 +610,7 @@ def simulate_train_test(
     test_pool: BackgroundPool | SyntheticBackgroundPool | None = None
     if cfg.background_mode == "data":
         if cfg.background_data_path is None:
-            raise ValueError("background_mode='data' requires background_data_path")
+            cfg.background_data_path = str(HIT_LEVEL_PROCESSED)
         full_pool = BackgroundPool(cfg.background_data_path)
         train_pool, test_pool = full_pool.split(cfg.train_test_split, cfg.seed)
     elif cfg.background_mode == "synthetic":
@@ -612,20 +618,19 @@ def simulate_train_test(
         train_pool = SyntheticBackgroundPool(
             n_per_layer=cfg.synthetic_bg_n_per_layer,
             cluster_size_mode=cfg.cluster_size_mode,
+            background_data_path=cfg.background_data_path,
         )
         test_pool = SyntheticBackgroundPool(
             n_per_layer=cfg.synthetic_bg_n_per_layer,
             cluster_size_mode=cfg.cluster_size_mode,
+            background_data_path=cfg.background_data_path,
         )
 
     # ── Load cluster-size table once ────────────────────────────────
     if cfg.cluster_size_mode == "empirical":
-        path = cfg.background_data_path
-        if path is None:
-            raise ValueError(
-                "cluster_size_mode='empirical' requires background_data_path"
-            )
-        cfg._cluster_size_table = _load_cluster_size_table(path)
+        if cfg.background_data_path is None:
+            cfg.background_data_path = str(HIT_LEVEL_PROCESSED)
+        cfg._cluster_size_table = _load_cluster_size_table(cfg.background_data_path)
 
     # ── Train ──────────────────────────────────────────────────────
     print("\n" + "=" * 60)
