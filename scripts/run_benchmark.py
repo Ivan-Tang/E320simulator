@@ -6,7 +6,7 @@ Non-ML (run on test only):
   - Hough Transform
 
 ML (train on train, evaluate on test):
-  - MLP, GNN, ResGNN, MPNN, AGNN, EggNet, HGNN
+  - MLP, GNN (ResGNN), InteractionNet, EggNet, HGNN
 
 Usage:
     cd /Users/IvanTang/hep/E320simulator
@@ -45,7 +45,7 @@ TEST_CLUSTERS  = SIM_DIR / "sim_clusters_test.parquet"
 TEST_TRACKS    = SIM_DIR / "sim_tracks_test.parquet"
 
 # ML model types to benchmark
-ML_MODELS = ["mlp", "gnn", "resgnn", "mpnn", "agnn", "eggnet", "hgnn", "transformer"]
+ML_MODELS = ["mlp", "gnn", "interaction_net", "eggnet", "hgnn", "transformer"]
 
 
 # ── Training helper ───────────────────────────────────────────────────────────

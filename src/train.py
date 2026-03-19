@@ -29,7 +29,7 @@ from sklearn.metrics import average_precision_score, roc_auc_score
 
 from src.models import (
     EdgeMLP, InteractionNet, TransformerEdgeClassifier,
-    ResGNN, MPNN, AGNN, EggNet, HierarchicalGNN,
+    ResGNN, EggNet, HierarchicalGNN,
 )
 from src.losses import FocalLoss, HingeLoss
 from src.train_embedder import EmbedderTrainConfig, train_embedder
@@ -51,7 +51,7 @@ from src.utils import (
 @dataclass
 class TrainConfig:
     # model
-    model_type: Literal["gnn", "mlp", "transformer", "trackformer", "resgnn", "mpnn", "agnn", "eggnet", "hgnn"] = "gnn"
+    model_type: Literal["gnn", "mlp", "transformer", "interaction_net", "eggnet", "hgnn"] = "gnn"
     hidden: int = 64
     n_mp: int = 2                        # message-passing rounds (gnn / hgnn interaction iters)
 
@@ -153,13 +153,9 @@ def _build_model(cfg: TrainConfig, node_dim: int = NODE_DIM) -> nn.Module:
     if cfg.model_type == "mlp":
         return EdgeMLP(node_dim=node_dim, hidden=cfg.hidden)
     if cfg.model_type == "gnn":
-        return InteractionNet(node_dim=node_dim, hidden=cfg.hidden, n_mp=cfg.n_mp)
-    if cfg.model_type == "resgnn":
         return ResGNN(node_dim=node_dim, hidden=cfg.hidden, n_graph_iters=cfg.n_mp)
-    if cfg.model_type == "mpnn":
-        return MPNN(node_dim=node_dim, hidden=cfg.hidden, n_graph_iters=cfg.n_mp)
-    if cfg.model_type == "agnn":
-        return AGNN(node_dim=node_dim, hidden=cfg.hidden, n_graph_iters=cfg.n_mp)
+    if cfg.model_type == "interaction_net":
+        return InteractionNet(node_dim=node_dim, hidden=cfg.hidden, n_mp=cfg.n_mp)
     if cfg.model_type == "eggnet":
         return EggNet(
             node_dim=node_dim,
@@ -520,7 +516,7 @@ def _cli() -> None:
                         help="Training task: edge classifier or hit embedder")
 
     # edge-model options
-    parser.add_argument("--model",    default="gnn", choices=["gnn", "mlp", "resgnn", "mpnn", "agnn", "eggnet"],
+    parser.add_argument("--model",    default="gnn", choices=["gnn", "mlp", "interaction_net", "eggnet", "hgnn"],
                         help="Edge model type (used when --task=edge)")
     parser.add_argument("--epochs",   type=int, default=50)
     parser.add_argument("--hidden",   type=int, default=64)

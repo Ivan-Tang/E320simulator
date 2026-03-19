@@ -154,8 +154,8 @@ def run_edge_classifier_reco(
 ) -> pl.DataFrame:
     """Run edge-classifier reconstruction on simulated clusters.
 
-    Works with any edge-classifier model type (mlp, gnn, transformer,
-    resgnn, mpnn, agnn, eggnet, hgnn) — the model architecture is
+    Works with any edge-classifier model type (mlp, gnn, interaction_net,
+    eggnet, hgnn, transformer) — the model architecture is
     auto-detected from the checkpoint's sibling ``config.json``.
 
     Optionally pre-filters edges with a metric-learning embedder

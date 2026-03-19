@@ -48,7 +48,7 @@ from scripts.compare_reco import compute_metrics
 NON_ML_MODELS = ["baseline", "hough"]
 
 # Edge-classification models (one checkpoint each)
-EDGE_MODELS = ["mlp", "gnn", "resgnn", "mpnn", "agnn", "eggnet", "hgnn"]
+EDGE_MODELS = ["mlp", "gnn", "interaction_net", "eggnet", "hgnn"]
 
 # Matches run_benchmark.py ML_MODELS list
 ALL_MODELS = NON_ML_MODELS + EDGE_MODELS + ["transformer"]
@@ -59,15 +59,13 @@ _PALETTE = [
     "#DD8452",  # hough
     "#55A868",  # mlp
     "#C44E52",  # gnn
-    "#8172B2",  # resgnn
-    "#937860",  # mpnn
-    "#DA8BC3",  # agnn
+    "#8172B2",  # interaction_net
     "#8C8C8C",  # eggnet
     "#CCB974",  # hgnn
     "#64B5CD",  # transformer
 ]
 MODEL_STYLE: dict[str, dict] = {
-    m: {"color": _PALETTE[i], "marker": ["o","s","^","D","v","P","X","*","h","<"][i]}
+    m: {"color": _PALETTE[i], "marker": ["o","s","^","D","v","P","X","*"][i]}
     for i, m in enumerate(ALL_MODELS)
 }
 
