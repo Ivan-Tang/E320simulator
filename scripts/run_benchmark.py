@@ -6,7 +6,7 @@ Non-ML (run on test only):
   - Hough Transform
 
 ML (train on train, evaluate on test):
-  - MLP, GNN, ResGNN, MPNN, AGNN, EggNet
+  - MLP, GNN, ResGNN, MPNN, AGNN, EggNet, HGNN
 
 Usage:
     cd /Users/IvanTang/hep/E320simulator
@@ -26,10 +26,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.baseline import BaselineConfig
 from src.hough_baseline import HoughConfig
 from src.train import TrainConfig, train
+from src.train_trackformer import TrackFormerConfig, train_trackformer
+from src.train_hit_filter import HitFilterConfig, train_hit_filter
 from src.utils import build_labeled_edges_from_sim
 from scripts.run_baseline import evaluate_baseline_on_sim
 from scripts.run_hough import evaluate_hough_on_sim
-from scripts.run_model import run_edge_classifier_reco
+from scripts.run_model import run_edge_classifier_reco, run_trackformer_reco
 from scripts.compare_reco import compare
 
 
@@ -42,7 +44,7 @@ TEST_CLUSTERS  = SIM_DIR / "sim_clusters_test.parquet"
 TEST_TRACKS    = SIM_DIR / "sim_tracks_test.parquet"
 
 # ML model types to benchmark
-ML_MODELS = ["mlp", "gnn", "resgnn", "mpnn", "agnn", "eggnet"]
+ML_MODELS = ["mlp", "gnn", "resgnn", "mpnn", "agnn", "eggnet", "hgnn", "transformer"]
 
 
 # ── Training helper ───────────────────────────────────────────────────────────
@@ -134,7 +136,71 @@ def main(
         ckpt_dir  = RUNS_DIR / model_type
         ckpt_path = str(ckpt_dir / "best_model.pt")
 
-        # Train
+        # ── TrackFormer: two-stage train + infer path ─────────────────────
+        if model_type == "transformer":
+            ckpt_dir.mkdir(parents=True, exist_ok=True)
+            hf_ckpt_path = str(ckpt_dir / "hit_filter.pt")
+            tf_ckpt_path = str(ckpt_dir / "best_model.pt")
+
+            # Stage 1: Hit Filter
+            t0 = time.perf_counter()
+            try:
+                if Path(hf_ckpt_path).exists() and not force_retrain:
+                    print(f"  [Stage 1] hit filter checkpoint exists → skipping: {hf_ckpt_path}")
+                else:
+                    print("  [Stage 1] Training hit filter...")
+                    hf_cfg = HitFilterConfig(
+                        n_epochs       = epochs,
+                        device         = device,
+                        checkpoint_dir = str(ckpt_dir),
+                    )
+                    train_hit_filter(clusters_train, hf_cfg)
+            except Exception as e:
+                print(f"  [ERROR] hit filter training failed: {e}")
+                continue
+            hf_train_dt = time.perf_counter() - t0
+
+            # Stage 2: MaskFormer (with frozen hit filter)
+            t0 = time.perf_counter()
+            try:
+                if Path(tf_ckpt_path).exists() and not force_retrain:
+                    print(f"  [Stage 2] trackformer checkpoint exists → skipping: {tf_ckpt_path}")
+                else:
+                    print("  [Stage 2] Training MaskFormer on filtered hits...")
+                    tf_cfg = TrackFormerConfig(
+                        n_epochs               = epochs,
+                        device                 = device,
+                        checkpoint_dir         = str(ckpt_dir),
+                        hit_filter_checkpoint  = hf_ckpt_path,
+                        hit_filter_threshold   = 0.1,
+                    )
+                    train_trackformer(clusters_train, tf_cfg)
+            except Exception as e:
+                print(f"  [ERROR] maskformer training failed: {e}")
+                continue
+            tf_train_dt = time.perf_counter() - t0
+
+            t0 = time.perf_counter()
+            try:
+                result = run_trackformer_reco(
+                    clusters_test, tracks_test, tf_ckpt_path,
+                    hit_filter_checkpoint=hf_ckpt_path,
+                    hit_filter_threshold=0.1,
+                    conf_threshold=0.5, mask_threshold=0.5,
+                    min_layers=4, device=device,
+                )
+            except Exception as e:
+                print(f"  [ERROR] inference failed: {e}")
+                continue
+            infer_dt = time.perf_counter() - t0
+
+            out = OUT_DIR / f"{model_type}_test.parquet"
+            result.write_parquet(out)
+            reco_paths[model_type.upper()] = str(out)
+            print(f"  → {out}  (hf_train {hf_train_dt:.0f}s  tf_train {tf_train_dt:.0f}s  infer {infer_dt:.1f}s)")
+            continue
+
+        # ── Edge-classification models ─────────────────────────────────────
         t0 = time.perf_counter()
         try:
             ckpt_path = train_ml_model(
