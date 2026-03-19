@@ -1,216 +1,362 @@
-import os
+"""Scaling study: compare all benchmark models as background / signal varies.
+
+Two sweeps
+----------
+1. Background scaling : synthetic_bg_n_per_layer varies, mean_n_signal fixed
+2. Signal scaling     : mean_n_signal varies, background fixed
+
+All ML models use pre-trained checkpoints from RUNS_DIR (no retraining).
+Transformer uses the two-stage hit-filter + MaskFormer pipeline.
+
+Metric
+------
+F1 = 2 · precision · recall / (precision + recall)
+  recall    = efficiency  = n_unique_matched / n_truth
+  precision = 1 - fake_rate = n_matched / n_kept
+
+Usage
+-----
+    cd /Users/IvanTang/hep/E320simulator
+    python scripts/compare_scaling.py [--device mps] [--events 200]
+"""
+from __future__ import annotations
+
+import argparse
 import sys
 import time
-import argparse
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 import polars as pl
 
-# Ensure we can import from the project root
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.simulator import SimConfig, simulate, SyntheticBackgroundPool
-from src.config import DATA_ROOT, RUNS_DIR, OUTPUTS_DIR
-from E320simulator.scripts.run_baseline import evaluate_baseline_on_sim
-from E320simulator.scripts.run_hough import evaluate_hough_on_sim
-from E320simulator.scripts.run_model import run_model_reco
-from E320simulator.scripts.compare_reco import compute_metrics
+from src.simulator import SimConfig, simulate
+from src.baseline import BaselineConfig
+from src.hough_baseline import HoughConfig
+from src.config import RUNS_DIR, OUTPUTS_DIR
+from scripts.run_baseline import evaluate_baseline_on_sim
+from scripts.run_hough import evaluate_hough_on_sim
+from scripts.run_model import run_edge_classifier_reco, run_trackformer_reco
+from scripts.compare_reco import compute_metrics
 
 
-def run_experiment(
+# ── Model catalogue ───────────────────────────────────────────────────────────
+
+# Non-ML algorithms (no checkpoint needed)
+NON_ML_MODELS = ["baseline", "hough"]
+
+# Edge-classification models (one checkpoint each)
+EDGE_MODELS = ["mlp", "gnn", "resgnn", "mpnn", "agnn", "eggnet", "hgnn"]
+
+# Matches run_benchmark.py ML_MODELS list
+ALL_MODELS = NON_ML_MODELS + EDGE_MODELS + ["transformer"]
+
+# Colour palette — one colour per model, consistent across plots
+_PALETTE = [
+    "#4C72B0",  # baseline
+    "#DD8452",  # hough
+    "#55A868",  # mlp
+    "#C44E52",  # gnn
+    "#8172B2",  # resgnn
+    "#937860",  # mpnn
+    "#DA8BC3",  # agnn
+    "#8C8C8C",  # eggnet
+    "#CCB974",  # hgnn
+    "#64B5CD",  # transformer
+]
+MODEL_STYLE: dict[str, dict] = {
+    m: {"color": _PALETTE[i], "marker": ["o","s","^","D","v","P","X","*","h","<"][i]}
+    for i, m in enumerate(ALL_MODELS)
+}
+
+
+# ── F1 helper ─────────────────────────────────────────────────────────────────
+
+def _f1(metrics: dict) -> float:
+    """F1 from efficiency (recall) and fake_rate."""
+    recall    = metrics.get("efficiency_%", 0.0) / 100.0
+    fake_rate = metrics.get("fake_rate_%",  0.0) / 100.0
+    precision = 1.0 - fake_rate
+    denom = precision + recall
+    if denom < 1e-9:
+        return 0.0
+    return 2.0 * precision * recall / denom
+
+
+# ── Inference dispatcher ──────────────────────────────────────────────────────
+
+def _run_one_model(
+    model_name: str,
+    clusters_df: pl.DataFrame,
+    tracks_df: pl.DataFrame,
+    device: str,
+    baseline_cfg: BaselineConfig,
+    hough_cfg: HoughConfig,
+) -> dict:
+    """Run inference for one model; return metrics dict (or {} on failure)."""
+    try:
+        if model_name == "baseline":
+            reco = evaluate_baseline_on_sim(clusters_df, tracks_df, baseline_cfg)
+
+        elif model_name == "hough":
+            reco = evaluate_hough_on_sim(clusters_df, tracks_df, hough_cfg)
+
+        elif model_name == "transformer":
+            hf_ckpt = RUNS_DIR / "transformer" / "hit_filter.pt"
+            tf_ckpt = RUNS_DIR / "transformer" / "best_model.pt"
+            if not hf_ckpt.exists() or not tf_ckpt.exists():
+                return {}
+            reco = run_trackformer_reco(
+                clusters_df, tracks_df,
+                checkpoint_path=str(tf_ckpt),
+                hit_filter_checkpoint=str(hf_ckpt),
+                hit_filter_threshold=0.1,
+                conf_threshold=0.5,
+                mask_threshold=0.5,
+                min_layers=4,
+                device=device,
+            )
+
+        else:  # edge-classification models
+            ckpt = RUNS_DIR / model_name / "best_model.pt"
+            if not ckpt.exists():
+                return {}
+            reco = run_edge_classifier_reco(
+                clusters_df, tracks_df,
+                checkpoint_path=str(ckpt),
+                threshold=0.1,
+                device=device,
+            )
+
+        if reco.is_empty():
+            return {}
+        return compute_metrics(reco, tracks_df)
+
+    except Exception as exc:
+        print(f"    [{model_name}] ERROR: {exc}")
+        return {}
+
+
+# ── Single sweep point ────────────────────────────────────────────────────────
+
+def _run_point(
     n_events: int,
     mean_n_signal: float,
     synthetic_bg_n_per_layer: int,
-    checkpoint_path: str,
-    device: str = "cpu"
-) -> tuple[dict, dict, dict]:
-    print(f"\n{'='*70}")
-    print(f"  Experiment: sig={mean_n_signal}, bg={synthetic_bg_n_per_layer}, n_events={n_events}")
-    print(f"{'='*70}")
-    
+    device: str,
+    seed: int = 42,
+) -> dict[str, dict]:
+    """Simulate one (bg, sig) configuration; run all models; return metrics."""
     cfg = SimConfig(
         n_events=n_events,
         mean_n_signal=mean_n_signal,
         synthetic_bg_n_per_layer=synthetic_bg_n_per_layer,
         background_mode="synthetic",
-        cluster_size_mode="fixed", 
-        seed=42
+        cluster_size_mode="fixed",
+        seed=seed,
     )
-    
-    # 1. Simulate data
-    print("[1] Simulating data...")
-    t0 = time.time()
     clusters_df, tracks_df = simulate(cfg)
-    print(f"Simulation took {time.time() - t0:.2f} s")
-    print(f"Clusters: {len(clusters_df)}, Tracks: {len(tracks_df)}")
-    
-    if len(tracks_df) == 0:
-        print("Warning: No tracks generated. Skipping evaluation.")
-        return {}, {}, {}
 
-    # 2. Run Baseline
-    print("\n[2] Running Baseline reco...")
-    t0 = time.time()
-    base_res = evaluate_baseline_on_sim(clusters_df, tracks_df)
-    base_time = time.time() - t0
-    base_metrics = compute_metrics(base_res, tracks_df) if len(base_res) > 0 else {}
-    base_metrics["time_s"] = base_time
+    if tracks_df.is_empty():
+        return {m: {} for m in ALL_MODELS}
 
-    # 3. Run Hough
-    print("\n[3] Running Hough reco...")
-    t0 = time.time()
-    hough_res = evaluate_hough_on_sim(clusters_df, tracks_df)
-    hough_time = time.time() - t0
-    hough_metrics = compute_metrics(hough_res, tracks_df) if len(hough_res) > 0 else {}
-    hough_metrics["time_s"] = hough_time
+    baseline_cfg = BaselineConfig()
+    hough_cfg    = HoughConfig()
 
-    # 4. Run GNN 
-    print("\n[4] Running GNN reco...")
-    t0 = time.time()
-    if checkpoint_path and os.path.exists(checkpoint_path):
-        gnn_res = run_model_reco(
-            clusters_df=clusters_df,
-            tracks_df=tracks_df,
-            mode="edge",
-            edge_checkpoint=checkpoint_path,
-            edge_threshold=0.5,
-            device=device,
-        )
-        gnn_time = time.time() - t0
-        gnn_metrics = compute_metrics(gnn_res, tracks_df) if len(gnn_res) > 0 else {}
-        gnn_metrics["time_s"] = gnn_time
-    else:
-        print(f"Warning: Checkpoint not found at {checkpoint_path}. Skipping GNN.")
-        gnn_metrics = {}
-    
-    return base_metrics, hough_metrics, gnn_metrics
+    results: dict[str, dict] = {}
+    for model in ALL_MODELS:
+        t0 = time.perf_counter()
+        m  = _run_one_model(model, clusters_df, tracks_df,
+                            device, baseline_cfg, hough_cfg)
+        dt = time.perf_counter() - t0
+        f1 = _f1(m) if m else float("nan")
+        eff = m.get("efficiency_%", float("nan")) if m else float("nan")
+        fr  = m.get("fake_rate_%",  float("nan")) if m else float("nan")
+        results[model] = m
+        print(f"    {model:12s}  F1={f1:.3f}  eff={eff:.1f}%  fake={fr:.1f}%  ({dt:.1f}s)")
+
+    return results
 
 
-def plot_metrics(
-    x_values: list, 
-    results_list: list[tuple[dict, dict, dict]], 
-    x_label: str, 
-    output_dir: str, 
-    prefix: str
-):
-    """Generate and save plots for given metrics against the x_values."""
-    
-    metrics_to_plot = {
-        "efficiency_%": "Efficiency (%)",
-        "signal_eff_%": "Signal Efficiency (%)",
-        "fake_rate_%": "Fake Rate (%)",
-        "chi2_median": "Median χ²",
-        "rms_median_um": "Median RMS (µm)",
-        "time_s": "Reconstruction Time (s)"
-    }
-    
-    os.makedirs(output_dir, exist_ok=True)
-    
-    alg_names = ["Baseline", "Hough", "GNN"]
-    alg_colors = ["#4C72B0", "#DD8452", "#55A868"]
-    alg_markers = ["o", "s", "^"]
-    
-    for metric_key, metric_name in metrics_to_plot.items():
-        plt.figure(figsize=(8, 6))
-        
-        for alg_idx, (name, color, marker) in enumerate(zip(alg_names, alg_colors, alg_markers)):
-            y_values = []
-            valid_x = []
-            
-            for i, res_tuple in enumerate(results_list):
-                metrics = res_tuple[alg_idx]
-                if metrics and metric_key in metrics:
-                    y_values.append(metrics[metric_key])
-                    valid_x.append(x_values[i])
-            
-            if valid_x:
-                plt.plot(valid_x, y_values, marker=marker, color=color, linewidth=2, label=name)
-        
-        plt.xlabel(x_label, fontsize=12)
-        plt.ylabel(metric_name, fontsize=12)
-        plt.title(f'{metric_name} vs {x_label}', fontsize=14, fontweight='bold')
-        
-        if "eff" in metric_key.lower() or "rate" in metric_key.lower():
-            plt.ylim(0, 105)
-            
-        plt.legend(fontsize=11)
-        plt.grid(True, alpha=0.3)
-        plt.tight_layout()
-        
-        safe_metric = metric_key.replace("%", "pct").replace("/", "_")
-        out_path = os.path.join(output_dir, f"{prefix}_{safe_metric}.png")
-        plt.savefig(out_path, dpi=300, bbox_inches='tight')
-        plt.close()
-        print(f"Saved plot: {out_path}")
+# ── Plotting ──────────────────────────────────────────────────────────────────
+
+def _plot_sweep(
+    x_values: list[float | int],
+    sweep_results: list[dict[str, dict]],
+    x_label: str,
+    title: str,
+    out_path: Path,
+) -> None:
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    for ax, (metric_key, metric_label, ylim) in zip(
+        axes,
+        [
+            ("f1",           "F1 score",      (0, 1)),
+            ("efficiency_%", "Efficiency (%)", (0, 105)),
+        ],
+    ):
+        for model in ALL_MODELS:
+            ys, xs = [], []
+            for xi, point in zip(x_values, sweep_results):
+                m = point.get(model, {})
+                if not m:
+                    continue
+                val = _f1(m) if metric_key == "f1" else m.get(metric_key, float("nan"))
+                if not np.isnan(val):
+                    ys.append(val)
+                    xs.append(xi)
+            if not xs:
+                continue
+            style = MODEL_STYLE[model]
+            ax.plot(xs, ys,
+                    color=style["color"], marker=style["marker"],
+                    linewidth=2, markersize=6, label=model.upper())
+
+        ax.set_xlabel(x_label, fontsize=11)
+        ax.set_ylabel(metric_label, fontsize=11)
+        ax.set_ylim(*ylim)
+        ax.set_title(f"{metric_label} vs {x_label}", fontsize=12, fontweight="bold")
+        ax.legend(fontsize=8, ncol=2)
+        ax.grid(True, alpha=0.3)
+
+    fig.suptitle(title, fontsize=13, fontweight="bold")
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved → {out_path}")
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Benchmark Baseline vs Hough vs GNN scaling")
-    parser.add_argument("--events", type=int, default=500, help="Number of events per simulation run")
-    parser.add_argument("--device", type=str, default="cpu", help="Device for GNN inference")
-    parser.add_argument("--checkpoint", type=str, default=str(RUNS_DIR / "gnn/best_model.pt"), help="Path to GNN model checkpoint")
-    parser.add_argument("--output-dir", type=str, default=str(OUTPUTS_DIR / "plots/"), help="Output directory for plots")
+def _plot_fake_rate(
+    x_values: list[float | int],
+    sweep_results: list[dict[str, dict]],
+    x_label: str,
+    out_path: Path,
+) -> None:
+    """Separate fake-rate plot (log-scale friendly)."""
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for model in ALL_MODELS:
+        ys, xs = [], []
+        for xi, point in zip(x_values, sweep_results):
+            m = point.get(model, {})
+            if not m:
+                continue
+            val = m.get("fake_rate_%", float("nan"))
+            if not np.isnan(val):
+                ys.append(val)
+                xs.append(xi)
+        if not xs:
+            continue
+        style = MODEL_STYLE[model]
+        ax.plot(xs, ys, color=style["color"], marker=style["marker"],
+                linewidth=2, markersize=6, label=model.upper())
+
+    ax.set_xlabel(x_label, fontsize=11)
+    ax.set_ylabel("Fake Rate (%)", fontsize=11)
+    ax.set_title(f"Fake Rate vs {x_label}", fontsize=12, fontweight="bold")
+    ax.set_ylim(0, 105)
+    ax.legend(fontsize=8, ncol=2)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved → {out_path}")
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Scaling study: all benchmark models vs bg / signal"
+    )
+    parser.add_argument("--events",    type=int,   default=200,
+                        help="Events per simulation point (default 200)")
+    parser.add_argument("--device",    default="mps",
+                        choices=["cpu", "cuda", "mps"],
+                        help="Device for ML inference (default mps)")
+    parser.add_argument("--output-dir", default=str(OUTPUTS_DIR / "scaling"),
+                        help="Directory for output plots")
     args = parser.parse_args()
-    
-    # ── Sweep 1: Background scaling ──────────────────────────────────────────
-    bg_values = [0, 200, 400, 600, 800, 1000]
-    default_sig = 0.12 # fixed mean_n_signal for bg sweep
-    
-    print("\n" + "="*70)
-    print("  Starting Background Scaling Sweep")
-    print("="*70)
-    
-    bg_results = []
+
+    out_dir  = Path(args.output_dir)
+    n_events = args.events
+    device   = args.device
+
+    # ── Print which checkpoints are available ─────────────────────────────────
+    print("Checkpoint availability:")
+    for m in EDGE_MODELS:
+        p = RUNS_DIR / m / "best_model.pt"
+        print(f"  {m:12s}  {'OK' if p.exists() else 'MISSING'}")
+    for f in ["hit_filter.pt", "best_model.pt"]:
+        p = RUNS_DIR / "transformer" / f
+        print(f"  transformer/{f}  {'OK' if p.exists() else 'MISSING'}")
+
+    # ── Sweep 1: Background scaling ───────────────────────────────────────────
+    # Total hits/event ≈ 5 layers × bg_per_layer
+    # E320 real data ≈ 700/layer → 3500 total
+    bg_values    = [0, 100, 300, 500, 700, 1000]
+    fixed_signal = 0.5   # ~0.5 tracks/event mean (matches E320 low-signal regime)
+
+    print(f"\n{'='*65}")
+    print(f"Sweep 1: Background scaling  (mean_n_signal={fixed_signal}, "
+          f"events={n_events})")
+    print(f"{'='*65}")
+
+    bg_results: list[dict[str, dict]] = []
     for bg in bg_values:
-        res = run_experiment(
-            n_events=args.events, 
-            mean_n_signal=default_sig, 
-            synthetic_bg_n_per_layer=bg, 
-            checkpoint_path=args.checkpoint,
-            device=args.device
-        )
+        total_hits_approx = 5 * bg
+        print(f"\n  bg_per_layer={bg}  (~{total_hits_approx} hits/event)")
+        res = _run_point(n_events, fixed_signal, bg, device)
         bg_results.append(res)
-        
-    print("\nGenerating Background Scaling plots...")
-    plot_metrics(
-        x_values=bg_values, 
-        results_list=bg_results, 
-        x_label="Background Clusters per Layer per Event", 
-        output_dir=args.output_dir, 
-        prefix="sweep_bg"
+
+    _plot_sweep(
+        x_values=[5 * b for b in bg_values],   # convert to total hits/event
+        sweep_results=bg_results,
+        x_label="Background hits per event",
+        title=f"Scaling with background  (mean_n_signal={fixed_signal})",
+        out_path=out_dir / "bg_scaling_f1_eff.png",
+    )
+    _plot_fake_rate(
+        x_values=[5 * b for b in bg_values],
+        sweep_results=bg_results,
+        x_label="Background hits per event",
+        out_path=out_dir / "bg_scaling_fake_rate.png",
     )
 
-    # ── Sweep 2: Signal / NTracks scaling ────────────────────────────────────
-    sig_values = [0.05, 0.1, 0.2, 0.3, 0.5, 0.8]
-    default_bg = 700 # fixed bg for sig sweep
-    
-    print("\n" + "="*70)
-    print("  Starting Signal Tracks Scaling Sweep")
-    print("="*70)
-    
-    sig_results = []
+    # ── Sweep 2: Signal scaling ───────────────────────────────────────────────
+    sig_values = [0.1, 0.3, 0.5, 1.0, 2.0, 3.0]
+    fixed_bg   = 700   # per layer ≈ 3500 total, matching real E320 background
+
+    print(f"\n{'='*65}")
+    print(f"Sweep 2: Signal scaling  (bg_per_layer={fixed_bg}, "
+          f"events={n_events})")
+    print(f"{'='*65}")
+
+    sig_results: list[dict[str, dict]] = []
     for sig in sig_values:
-        res = run_experiment(
-            n_events=args.events, 
-            mean_n_signal=sig, 
-            synthetic_bg_n_per_layer=default_bg, 
-            checkpoint_path=args.checkpoint,
-            device=args.device
-        )
+        print(f"\n  mean_n_signal={sig}")
+        res = _run_point(n_events, sig, fixed_bg, device)
         sig_results.append(res)
-        
-    print("\nGenerating Track Scaling plots...")
-    plot_metrics(
-        x_values=sig_values, 
-        results_list=sig_results, 
-        x_label="Mean Signal Tracks per Event", 
-        output_dir=args.output_dir, 
-        prefix="sweep_ntracks"
+
+    _plot_sweep(
+        x_values=sig_values,
+        sweep_results=sig_results,
+        x_label="Mean signal tracks per event",
+        title=f"Scaling with signal tracks  (bg_per_layer={fixed_bg})",
+        out_path=out_dir / "sig_scaling_f1_eff.png",
     )
-    
-    print("\nAll benchmarking complete. Plots saved to:", args.output_dir)
+    _plot_fake_rate(
+        x_values=sig_values,
+        sweep_results=sig_results,
+        x_label="Mean signal tracks per event",
+        out_path=out_dir / "sig_scaling_fake_rate.png",
+    )
+
+    print(f"\nAll done. Plots saved to {out_dir}/")
 
 
 if __name__ == "__main__":
