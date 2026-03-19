@@ -22,6 +22,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -178,6 +179,34 @@ def _run_point(
     return results
 
 
+# ── Models to plot (exclude transformer due to poor performance) ──────────────
+
+PLOT_MODELS = [m for m in ALL_MODELS if m != "transformer"]
+
+
+# ── Save raw data ─────────────────────────────────────────────────────────────
+
+def _save_raw_data(
+    x_values: list,
+    sweep_results: list[dict[str, dict]],
+    x_label: str,
+    out_path: Path,
+) -> None:
+    """Save sweep results as JSON for reproducibility."""
+    payload = {
+        "x_label": x_label,
+        "x_values": x_values,
+        "results": [
+            {model: metrics for model, metrics in point.items()}
+            for point in sweep_results
+        ],
+    }
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w") as f:
+        json.dump(payload, f, indent=2, default=lambda v: None if (isinstance(v, float) and np.isnan(v)) else v)
+    print(f"  Saved raw data → {out_path}")
+
+
 # ── Plotting ──────────────────────────────────────────────────────────────────
 
 def _plot_sweep(
@@ -189,14 +218,14 @@ def _plot_sweep(
 ) -> None:
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
-    for ax, (metric_key, metric_label, ylim) in zip(
+    for ax, (metric_key, metric_label) in zip(
         axes,
         [
-            ("f1",           "F1 score",      (0, 1)),
-            ("efficiency_%", "Efficiency (%)", (0, 105)),
+            ("f1",           "F1 score"),
+            ("efficiency_%", "Efficiency (%)"),
         ],
     ):
-        for model in ALL_MODELS:
+        for model in PLOT_MODELS:
             ys, xs = [], []
             for xi, point in zip(x_values, sweep_results):
                 m = point.get(model, {})
@@ -215,7 +244,8 @@ def _plot_sweep(
 
         ax.set_xlabel(x_label, fontsize=11)
         ax.set_ylabel(metric_label, fontsize=11)
-        ax.set_ylim(*ylim)
+        ax.autoscale(axis="y")
+        ax.margins(y=0.1)
         ax.set_title(f"{metric_label} vs {x_label}", fontsize=12, fontweight="bold")
         ax.legend(fontsize=8, ncol=2)
         ax.grid(True, alpha=0.3)
@@ -236,7 +266,7 @@ def _plot_fake_rate(
 ) -> None:
     """Separate fake-rate plot (log-scale friendly)."""
     fig, ax = plt.subplots(figsize=(8, 5))
-    for model in ALL_MODELS:
+    for model in PLOT_MODELS:
         ys, xs = [], []
         for xi, point in zip(x_values, sweep_results):
             m = point.get(model, {})
@@ -255,7 +285,8 @@ def _plot_fake_rate(
     ax.set_xlabel(x_label, fontsize=11)
     ax.set_ylabel("Fake Rate (%)", fontsize=11)
     ax.set_title(f"Fake Rate vs {x_label}", fontsize=12, fontweight="bold")
-    ax.set_ylim(0, 105)
+    ax.autoscale(axis="y")
+    ax.margins(y=0.1)
     ax.legend(fontsize=8, ncol=2)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
@@ -311,6 +342,12 @@ def main() -> None:
         res = _run_point(n_events, fixed_signal, bg, device)
         bg_results.append(res)
 
+    _save_raw_data(
+        x_values=[5 * b for b in bg_values],
+        sweep_results=bg_results,
+        x_label="Background hits per event",
+        out_path=out_dir / "bg_scaling_raw.json",
+    )
     _plot_sweep(
         x_values=[5 * b for b in bg_values],   # convert to total hits/event
         sweep_results=bg_results,
@@ -340,6 +377,12 @@ def main() -> None:
         res = _run_point(n_events, sig, fixed_bg, device)
         sig_results.append(res)
 
+    _save_raw_data(
+        x_values=sig_values,
+        sweep_results=sig_results,
+        x_label="Mean signal tracks per event",
+        out_path=out_dir / "sig_scaling_raw.json",
+    )
     _plot_sweep(
         x_values=sig_values,
         sweep_results=sig_results,
