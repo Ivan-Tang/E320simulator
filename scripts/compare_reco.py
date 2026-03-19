@@ -44,67 +44,49 @@ def compute_metrics(reco: pl.DataFrame, tracks: pl.DataFrame) -> dict:
         Truth track table with columns: track_id, event_id, is_signal.
     """
     n_truth  = tracks.height
-    n_signal = tracks.filter(pl.col("is_signal")).height
 
     if reco.is_empty() or "is_kept" not in reco.columns:
         return {
-            "n_truth": n_truth, "n_signal": n_signal, "n_kept": 0,
-            "n_matched": 0, "n_unique_matched": 0, "n_fake": 0,
-            "efficiency_%": 0.0, "signal_eff_%": 0.0, "fake_rate_%": 0.0,
-            "chi2_median": float("nan"), "chi2_p95": float("nan"),
-            "rms_median_um": float("nan"), "n_layers_mean": float("nan"),
+            "n_truth": n_truth, "n_kept": 0,
+            "match_5": 0, "match_4": 0, "match_3": 0,
+            "match_2": 0, "match_1": 0, "match_0": 0,
+            "n_matched": 0, "n_fake": 0,
+            "efficiency_%": 0.0, "fake_rate_%": 0.0,
+            "chi2_mean": float("nan"), "rms_mean_um": float("nan"),
         }
 
     kept = reco.filter(pl.col("is_kept"))
+    n_kept = kept.height
 
-    n_kept   = kept.height
+    matched   = kept.filter(pl.col("matched_track_id") >= 0)
+    n_matched = matched.height
+    n_fake    = n_kept - n_matched
 
-    matched    = kept.filter(pl.col("matched_track_id") >= 0)
-    n_matched  = matched.height
-    n_fake     = n_kept - n_matched
-
-    # Track-level efficiency per event
-    # — for each truth track: was it matched by at least one kept candidate?
+    # Track-level efficiency: how many unique truth tracks were matched
     n_unique_matched = matched["matched_track_id"].n_unique()
+    efficiency = n_unique_matched / n_truth * 100 if n_truth else 0.0
+    fake_rate  = n_fake / n_kept * 100 if n_kept else 0.0
 
-    efficiency    = n_unique_matched / n_truth * 100 if n_truth  else 0.0
-    fake_rate     = n_fake           / n_kept  * 100 if n_kept   else 0.0
-
-    # Signal-only efficiency
-    signal_tracks = tracks.filter(pl.col("is_signal"))
-    # we need to check which signal track_ids appear in matched
-    # join matched with signal tracks on matched_track_id == track_id AND event_id
-    if n_signal > 0 and n_matched > 0:
-        sig_matched = (
-            matched
-            .join(
-                signal_tracks.select(["event_id", "track_id"]),
-                left_on  = ["event_id", "matched_track_id"],
-                right_on = ["event_id", "track_id"],
-                how = "inner",
-            )
-        )
-        n_sig_matched = sig_matched["matched_track_id"].n_unique()
-        signal_eff = n_sig_matched / n_signal * 100
-    else:
-        n_sig_matched = 0
-        signal_eff    = 0.0
+    # Matching degree: count kept candidates by n_matched hits
+    nm_arr = kept["n_matched"].to_numpy() if "n_matched" in kept.columns else np.zeros(n_kept, dtype=int)
+    match_counts = {k: int(np.sum(nm_arr == k)) for k in range(6)}
 
     return {
-        "n_truth":          n_truth,
-        "n_signal":         n_signal,
-        "n_kept":           n_kept,
-        "n_matched":        n_matched,
-        "n_unique_matched": n_unique_matched,
-        "n_fake":           n_fake,
-        "efficiency_%":     round(efficiency,  2),
-        "signal_eff_%":     round(signal_eff,  2),
-        "fake_rate_%":      round(fake_rate,   2),
-        # quality
-        "chi2_median":  float(np.median(kept["chi2"].to_numpy())),
-        "chi2_p95":     float(np.percentile(kept["chi2"].to_numpy(), 95)),
-        "rms_median_um": float(np.median(kept["rms"].to_numpy()) * 1e3),
-        "n_layers_mean": float(kept["n_layers"].mean()),
+        "n_truth":      n_truth,
+        "n_kept":       n_kept,
+        "match_5":      match_counts[5],
+        "match_4":      match_counts[4],
+        "match_3":      match_counts[3],
+        "match_2":      match_counts[2],
+        "match_1":      match_counts[1],
+        "match_0":      match_counts[0],
+        "n_matched":    n_matched,
+        "n_fake":       n_fake,
+        "efficiency_%": round(efficiency, 2),
+        "fake_rate_%":  round(fake_rate,  2),
+        # fit quality
+        "chi2_mean":   float(np.mean(kept["chi2"].to_numpy())),
+        "rms_mean_um": float(np.mean(kept["rms"].to_numpy()) * 1e3),
     }
 
 
@@ -116,17 +98,20 @@ def print_table(method_metrics: dict[str, dict]) -> None:
     names = list(method_metrics.keys())
     rows = [
         ("Truth tracks",        "n_truth",          ""),
-        ("Signal tracks",       "n_signal",         ""),
-        ("Kept candidates",     "n_kept",            ""),
-        ("─" * 22,              None,                ""),
-        ("Efficiency",          "efficiency_%",      "%"),
-        ("Signal efficiency",   "signal_eff_%",      "%"),
-        ("Fake rate",           "fake_rate_%",       "%"),
-        ("─" * 22,              None,                ""),
-        ("Median χ²",           "chi2_median",       ""),
-        ("95th-pct χ²",         "chi2_p95",          ""),
-        ("Median RMS",          "rms_median_um",     "µm"),
-        ("Mean n_layers",       "n_layers_mean",     ""),
+        ("Kept candidates",     "n_kept",           ""),
+        ("─" * 22,              None,               ""),
+        ("  5-hit match",       "match_5",          ""),
+        ("  4-hit match",       "match_4",          ""),
+        ("  3-hit match",       "match_3",          ""),
+        ("  2-hit match",       "match_2",          ""),
+        ("  1-hit match",       "match_1",          ""),
+        ("  0-hit match",       "match_0",          ""),
+        ("─" * 22,              None,               ""),
+        ("Efficiency",          "efficiency_%",     "%"),
+        ("Fake rate",           "fake_rate_%",      "%"),
+        ("─" * 22,              None,               ""),
+        ("Mean χ²",             "chi2_mean",        ""),
+        ("Mean RMS",            "rms_mean_um",      "µm"),
     ]
 
     w = 24
