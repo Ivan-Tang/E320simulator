@@ -29,6 +29,8 @@ from src.baseline import (
 )
 from src.train import load_checkpoint, _augment_with_embedder
 from src.train_embedder import infer_embedding_neighbors
+from src.train_trackformer import load_trackformer_checkpoint
+from src.train_hit_filter import load_hit_filter_checkpoint
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -326,6 +328,136 @@ def run_embedder_reco(
 
     result = pl.DataFrame(all_candidates).sort("event_id", "candidate_id")
     _print_reco_summary("Embedder reco", result, tracks_df)
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TrackFormer (MaskFormer set-prediction) inference
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_trackformer_reco(
+    clusters_df: pl.DataFrame,
+    tracks_df: pl.DataFrame | None,
+    checkpoint_path: str,
+    hit_filter_checkpoint: str | None = None,
+    hit_filter_threshold: float = 0.1,
+    conf_threshold: float = 0.5,
+    mask_threshold: float = 0.5,
+    min_layers: int = 4,
+    device: str = "cpu",
+) -> pl.DataFrame:
+    """Run E320TrackFormer reconstruction.
+
+    The model outputs Q track-query predictions per event.  Each prediction
+    carries a confidence score and a per-hit assignment mask.  Candidates
+    above conf_threshold with hits on at least min_layers detector layers are
+    kept, followed by a straight-line fit and shared-hit rejection identical
+    to the baseline pipeline.
+
+    Parameters
+    ----------
+    conf_threshold : float
+        Minimum sigmoid(track_logit) to keep a query as a track candidate.
+    mask_threshold : float
+        Minimum sigmoid(mask_logit) for a hit to be assigned to a query.
+    min_layers : int
+        Minimum number of distinct detector layers required (default 4).
+    """
+    ckpt      = load_trackformer_checkpoint(checkpoint_path, device=device)
+    model     = ckpt["model"]
+    node_mean = ckpt["node_mean"].to(device)
+    node_std  = ckpt["node_std"].to(device)
+    device_t  = torch.device(device)
+    model.to(device_t).eval()
+
+    # Load hit filter (Stage 1) if provided
+    hf = None
+    if hit_filter_checkpoint is not None:
+        hf = load_hit_filter_checkpoint(hit_filter_checkpoint, device=device)
+        hf["model"].to(device_t).eval()
+
+    arrs = _extract_event_arrays(clusters_df)
+    unique_events, starts = np.unique(arrs["eid_arr"], return_index=True)
+    counts = np.diff(np.append(starts, len(arrs["eid_arr"])))
+
+    all_candidates: list[dict] = []
+
+    for i in range(len(unique_events)):
+        s, c_ = int(starts[i]), int(counts[i])
+        eid   = int(unique_events[i])
+        xv    = arrs["x_arr"][s:s+c_];  yv  = arrs["y_arr"][s:s+c_]
+        zv    = arrs["z_arr"][s:s+c_];  lv  = arrs["lid_arr"][s:s+c_]
+        nv    = arrs["nid_arr"][s:s+c_]
+        sxv   = arrs["sx_arr"][s:s+c_];  syv = arrs["sy_arr"][s:s+c_]
+        sv    = arrs["s_arr"][s:s+c_]
+        tv    = arrs["tid_arr"][s:s+c_] if arrs["has_truth"] else None
+
+        nid_to_local = {int(n): j for j, n in enumerate(nv)}
+
+        # Build raw node feature tensor (7-dim)
+        node_feat_np = np.stack([lv, xv, yv, zv, sxv, syv, sv], axis=1).astype(np.float32)
+        nf_raw = torch.from_numpy(node_feat_np)  # (N, 7) on CPU
+
+        # Stage 1: hit filter — reduce ~3500 hits to signal candidates
+        if hf is not None:
+            hf_mean = hf["node_mean"].cpu()
+            hf_std  = hf["node_std"].cpu()
+            with torch.no_grad():
+                hf_input  = ((nf_raw - hf_mean) / hf_std).to(device_t)
+                hf_logits = hf["model"](hf_input).cpu()
+            keep_mask = hf_logits.sigmoid() >= hit_filter_threshold  # (N,) bool
+            keep_idx  = keep_mask.nonzero(as_tuple=True)[0].numpy()
+            if len(keep_idx) == 0:
+                continue
+            # Subset arrays to kept hits
+            nv_k  = nv[keep_idx];   lv_k  = lv[keep_idx]
+            xv_k  = xv[keep_idx];   yv_k  = yv[keep_idx];  zv_k  = zv[keep_idx]
+            nf_k  = nf_raw[keep_idx]
+        else:
+            keep_idx = np.arange(len(nv))
+            nv_k = nv;  lv_k = lv;  xv_k = xv;  yv_k = yv;  zv_k = zv
+            nf_k = nf_raw
+
+        # Stage 2: MaskFormer — normalise with its own stats and run
+        nf = ((nf_k - node_mean.cpu()) / node_std.cpu()).to(device_t)
+
+        with torch.no_grad():
+            out  = model(nf)
+            conf = out["track_logits"].sigmoid()   # (Q,)
+            mask = out["mask_logits"].sigmoid()     # (Q, N_kept)
+
+        # Convert predictions to chains for _fit_and_score
+        chains: list[tuple[tuple, tuple]] = []
+        kept_queries = (conf >= conf_threshold).nonzero(as_tuple=True)[0].tolist()
+
+        for qi in kept_queries:
+            # hit_local indexes into the kept-hit subset
+            hit_local = (mask[qi] >= mask_threshold).nonzero(as_tuple=True)[0].cpu().numpy()
+            if len(hit_local) == 0:
+                continue
+            # Map local (kept-hit) indices → global node_ids and layer_ids
+            node_ids_q  = tuple(int(nv_k[j]) for j in hit_local)
+            layer_ids_q = tuple(int(lv_k[j]) for j in hit_local)
+            if len(set(layer_ids_q)) < min_layers:
+                continue
+            chains.append((node_ids_q, layer_ids_q))
+
+        if not chains:
+            continue
+
+        candidates = _fit_and_score(chains, xv, yv, zv, nid_to_local)
+        candidates = _shared_hit_rejection(candidates)
+
+        for cand in candidates:
+            cand["event_id"] = eid
+        _match_candidates(candidates, nid_to_local, tv, arrs["has_truth"])
+        all_candidates.extend(candidates)
+
+    if not all_candidates:
+        return pl.DataFrame()
+
+    result = pl.DataFrame(all_candidates).sort("event_id", "candidate_id")
+    _print_reco_summary("TrackFormer reco", result, tracks_df)
     return result
 
 
