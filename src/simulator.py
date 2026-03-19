@@ -153,10 +153,12 @@ def _sample_cluster_size(
 class SyntheticBackgroundPool:
     """Generates background clusters uniformly on each layer's active area."""
 
-    def __init__(self, n_per_layer: int = 50, use_alignment: bool = True, ):
+    def __init__(self, n_per_layer: int = 50, use_alignment: bool = True,
+                 cluster_size_mode: str = "fixed"):
         from src.geometry import E320PrototypeGeometry
 
         self.n_per_layer = n_per_layer
+        self.cluster_size_mode = cluster_size_mode
         self.geom = E320PrototypeGeometry(use_alignment=use_alignment)
 
     def sample(self, rng: np.random.Generator) -> dict[str, np.ndarray]:
@@ -184,8 +186,9 @@ class SyntheticBackgroundPool:
             z_trk[sl] = layer.z_trk_mm
             layer_ids[sl] = lid
 
-        # sample cluster sizes using the common sampler (fall back to default config)
-        sx, sy, sz = _sample_cluster_size(rng, total, cfg)
+        # build a minimal config proxy for _sample_cluster_size
+        _cfg_proxy = SimConfig(cluster_size_mode=self.cluster_size_mode)
+        sx, sy, sz = _sample_cluster_size(rng, total, _cfg_proxy)
         size_x = sx.astype(np.int32)
         size_y = sy.astype(np.int32)
         size = sz.astype(np.int32)
@@ -515,7 +518,10 @@ def simulate(
         train_pool, test_pool = full_pool.split(cfg.train_test_split, cfg.seed)
         bg_pool = test_pool if cfg.mode == "test" else train_pool
     elif bg_pool is None and cfg.background_mode == "synthetic":
-        bg_pool = SyntheticBackgroundPool(n_per_layer=cfg.synthetic_bg_n_per_layer)
+        bg_pool = SyntheticBackgroundPool(
+            n_per_layer=cfg.synthetic_bg_n_per_layer,
+            cluster_size_mode=cfg.cluster_size_mode,
+        )
 
     # Optionally load cluster-size table
     if cfg.cluster_size_mode == "empirical":
@@ -603,8 +609,14 @@ def simulate_train_test(
         train_pool, test_pool = full_pool.split(cfg.train_test_split, cfg.seed)
     elif cfg.background_mode == "synthetic":
         # SyntheticBackgroundPool is stateless; safe to share the same instance
-        train_pool = SyntheticBackgroundPool(n_per_layer=cfg.synthetic_bg_n_per_layer)
-        test_pool = SyntheticBackgroundPool(n_per_layer=cfg.synthetic_bg_n_per_layer)
+        train_pool = SyntheticBackgroundPool(
+            n_per_layer=cfg.synthetic_bg_n_per_layer,
+            cluster_size_mode=cfg.cluster_size_mode,
+        )
+        test_pool = SyntheticBackgroundPool(
+            n_per_layer=cfg.synthetic_bg_n_per_layer,
+            cluster_size_mode=cfg.cluster_size_mode,
+        )
 
     # ── Load cluster-size table once ────────────────────────────────
     if cfg.cluster_size_mode == "empirical":
