@@ -28,7 +28,7 @@ import torch.optim as optim
 from sklearn.metrics import average_precision_score, roc_auc_score
 
 from src.models import (
-    EdgeMLP, InteractionNet, TransformerEdgeClassifier, TrackFormerSeed,
+    EdgeMLP, InteractionNet, TransformerEdgeClassifier,
     ResGNN, MPNN, AGNN, EggNet, HierarchicalGNN,
 )
 from src.losses import FocalLoss, HingeLoss
@@ -176,17 +176,6 @@ def _build_model(cfg: TrainConfig, node_dim: int = NODE_DIM) -> nn.Module:
             n_heads=cfg.n_heads,
             n_encoder_layers=cfg.n_encoder_layers,
             dim_feedforward=cfg.dim_feedforward,
-            dropout=cfg.dropout,
-        )
-    if cfg.model_type == "trackformer":
-        return TrackFormerSeed(
-            node_dim=node_dim,
-            d_model=cfg.d_model,
-            n_heads=cfg.n_heads,
-            n_encoder_layers=cfg.n_encoder_layers,
-            n_decoder_layers=cfg.n_decoder_layers,
-            dim_feedforward=cfg.dim_feedforward,
-            max_seeds=cfg.max_seeds,
             dropout=cfg.dropout,
         )
     if cfg.model_type == "hgnn":

@@ -123,7 +123,7 @@ Simulator → clusters_df / tracks_df (Polars)
 | `simulator.py` | Cluster-level fast simulator; `SimConfig` controls signal rate, noise, cluster size model |
 | `baseline.py` | Slope-window edge building + greedy chain seeding + 3D line fit; `BaselineConfig` |
 | `hough_baseline.py` | Hough transform tracker in (θ, ρ) space; `HoughConfig` |
-| `models.py` | 11 model classes: `EdgeMLP`, `InteractionNet`, `ResGNN`, `MPNN`, `AGNN`, `TransformerEdgeClassifier`, `TrackFormerSeed`, `EggNet`, `HierarchicalGNN`, `Embedder`, `TransformerEmbedder` |
+| `models.py` | 10 model classes: `EdgeMLP`, `InteractionNet`, `ResGNN`, `MPNN`, `AGNN`, `TransformerEdgeClassifier`, `EggNet`, `HierarchicalGNN`, `Embedder`, `TransformerEmbedder` |
 | `layers.py` | Reusable building blocks: `MLP()` factory, `PositionalEncoding3D`, `MultiHeadAttention`, transformer layers |
 | `losses.py` | `FocalLoss` (for class imbalance) and `HingeLoss` (for metric learning) |
 | `train.py` | Unified training loop for all edge-classification models; `TrainConfig` |
