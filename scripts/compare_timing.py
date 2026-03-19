@@ -21,7 +21,7 @@ from src.baseline import (
     _fit_and_score,
     _shared_hit_rejection,
 )
-from src.train import TrainConfig, load_checkpoint
+from src.train import TrainConfig, load_checkpoint, _augment_with_embedder
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -174,13 +174,15 @@ def time_gnn_per_event(
 
     # ── load model (outside timing loop) ─────────────────────────────────────
     ckpt = load_checkpoint(checkpoint_path, device=device)
-    model     = ckpt["model"].to(device)
+    model        = ckpt["model"].to(device)
+    embedder_info = ckpt.get("embedder_info")
     node_mean = torch.as_tensor(ckpt["node_mean"], device=device)
     node_std  = torch.as_tensor(ckpt["node_std"],  device=device)
     edge_mean = torch.as_tensor(ckpt["edge_mean"], device=device)
     edge_std  = torch.as_tensor(ckpt["edge_std"],  device=device)
     model.eval()
-    print(f"  [gnn] checkpoint loaded  epoch={ckpt['epoch']}  best_AP={ckpt['best_ap']:.4f}")
+    print(f"  [gnn] checkpoint loaded  epoch={ckpt['epoch']}  best_AP={ckpt['best_ap']:.4f}"
+          + (f"  embedder=ON" if embedder_info is not None else ""))
 
     # ── arrays ────────────────────────────────────────────────────────────────
     eid_arr = clusters_df["event_id"].to_numpy()
@@ -228,7 +230,10 @@ def time_gnn_per_event(
             e_src, e_dst, e_sl, e_sx, e_sy,
             nid_to_local,
         )
-        nf = (nf.to(device) - node_mean) / node_std
+        if embedder_info is not None:
+            nf = _augment_with_embedder(nf, embedder_info).to(device)
+        else:
+            nf = (nf.to(device) - node_mean) / node_std
         ef = (ef.to(device) - edge_mean) / edge_std
 
         with torch.no_grad():
