@@ -475,7 +475,7 @@ def load_checkpoint(
     embedder_info = None
     if cfg.embedder_checkpoint:
         embedder_info = _load_embedder(cfg)
-        node_dim = NODE_DIM + embedder_info["_emb_dim"]
+        node_dim = embedder_info["_emb_dim"]
 
     model = _build_model(cfg, node_dim=node_dim)
     model.load_state_dict(ckpt["model_state"])
