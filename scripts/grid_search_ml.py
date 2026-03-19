@@ -1,5 +1,5 @@
 """
-Grid search over GNN score threshold on simulated data.
+Grid search over ML edge-classifier score threshold on simulated data.
 
 Inference is run *once* per event; the resulting edge scores are cached in
 memory.  The threshold sweep is then just repeated numpy masking + chain
@@ -9,12 +9,18 @@ A reference line from the default baseline configuration is drawn on every
 plot for direct comparison.
 
 Outputs (saved to SIM_DIR):
-    grid_search_gnn_threshold.png   — efficiency & fake rate vs threshold
+    grid_search_<model_name>_threshold.png  — efficiency & fake rate vs threshold
+    grid_search_<model_name>_edge_keep.png  — edge keep rate & reco track count
 
 Usage
 -----
-    python scripts/grid_search_gnn.py \\
+    python scripts/grid_search_ml.py \\
         --checkpoint runs/exp_gnn_v1/best_model.pt
+
+    python scripts/grid_search_ml.py \\
+        --checkpoint runs/exp_gnn_v1/best_model.pt \\
+        --model-name gnn_v1 \\
+        --device mps
 
     # or edit SIM_DIR / CHECKPOINT_PATH at the top of the file
 """
@@ -54,11 +60,26 @@ DEVICE          = "cpu"   # "cpu" | "mps" | "cuda"
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Grid search GNN threshold")
-    p.add_argument("--checkpoint", default=CHECKPOINT_PATH)
-    p.add_argument("--device",     default=DEVICE, choices=["cpu", "cuda", "mps"])
-    p.add_argument("--sim_dir",    default=SIM_DIR)
+    p = argparse.ArgumentParser(description="Grid search ML threshold")
+    p.add_argument("--checkpoint",  default=CHECKPOINT_PATH)
+    p.add_argument("--device",      default=DEVICE, choices=["cpu", "cuda", "mps"])
+    p.add_argument("--sim_dir",     default=SIM_DIR)
+    p.add_argument("--model-name",  default=None,
+                   help="Display name for the model (derived from checkpoint if omitted)")
     return p.parse_args()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Model name derivation
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _derive_model_name(checkpoint_path: str, ckpt: dict) -> str:
+    # 1. Try cfg stored in checkpoint
+    cfg = ckpt.get("cfg") or ckpt.get("config")
+    if cfg and hasattr(cfg, "model"):
+        return cfg.model
+    # 2. Fall back to parent directory name
+    return Path(checkpoint_path).parent.name
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -259,14 +280,18 @@ def baseline_reference(event_slices, n_truth: int) -> dict:
 # Plotting
 # ──────────────────────────────────────────────────────────────────────────────
 
-def plot_threshold_sweep(results: list[dict], bl_ref: dict, save_path: str) -> None:
-    thresholds  = [r["threshold"]   for r in results]
+def plot_threshold_sweep(
+    results: list[dict], bl_ref: dict, save_path: str, model_name: str
+) -> None:
+    thresholds   = [r["threshold"]   for r in results]
     efficiencies = [r["efficiency"]  for r in results]
     fake_rates   = [r["fake_rate"]   for r in results]
-    edge_keeps   = [r["edge_keep_%"] for r in results]
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    fig.suptitle("GNN threshold sweep  –  efficiency & fake rate", fontsize=13, fontweight="bold")
+    fig.suptitle(
+        f"{model_name} threshold sweep  –  efficiency & fake rate",
+        fontsize=13, fontweight="bold",
+    )
 
     col_eff  = "#4878CF"
     col_fake = "#D65F5F"
@@ -275,7 +300,7 @@ def plot_threshold_sweep(results: list[dict], bl_ref: dict, save_path: str) -> N
 
     # ── (1) efficiency ────────────────────────────────────────────────────────
     ax = axes[0]
-    ax.plot(thresholds, efficiencies, "o-", color=col_eff, lw=2, ms=5, label="GNN")
+    ax.plot(thresholds, efficiencies, "o-", color=col_eff, lw=2, ms=5, label=model_name)
     ax.axhline(bl_ref["efficiency"], ls="--", lw=1.5, color=col_bl,
                label=f"Baseline ({bl_ref['efficiency']:.1f}%)")
     ax.set_xlabel("Score threshold"); ax.set_ylabel("Efficiency (%)")
@@ -284,7 +309,7 @@ def plot_threshold_sweep(results: list[dict], bl_ref: dict, save_path: str) -> N
 
     # ── (2) fake rate ─────────────────────────────────────────────────────────
     ax = axes[1]
-    ax.plot(thresholds, fake_rates, "s-", color=col_fake, lw=2, ms=5, label="GNN")
+    ax.plot(thresholds, fake_rates, "s-", color=col_fake, lw=2, ms=5, label=model_name)
     ax.axhline(bl_ref["fake_rate"], ls="--", lw=1.5, color=col_bl,
                label=f"Baseline ({bl_ref['fake_rate']:.1f}%)")
     ax.set_xlabel("Score threshold"); ax.set_ylabel("Fake rate (%)")
@@ -294,7 +319,7 @@ def plot_threshold_sweep(results: list[dict], bl_ref: dict, save_path: str) -> N
     # ── (3) efficiency vs fake rate (operating-point curve) ───────────────────
     ax = axes[2]
     sc = ax.scatter(fake_rates, efficiencies, c=thresholds, cmap="viridis",
-                    s=50, zorder=3, label="GNN (threshold →)")
+                    s=50, zorder=3, label=f"{model_name} (threshold →)")
     plt.colorbar(sc, ax=ax, label="threshold")
     for r in results[::max(1, len(results)//6)]:   # annotate every ~6th point
         ax.annotate(f"{r['threshold']:.2f}",
@@ -313,7 +338,7 @@ def plot_threshold_sweep(results: list[dict], bl_ref: dict, save_path: str) -> N
     plt.close(fig)
 
 
-def plot_edge_keep_rate(results: list[dict], save_path: str) -> None:
+def plot_edge_keep_rate(results: list[dict], save_path: str, model_name: str) -> None:
     thresholds = [r["threshold"]   for r in results]
     keeps      = [r["edge_keep_%"] for r in results]
     n_kepts    = [r["n_kept"]      for r in results]
@@ -334,7 +359,7 @@ def plot_edge_keep_rate(results: list[dict], save_path: str) -> None:
     lines1, labels1 = ax1.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
     ax1.legend(lines1 + lines2, labels1 + labels2, loc="center right")
-    ax1.set_title("Edge keep rate & reco track count vs threshold")
+    ax1.set_title(f"Edge keep rate & reco track count vs threshold ({model_name})")
 
     fig.tight_layout()
     fig.savefig(save_path, dpi=150, bbox_inches="tight")
@@ -346,10 +371,17 @@ def plot_edge_keep_rate(results: list[dict], save_path: str) -> None:
 # Main
 # ──────────────────────────────────────────────────────────────────────────────
 
-def main(checkpoint_path: str, device: str, sim_dir: str) -> None:
+def main(checkpoint_path: str, device: str, sim_dir: str, model_name: str | None) -> None:
     # ── load data ─────────────────────────────────────────────────────────────
-    clusters_df = pl.read_parquet(f"{sim_dir}/sim_clusters.parquet")
-    tracks_df   = pl.read_parquet(f"{sim_dir}/sim_tracks.parquet")
+    clusters_path = f"{sim_dir}/sim_clusters_test.parquet"
+    tracks_path   = f"{sim_dir}/sim_tracks_test.parquet"
+    # fall back to non-split files if test split doesn't exist
+    if not Path(clusters_path).exists():
+        clusters_path = f"{sim_dir}/sim_clusters.parquet"
+        tracks_path   = f"{sim_dir}/sim_tracks.parquet"
+
+    clusters_df = pl.read_parquet(clusters_path)
+    tracks_df   = pl.read_parquet(tracks_path)
     n_truth     = tracks_df.height
     has_truth   = "track_id" in clusters_df.columns
 
@@ -384,10 +416,15 @@ def main(checkpoint_path: str, device: str, sim_dir: str) -> None:
     ckpt = load_checkpoint(checkpoint_path, device=device)
     print(f"Checkpoint: epoch={ckpt['epoch']}  best_AP={ckpt['best_ap']:.4f}")
 
+    # ── resolve model name ────────────────────────────────────────────────────
+    if model_name is None:
+        model_name = _derive_model_name(checkpoint_path, ckpt)
+    safe_name = model_name.replace(" ", "_")
+
     baseline_cfg = BaselineConfig()
 
     # ── inference pass (once) ─────────────────────────────────────────────────
-    print("\nRunning GNN inference on all events (once) …")
+    print(f"\nRunning {model_name} inference on all events (once) …")
     t0 = time.perf_counter()
     cache = run_inference(
         event_slices,
@@ -431,15 +468,17 @@ def main(checkpoint_path: str, device: str, sim_dir: str) -> None:
     print("Generating plots …")
     plot_threshold_sweep(
         results, bl_ref,
-        save_path=f"{sim_dir}/grid_search_gnn_threshold.png",
+        save_path=f"{sim_dir}/grid_search_{safe_name}_threshold.png",
+        model_name=model_name,
     )
     plot_edge_keep_rate(
         results,
-        save_path=f"{sim_dir}/grid_search_gnn_edge_keep.png",
+        save_path=f"{sim_dir}/grid_search_{safe_name}_edge_keep.png",
+        model_name=model_name,
     )
     print("Done!")
 
 
 if __name__ == "__main__":
     args = _parse_args()
-    main(args.checkpoint, args.device, args.sim_dir)
+    main(args.checkpoint, args.device, args.sim_dir, args.model_name)
