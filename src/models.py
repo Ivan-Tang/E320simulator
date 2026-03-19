@@ -29,7 +29,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from src.utils import NODE_FEAT_COLS_SRC, NODE_FEAT_COLS_DST, EDGE_FEAT_COLS
-from src.layers import MLP, PositionalEncoding3D, TransformerEncoderLayer, TransformerDecoderLayer
+from src.layers import MLP, MultiHeadAttention, WindowedMultiHeadAttention, PositionalEncoding3D, TransformerEncoderLayer, TransformerDecoderLayer
 
 NODE_DIM = len(NODE_FEAT_COLS_SRC)   # 7
 EDGE_DIM = len(EDGE_FEAT_COLS)       # 6
@@ -590,6 +590,271 @@ class TrackFormerSeed(nn.Module):
             'seed_parameters': seed_parameters,
             'hit_assignments': hit_assignments,
             'seed_embeddings': seed_features,
+        }
+
+
+class HitFilterEncoderLayer(nn.Module):
+    """Transformer encoder layer with windowed self-attention for hit filtering.
+
+    Identical structure to TransformerEncoderLayer but uses
+    WindowedMultiHeadAttention for O(N×w) instead of O(N²) complexity.
+    For E320 hits sorted by x_trk_mm, the window covers a contiguous
+    spatial neighbourhood so same-track hits always share a window.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        dim_feedforward: int = 128,
+        dropout: float = 0.1,
+        window_size: int = 256,
+    ):
+        super().__init__()
+        self.self_attn = WindowedMultiHeadAttention(d_model, n_heads, window_size, dropout)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, d_model),
+        )
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+
+    def forward(self, x: Tensor) -> Tensor:  # x: (1, N, d_model)
+        attn_out = self.self_attn(x, x, x)
+        x = self.norm1(x + self.dropout1(attn_out))
+        x = self.norm2(x + self.dropout2(self.ffn(x)))
+        return x
+
+
+class E320HitFilter(nn.Module):
+    """Per-hit signal/noise classifier for E320, Stage 1 of the two-stage pipeline.
+
+    Adapted from the hit filtering stage of Van Stroud et al. (2025).
+    Hits are sorted by x_trk_mm before encoding to exploit spatial locality:
+    signal hits from the same track cluster near the same x position, so a
+    window of size w almost certainly contains all 5 hits of one track.
+
+    Architecture
+    ------------
+    1. Sort hits by x_trk_mm
+    2. input_proj : node_dim → d_model
+    3. n_layers × HitFilterEncoderLayer  (windowed self-attention, O(N×w))
+    4. classifier : d_model → d_model → d_model//2 → 1  (3-hidden-layer dense
+       network, matching the paper)
+    5. Unsort output to original hit order
+
+    Input  : (N, node_dim)  raw hit features
+    Output : (N,)           per-hit signal logit
+    """
+
+    def __init__(
+        self,
+        node_dim:        int   = NODE_DIM,
+        d_model:         int   = 64,
+        n_heads:         int   = 4,
+        n_layers:        int   = 3,
+        dim_feedforward: int   = 128,
+        window_size:     int   = 256,
+        dropout:         float = 0.1,
+    ):
+        super().__init__()
+        self.input_proj = nn.Linear(node_dim, d_model)
+        self.encoder = nn.ModuleList([
+            HitFilterEncoderLayer(d_model, n_heads, dim_feedforward, dropout, window_size)
+            for _ in range(n_layers)
+        ])
+        self.norm = nn.LayerNorm(d_model)
+        # 3-hidden-layer dense classifier (matching the paper's design)
+        self.classifier = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model // 2),
+            nn.LayerNorm(d_model // 2),
+            nn.GELU(),
+            nn.Linear(d_model // 2, 1),
+        )
+
+    def forward(self, node_feat: Tensor) -> Tensor:  # (N, node_dim) → (N,)
+        # Sort by x_trk_mm (feature index 1) for spatial locality
+        sort_idx   = torch.argsort(node_feat[:, 1])
+        sorted_feat = node_feat[sort_idx]
+
+        x = self.input_proj(sorted_feat).unsqueeze(0)   # (1, N, d_model)
+        for layer in self.encoder:
+            x = layer(x)
+        x = self.norm(x).squeeze(0)                      # (N, d_model)
+
+        logits_sorted = self.classifier(x).squeeze(-1)  # (N,)
+
+        # Restore original hit order
+        unsort_idx = torch.argsort(sort_idx)
+        return logits_sorted[unsort_idx]                 # (N,)
+
+
+class MaskFormerDecoderLayer(nn.Module):
+    """Single decoder layer from Van Stroud et al. (2025).
+
+    Order: masked cross-attention → self-attention → FFN (all pre-norm).
+
+    MaskAttention: the binary mask predicted by the previous decoder layer
+    gates which hits each query is allowed to attend to.  This focuses each
+    track query on the hits already assigned to its current hypothesis.
+    At the first layer (no previous mask) full attention is used.
+    """
+
+    def __init__(self, d_model: int, n_heads: int, dim_feedforward: int = 512, dropout: float = 0.1):
+        super().__init__()
+        self.cross_attn = MultiHeadAttention(d_model, n_heads, dropout)
+        self.self_attn  = MultiHeadAttention(d_model, n_heads, dropout)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, d_model),
+        )
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        queries: Tensor,                       # (Q, d_model)
+        memory:  Tensor,                       # (N, d_model)
+        mask_logits: Tensor | None = None,     # (Q, N) from previous decoder layer
+    ) -> Tensor:                               # (Q, d_model)
+        # Build binary attention mask from previous mask prediction
+        attn_mask = None
+        if mask_logits is not None:
+            bin_mask = (mask_logits.sigmoid() > 0.5)   # (Q, N) bool
+            # Safety: if a query masks out all hits, fall back to full attention
+            all_zero = ~bin_mask.any(dim=-1, keepdim=True)  # (Q, 1)
+            bin_mask = bin_mask | all_zero                   # (Q, N)
+            attn_mask = bin_mask.unsqueeze(0).unsqueeze(0)   # (1, 1, Q, N)
+
+        # Masked cross-attention (pre-norm)
+        q = self.norm1(queries).unsqueeze(0)   # (1, Q, d_model)
+        m = memory.unsqueeze(0)                # (1, N, d_model)
+        cross = self.cross_attn(q, m, m, mask=attn_mask)  # (1, Q, d_model)
+        queries = queries + self.dropout1(cross.squeeze(0))
+
+        # Self-attention (pre-norm)
+        q = self.norm2(queries).unsqueeze(0)
+        self_out = self.self_attn(q, q, q).squeeze(0)
+        queries = queries + self.dropout2(self_out)
+
+        # FFN (pre-norm)
+        queries = queries + self.dropout3(self.ffn(self.norm3(queries)))
+        return queries
+
+
+class E320TrackFormer(nn.Module):
+    """MaskFormer-style track reconstruction for the E320 5-layer detector.
+
+    Adapted from Van Stroud et al. (2025) "Transformers for Charged Particle
+    Track Reconstruction in High Energy Physics" (PRX 15, 041046).
+
+    Differences from the original:
+    - No hit-filter stage (E320 has ~100 hits/event vs. 60k at LHC)
+    - Full self-attention instead of sliding-window (N is small)
+    - Adapted input features (7-dim: layer_id, x, y, z, size_x, size_y, size)
+
+    Architecture
+    ------------
+    1. input_proj     : node_dim → d_model
+    2. Transformer encoder (n_encoder_layers × TransformerEncoderLayer)
+       → hit_memory (N, d_model)
+    3. Q learnable object queries
+    4. Decoder: n_decoder_layers × MaskFormerDecoderLayer
+       Each layer l computes intermediate mask logits M^l = query @ hit_memory.T
+       and passes them as attention masks to layer l+1.
+    5. class_head     : (Q, d_model) → (Q,)  track/no-track logit
+    6. mask_head      : (Q, d_model) @ hit_memory.T → (Q, N)  hit-assignment logit
+
+    Output (dict)
+    -------------
+    track_logits    : (Q,)           raw logit — each query being a real track
+    mask_logits     : (Q, N)         final per-hit assignment logits
+    aux_mask_logits : list[(Q, N)]   intermediate mask logits (for auxiliary loss)
+    hit_memory      : (N, d_model)   encoder hit embeddings
+    """
+
+    def __init__(
+        self,
+        node_dim:         int = NODE_DIM,
+        d_model:          int = 128,
+        n_heads:          int = 4,
+        n_encoder_layers: int = 4,
+        n_decoder_layers: int = 4,
+        dim_feedforward:  int = 256,
+        max_queries:      int = 30,
+        dropout:          float = 0.1,
+    ):
+        super().__init__()
+        self.max_queries = max_queries
+        self.d_model = d_model
+
+        # Encoder
+        self.input_proj  = nn.Linear(node_dim, d_model)
+        self.encoder     = nn.ModuleList([
+            TransformerEncoderLayer(d_model, n_heads, dim_feedforward, dropout)
+            for _ in range(n_encoder_layers)
+        ])
+        self.encoder_norm = nn.LayerNorm(d_model)
+
+        # Decoder
+        self.queries     = nn.Parameter(torch.randn(max_queries, d_model))
+        self.decoder     = nn.ModuleList([
+            MaskFormerDecoderLayer(d_model, n_heads, dim_feedforward, dropout)
+            for _ in range(n_decoder_layers)
+        ])
+        self.decoder_norm = nn.LayerNorm(d_model)
+
+        # Output heads
+        self.class_head      = nn.Linear(d_model, 1)
+        self.mask_token_proj = nn.Linear(d_model, d_model)
+
+    def _mask_logits(self, query_emb: Tensor, hit_memory: Tensor) -> Tensor:
+        """Dot-product mask: (Q, d) @ (d, N) → (Q, N), scaled."""
+        tokens = self.mask_token_proj(query_emb)                   # (Q, d_model)
+        return torch.matmul(tokens, hit_memory.T) / math.sqrt(self.d_model)
+
+    def forward(
+        self,
+        node_feat:  Tensor,              # (N, node_dim)
+        edge_index: Tensor | None = None,  # unused — kept for API compatibility
+        edge_feat:  Tensor | None = None,  # unused
+    ) -> dict:
+        # Encode all hits
+        x = self.input_proj(node_feat).unsqueeze(0)  # (1, N, d_model)
+        for layer in self.encoder:
+            x = layer(x)
+        hit_memory = self.encoder_norm(x).squeeze(0)  # (N, d_model)
+
+        # Decode with MaskAttention
+        queries = self.queries.clone()                # (Q, d_model)
+        mask_logits_prev: Tensor | None = None
+        aux_mask_logits: list[Tensor] = []
+
+        for layer in self.decoder:
+            queries = layer(queries, hit_memory, mask_logits=mask_logits_prev)
+            mask_logits_prev = self._mask_logits(queries, hit_memory)
+            aux_mask_logits.append(mask_logits_prev)
+
+        queries = self.decoder_norm(queries)
+
+        return {
+            "track_logits":    self.class_head(queries).squeeze(-1),   # (Q,)
+            "mask_logits":     self._mask_logits(queries, hit_memory),  # (Q, N)
+            "aux_mask_logits": aux_mask_logits[:-1],  # all but last (recomputed above)
+            "hit_memory":      hit_memory,
         }
 
 
