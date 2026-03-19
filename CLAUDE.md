@@ -8,8 +8,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 1. `research_proposal_ML_seeding.md` — 了解研究方向和目标
 2. `progress.md` — 了解当前进度和下一步计划
 
-每次会话结束时，必须更新：
-- `progress.md` — 记录本次完成的工作、实验结果、遇到的问题、下一步计划
+每次会话结束时，必须按顺序执行：
+1. 更新 `progress.md` — 记录本次完成的工作、实验结果、遇到的问题、下一步计划
+2. **Git commit + push** — 将本次所有修改提交并推送到远端（worker 节点从 git 拉取代码，不推送则批处理作业看不到更改）：
+   ```bash
+   cd ~/E320simulator
+   git add <changed files>
+   git commit -m "描述本次修改"
+   git push
+   ```
 
 ## Cluster Environment
 
