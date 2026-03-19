@@ -49,7 +49,7 @@ class EmbedderTrainConfig:
     seed: int = 42
 
     # model
-    emb_dim: int = 3
+    emb_dim: int = 8
     hidden_dim: int = 64
     n_layers: int = 3
 

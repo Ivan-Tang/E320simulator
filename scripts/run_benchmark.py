@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.baseline import BaselineConfig
 from src.hough_baseline import HoughConfig
 from src.train import TrainConfig, train
+from src.train_embedder import EmbedderTrainConfig, train_embedder
 from src.train_trackformer import TrackFormerConfig, train_trackformer
 from src.train_hit_filter import HitFilterConfig, train_hit_filter
 from src.utils import build_labeled_edges_from_sim
@@ -56,6 +57,7 @@ def train_ml_model(
     device: str = "mps",
     n_epochs: int = 50,
     force: bool = False,
+    embedder_checkpoint: str | None = None,
 ) -> str:
     """Build edges, train model, and save checkpoint.  Returns checkpoint path."""
     ckpt_path = checkpoint_dir / "best_model.pt"
@@ -69,13 +71,14 @@ def train_ml_model(
     print(f"  Built {len(edges_df):,} candidate edges")
 
     cfg = TrainConfig(
-        model_type     = model_type,
-        n_epochs       = n_epochs,
-        hidden         = 64,
-        n_mp           = 2,
-        lr             = 3e-4,
-        device         = device,
-        checkpoint_dir = str(checkpoint_dir),
+        model_type          = model_type,
+        n_epochs            = n_epochs,
+        hidden              = 64,
+        n_mp                = 2,
+        lr                  = 3e-4,
+        device              = device,
+        checkpoint_dir      = str(checkpoint_dir),
+        embedder_checkpoint = embedder_checkpoint,
     )
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     train(edges_df, cfg)
@@ -126,6 +129,25 @@ def main(
         result.write_parquet(out)
         reco_paths[name] = str(out)
         print(f"  → {out}  ({dt:.1f}s)")
+
+    # ── Stage 0: Shared metric-learning embedder (hinge loss) ────────────────
+    print("\n" + "=" * 65)
+    print("Stage 0: Metric-learning embedder (hinge loss)")
+    embedder_dir  = RUNS_DIR / "embedder"
+    embedder_ckpt = embedder_dir / "best_embedder.pt"
+    embedder_dir.mkdir(parents=True, exist_ok=True)
+    t0 = time.perf_counter()
+    if embedder_ckpt.exists() and not force_retrain:
+        print(f"  checkpoint exists → skipping: {embedder_ckpt}")
+    else:
+        emb_cfg = EmbedderTrainConfig(
+            emb_dim        = 8,
+            n_epochs       = epochs,
+            device         = device,
+            checkpoint_dir = str(embedder_dir),
+        )
+        train_embedder(clusters_train, emb_cfg)
+    print(f"  embedder → {embedder_ckpt}  ({time.perf_counter() - t0:.0f}s)")
 
     # ── ML algorithms ─────────────────────────────────────────────────────────
     print("\n" + "=" * 65)
@@ -206,6 +228,7 @@ def main(
             ckpt_path = train_ml_model(
                 model_type, clusters_train, ckpt_dir,
                 device=device, n_epochs=epochs, force=force_retrain,
+                embedder_checkpoint=str(embedder_ckpt),
             )
         except Exception as e:
             print(f"  [ERROR] training failed: {e}")
