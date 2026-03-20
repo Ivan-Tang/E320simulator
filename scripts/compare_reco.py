@@ -63,7 +63,8 @@ def compute_metrics(reco: pl.DataFrame, tracks: pl.DataFrame) -> dict:
     n_fake    = n_kept - n_matched
 
     # Track-level efficiency: how many unique truth tracks were matched
-    n_unique_matched = matched["matched_track_id"].n_unique()
+    # matched_track_id is per-event local, must combine with event_id
+    n_unique_matched = matched.select(["event_id", "matched_track_id"]).unique().height
     efficiency = n_unique_matched / n_truth * 100 if n_truth else 0.0
     fake_rate  = n_fake / n_kept * 100 if n_kept else 0.0
 
