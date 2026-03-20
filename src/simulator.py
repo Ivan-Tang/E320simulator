@@ -82,7 +82,8 @@ class SimConfig:
     pz_range: tuple[float, float] = (1.5, 4.0)        # GeV, placeholder
 
     # -- multiple scattering --
-    multiple_scattering_mrad: float = 0.2
+    # 0.09 mrad: estimated for 2.5 GeV electrons (scaled from 0.2 mrad at 1 GeV, ~1/p)
+    multiple_scattering_mrad: float = 0.09
 
     # -- measurement smearing --
     sigma_x_mm: float = SIGMA_X_MM

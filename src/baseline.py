@@ -35,8 +35,10 @@ class BaselineConfig:
     slope_y_max: float = 0.2
     knn_k: int = 10
     # chain seeding
-    dslope_x_max: float = 0.001
-    dslope_y_max: float = 0.001
+    # 0.002 rad ≈ 4σ of dslope spread (σ_dslope = 2*σ_x/dz = 2*0.005mm/20mm = 0.5 mrad)
+    # increased from 0.001 to avoid cutting real tracks given measurement smearing
+    dslope_x_max: float = 0.002
+    dslope_y_max: float = 0.002
     # parallelism
     n_workers: int = 8
 
