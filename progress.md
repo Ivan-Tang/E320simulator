@@ -2,18 +2,20 @@
 
 ## 当前阶段
 
-**阶段**：Scaling 已完成分析；Benchmark（256GB）仍在运行（~1h）
+**阶段**：Scaling 完成；Benchmark OOM 问题未解决，需降低 --workers
 **时间**：2026年3月20日
-**状态**：Scaling sweep 全部完成，得到各方法在不同背景/信号密度下的系统性结果。Transformer 彻底失效（效率0%），InteractionNet 是现有 ML 模型中综合表现最优的。新 Benchmark job（256GB）仍在跑。
+**状态**：Scaling sweep 全部完成。Benchmark 256GB 版本仍在 epoch ~187 被 OOM kill，根因确认为 `--workers 8` 导致 8 个进程各持 35M clusters，需减少 workers 后重提交。
 
 ---
 
 ## 已完成工作（按时间倒序）
 
 ### 2026年3月20日
+- Benchmark `3913186.pbs`（256GB）完成，但仍在 epoch 187/200 被 OOM kill
+- 根因确认：`--workers 8` × 35M clusters = 单次作业需要 >256GB RAM
+- 非 ML 结果再次确认：Baseline 74.3%/42.5%，Hough 82.7%/46.1%（与上次一致）
 - Scaling job `3911702.pbs` 完成（耗时 ~5h，03月19日23:42落盘）
 - 分析 Scaling 结果（两轮 sweep：背景扫描 + 信号密度扫描），见下方详细表格
-- 新 Benchmark job `3913186.pbs`（256GB）提交并运行中
 
 ### 2026年3月19日
 - Benchmark job `3912419.pbs`（64GB）部分完成：Baseline 和 Hough 定量结果获得，ML 部分 OOM kill
@@ -93,7 +95,7 @@ Transformer 在 bg=700 下全线 0% 效率 / 100% 误判率，略。
 
 - **Transformer checkpoint 失效**：需要重新训练，或完全重新设计针对 E320 的 TrackFormer-Seed。
 - **EggNet NaN/低效率**：checkpoint 疑似有问题，需重新训练。
-- **Benchmark ML 结果待完成**：`3913186.pbs`（256GB）仍在运行，等待完整 ML 训练+评估结果。
+- **Benchmark OOM 根因确认**：`--workers 8` 让 8 个进程各持 35M clusters，256GB 仍不够。需改用 `--workers 2` 或将 ML 训练从 benchmark 脚本中拆出单独提交。
 - **所有方法效率上限 ~83%，误判率在实际背景下远超 5% 目标**：需要专门针对 E320 重新训练。
 - `src/baseline.py:110-111`：divide-by-zero RuntimeWarning（dz=0），需修复。
 
@@ -101,7 +103,7 @@ Transformer 在 bg=700 下全线 0% 效率 / 100% 误判率，略。
 
 ## 下一步计划
 
-1. **等待 Benchmark（256GB）完成**：获得完整 ML 训练结果，填充 Benchmark 结果表格
+1. **修复 Benchmark OOM，重新提交**：将 `--workers 8` 改为 `--workers 2`，或拆分任务——ML 训练单独跑，不与数据生成混跑
 2. **重新训练 Transformer（TrackFormer-Seed）**：
    - 现有 checkpoint 完全失效，从头设计针对 E320 低信噪比的训练流程
    - 优先推进方向：TrackFormer-Seed（周期短，已有框架）
