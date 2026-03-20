@@ -15,6 +15,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -48,6 +49,26 @@ TEST_TRACKS    = SIM_DIR / "sim_tracks_test.parquet"
 ML_MODELS = ["mlp", "gnn", "interaction_net", "eggnet", "hgnn", "transformer"]
 
 
+# ── DDP subprocess helper ──────────────────────────────────────────────────────
+
+def _run_torchrun(
+    module: str,
+    extra_args: list[str],
+    nproc: int,
+    accum_steps: int,
+) -> None:
+    """Launch a training module via torchrun (blocks until done)."""
+    cmd = [
+        sys.executable, "-m", "torch.distributed.run",
+        "--standalone", f"--nproc_per_node={nproc}",
+        "-m", module,
+        *extra_args,
+        "--gradient-accumulation-steps", str(accum_steps),
+    ]
+    print(f"  [torchrun] {' '.join(cmd)}")
+    subprocess.run(cmd, check=True)
+
+
 # ── Training helper ───────────────────────────────────────────────────────────
 
 def train_ml_model(
@@ -58,6 +79,8 @@ def train_ml_model(
     n_epochs: int = 50,
     force: bool = False,
     embedder_checkpoint: str | None = None,
+    ddp_nproc: int = 1,
+    accum_steps: int = 1,
 ) -> str:
     """Build edges, train model, and save checkpoint.  Returns checkpoint path."""
     ckpt_path = checkpoint_dir / "best_model.pt"
@@ -70,18 +93,35 @@ def train_ml_model(
     edges_df = build_labeled_edges_from_sim(clusters_df)
     print(f"  Built {len(edges_df):,} candidate edges")
 
-    cfg = TrainConfig(
-        model_type          = model_type,
-        n_epochs            = n_epochs,
-        hidden              = 64,
-        n_mp                = 2,
-        lr                  = 3e-4,
-        device              = device,
-        checkpoint_dir      = str(checkpoint_dir),
-        embedder_checkpoint = embedder_checkpoint,
-    )
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    train(edges_df, cfg)
+
+    if ddp_nproc > 1:
+        # Save edges to a temp parquet so the subprocess can read them
+        tmp_edges = checkpoint_dir / "_tmp_edges.parquet"
+        edges_df.write_parquet(tmp_edges)
+        extra = [
+            "--task", "edge",
+            "--clusters", str(TRAIN_CLUSTERS),   # passed to build_labeled_edges internally
+            "--model", model_type,
+            "--epochs", str(n_epochs),
+            "--device", "auto",
+            "--checkpoint", str(checkpoint_dir),
+        ]
+        if embedder_checkpoint:
+            extra += ["--embedder-checkpoint", embedder_checkpoint]
+        _run_torchrun("src.train", extra, nproc=ddp_nproc, accum_steps=accum_steps)
+    else:
+        cfg = TrainConfig(
+            model_type          = model_type,
+            n_epochs            = n_epochs,
+            hidden              = 64,
+            n_mp                = 2,
+            lr                  = 3e-4,
+            device              = device,
+            checkpoint_dir      = str(checkpoint_dir),
+            embedder_checkpoint = embedder_checkpoint,
+        )
+        train(edges_df, cfg)
     return str(ckpt_path)
 
 
@@ -92,6 +132,8 @@ def main(
     force_retrain: bool = False,
     epochs: int = 200,
     workers: int = 1,
+    ddp_nproc: int = 1,
+    accum_steps: int = 1,
 ) -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -107,6 +149,8 @@ def main(
           f"({clusters_test['event_id'].n_unique():,} events)")
     print(f"  Test  tracks   : {len(tracks_test):,}")
     print(f"  workers        : {workers}")
+    if ddp_nproc > 1:
+        print(f"  DDP nproc      : {ddp_nproc}  accum_steps={accum_steps}")
 
     baseline_cfg = BaselineConfig(n_workers=workers)
     hough_cfg    = HoughConfig(n_workers=workers)
@@ -139,6 +183,17 @@ def main(
     t0 = time.perf_counter()
     if embedder_ckpt.exists() and not force_retrain:
         print(f"  checkpoint exists → skipping: {embedder_ckpt}")
+    elif ddp_nproc > 1:
+        _run_torchrun(
+            "src.train",
+            ["--task", "embedder",
+             "--clusters", str(TRAIN_CLUSTERS),
+             "--epochs", str(epochs),
+             "--device", "auto",
+             "--checkpoint", str(embedder_dir)],
+            nproc=ddp_nproc,
+            accum_steps=accum_steps,
+        )
     else:
         emb_cfg = EmbedderTrainConfig(
             emb_dim        = 8,
@@ -169,6 +224,17 @@ def main(
             try:
                 if Path(hf_ckpt_path).exists() and not force_retrain:
                     print(f"  [Stage 1] hit filter checkpoint exists → skipping: {hf_ckpt_path}")
+                elif ddp_nproc > 1:
+                    print("  [Stage 1] Training hit filter (DDP)...")
+                    _run_torchrun(
+                        "src.train_hit_filter",
+                        ["--clusters", str(TRAIN_CLUSTERS),
+                         "--epochs", str(epochs),
+                         "--device", "auto",
+                         "--checkpoint", str(ckpt_dir)],
+                        nproc=ddp_nproc,
+                        accum_steps=accum_steps,
+                    )
                 else:
                     print("  [Stage 1] Training hit filter...")
                     hf_cfg = HitFilterConfig(
@@ -187,6 +253,19 @@ def main(
             try:
                 if Path(tf_ckpt_path).exists() and not force_retrain:
                     print(f"  [Stage 2] trackformer checkpoint exists → skipping: {tf_ckpt_path}")
+                elif ddp_nproc > 1:
+                    print("  [Stage 2] Training MaskFormer on filtered hits (DDP)...")
+                    _run_torchrun(
+                        "src.train_trackformer",
+                        ["--clusters", str(TRAIN_CLUSTERS),
+                         "--epochs", str(epochs),
+                         "--device", "auto",
+                         "--checkpoint", str(ckpt_dir),
+                         "--hit-filter-checkpoint", hf_ckpt_path,
+                         "--hit-filter-threshold", "0.1"],
+                        nproc=ddp_nproc,
+                        accum_steps=accum_steps,
+                    )
                 else:
                     print("  [Stage 2] Training MaskFormer on filtered hits...")
                     tf_cfg = TrackFormerConfig(
@@ -229,6 +308,7 @@ def main(
                 model_type, clusters_train, ckpt_dir,
                 device=device, n_epochs=epochs, force=force_retrain,
                 embedder_checkpoint=str(embedder_ckpt),
+                ddp_nproc=ddp_nproc, accum_steps=accum_steps,
             )
         except Exception as e:
             print(f"  [ERROR] training failed: {e}")
@@ -260,16 +340,22 @@ def main(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Benchmark E320 tracking algorithms")
-    parser.add_argument("--device",           default="mps", choices=["cpu", "cuda", "mps"])
+    parser.add_argument("--device",           default="mps", choices=["cpu", "cuda", "mps", "auto"])
     parser.add_argument("--epochs",           type=int, default=200)
-    parser.add_argument("--workers",       type=int, default=1,
+    parser.add_argument("--workers",          type=int, default=1,
                         help="Parallel workers for non-ML algorithms (default 1 to limit memory)")
-    parser.add_argument("--force-retrain", action="store_true",
+    parser.add_argument("--force-retrain",    action="store_true",
                         help="Re-train even if checkpoint already exists")
+    parser.add_argument("--ddp-nproc",        type=int, default=1,
+                        help="Number of GPUs for DDP training (1 = single-GPU, no DDP)")
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1,
+                        help="Gradient accumulation steps for DDP training")
     args = parser.parse_args()
     main(
-        device=args.device,
-        force_retrain=args.force_retrain,
-        epochs=args.epochs,
-        workers=args.workers,
+        device       = args.device,
+        force_retrain= args.force_retrain,
+        epochs       = args.epochs,
+        workers      = args.workers,
+        ddp_nproc    = args.ddp_nproc,
+        accum_steps  = args.gradient_accumulation_steps,
     )

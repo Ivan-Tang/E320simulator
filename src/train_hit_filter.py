@@ -21,6 +21,7 @@ Usage
 """
 from __future__ import annotations
 
+import argparse
 import dataclasses
 import json
 import time
@@ -369,3 +370,31 @@ def load_hit_filter_checkpoint(
         "epoch":     ckpt.get("epoch"),
         "best_eff":  ckpt.get("best_eff"),
     }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CLI entry-point
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _cli() -> None:
+    parser = argparse.ArgumentParser(description="Train E320HitFilter")
+    parser.add_argument("--clusters",    required=True, help="Path to sim_clusters.parquet")
+    parser.add_argument("--epochs",      type=int,   default=50)
+    parser.add_argument("--device",      default="auto")
+    parser.add_argument("--checkpoint",  default=None, help="Directory to save checkpoint")
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
+    args = parser.parse_args()
+
+    import polars as pl
+    clusters_df = pl.read_parquet(args.clusters)
+    cfg = HitFilterConfig(
+        n_epochs                    = args.epochs,
+        device                      = args.device,
+        checkpoint_dir              = args.checkpoint,
+        gradient_accumulation_steps = args.gradient_accumulation_steps,
+    )
+    train_hit_filter(clusters_df, cfg)
+
+
+if __name__ == "__main__":
+    _cli()

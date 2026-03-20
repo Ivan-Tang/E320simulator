@@ -17,6 +17,7 @@ Usage
 """
 from __future__ import annotations
 
+import argparse
 import dataclasses
 import json
 import time
@@ -620,3 +621,35 @@ def load_trackformer_checkpoint(
         "epoch":     ckpt.get("epoch"),
         "best_eff":  ckpt.get("best_eff"),
     }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CLI entry-point
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _cli() -> None:
+    parser = argparse.ArgumentParser(description="Train E320TrackFormer")
+    parser.add_argument("--clusters",              required=True, help="Path to sim_clusters.parquet")
+    parser.add_argument("--epochs",                type=int,   default=50)
+    parser.add_argument("--device",                default="auto")
+    parser.add_argument("--checkpoint",            default=None, help="Directory to save checkpoint")
+    parser.add_argument("--hit-filter-checkpoint", default=None, help="Path to hit_filter.pt")
+    parser.add_argument("--hit-filter-threshold",  type=float, default=0.1)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
+    args = parser.parse_args()
+
+    import polars as pl
+    clusters_df = pl.read_parquet(args.clusters)
+    cfg = TrackFormerConfig(
+        n_epochs                    = args.epochs,
+        device                      = args.device,
+        checkpoint_dir              = args.checkpoint,
+        hit_filter_checkpoint       = args.hit_filter_checkpoint,
+        hit_filter_threshold        = args.hit_filter_threshold,
+        gradient_accumulation_steps = args.gradient_accumulation_steps,
+    )
+    train_trackformer(clusters_df, cfg)
+
+
+if __name__ == "__main__":
+    _cli()
