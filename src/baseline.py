@@ -109,8 +109,9 @@ def _build_edges(
         dx = bx_[None, :] - ax_[:, None]
         dy = by_[None, :] - ay_[:, None]
         dz = bz_[None, :] - az_[:, None]
-        s_x = dx / dz
-        s_y = dy / dz
+        with np.errstate(divide="ignore", invalid="ignore"):
+            s_x = dx / dz
+            s_y = dy / dz
 
         ok = (np.abs(s_x) < cfg.slope_x_max) & (np.abs(s_y) < cfg.slope_y_max)
         ia, ib = np.where(ok)
