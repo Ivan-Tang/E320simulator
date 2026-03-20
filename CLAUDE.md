@@ -212,3 +212,116 @@ Polars DataFrames serialized to Parquet. Use Polars idioms throughout (not panda
 ### Device Handling
 
 Scripts auto-detect the best available device: CUDA > CPU. GPU nodes have NVIDIA RTX 3090 (24 GB VRAM, CUDA 13.0). MPS/Apple Silicon is not applicable on this Linux cluster.
+
+---
+
+## Autonomous Research Mode
+
+### 什么是 Autonomous Research Mode
+
+当 Claude Code 以 `claude --print --dangerously-skip-permissions` 被 `autonomous_watcher.sh` 自动调用时，进入 **Autonomous Research Mode**。
+
+在此模式下，Claude 作为自主研究员：以 `research_goal.md` 中的目标为导向，分析代码和实验结果，提出假设，修改模型架构，提交 PBS 实验，读取结果，形成新假设，持续循环。
+
+### 进入判断
+
+会话开始时检查：读取 `experiment_state.json`，若 `loop_status` 为 `idle/submitted/waiting`，且存在 `research_goal.md`，则以 Autonomous Research Mode 执行 `autonomous_loop_prompt.md` 中的步骤。
+
+### 代码改动白名单（Autonomous Mode 下）
+
+| 允许修改 | 禁止修改 |
+|---------|---------|
+| `src/models.py` | `src/geometry.py` |
+| `src/layers.py` | `src/simulator.py` |
+| `src/train.py` | `src/utils.py` |
+| `src/losses.py` | `src/config.py` |
+| `experiment_state.json` | `CLAUDE.md`（本文件）|
+| `research_log.md` | `autonomous_loop_prompt.md` |
+| `status.md` | `autonomous_watcher.sh` |
+| `~/subs/auto_loop*.sh`（生成） | `~/subs/auto_eval_template.sh`（模板）|
+
+### Git 分支规则
+
+- 所有 autonomous mode 的代码改动必须在 `auto-research-*` 分支
+- **不得直接 commit 到 master**（`settings.json` 的 deny 规则会阻止）
+- 每次循环至少一次 `git push`（在 qsub 之前）
+- 用户决定何时 merge 到 master
+
+### 测试门槛
+
+```bash
+conda run -n e320root pytest test/ -v
+```
+
+pytest 必须通过才能 commit 代码。测试失败 → 修复代码 → 重跑。
+若无法修复 → 设置 `error_state` → 退出（不提交 PBS 作业）。
+
+### 关键文件说明
+
+| 文件 | 角色 | 由谁维护 |
+|------|------|---------|
+| `research_goal.md` | 研究目标和约束 | **用户**（每 session 更新）|
+| `research_log.md` | 假设+变更+结果的研究日志 | **Claude**（每轮追加）|
+| `experiment_state.json` | 循环控制状态 | **Claude**（每轮更新）|
+| `status.md` | 实时监控 | **Claude**（每轮覆盖）|
+| `autonomous_loop_prompt.md` | Claude 的执行指令 | **用户**（修改循环行为）|
+
+### 启动新研究 Session
+
+```bash
+# 1. 填写研究目标
+vim ~/E320simulator/research_goal.md
+
+# 2. 创建研究分支
+cd ~/E320simulator
+git checkout -b auto-research-{目标缩写}
+git push -u origin auto-research-{目标缩写}
+
+# 3. 初始化状态文件（填入 loop_start_time, research_branch, max_loops）
+vim ~/E320simulator/experiment_state.json
+
+# 4. 启动 watcher（后台守护进程）
+nohup bash ~/subs/autonomous_watcher.sh > ~/logs/watcher.log 2>&1 &
+echo "Watcher PID: $!"
+
+# 5. 手动触发第一次循环（冷启动）
+cd ~/E320simulator
+claude --print --dangerously-skip-permissions \
+  "$(cat autonomous_loop_prompt.md)" \
+  >> ~/logs/claude_init.log 2>&1 &
+```
+
+### 停止与恢复
+
+**查看状态**: `cat ~/E320simulator/status.md`
+**查看日志**: `tail -50 ~/logs/watcher.log`
+
+**优雅停止**（等当前作业完成后停止）：
+```bash
+python3 -c "
+import json
+with open('~/E320simulator/experiment_state.json') as f: s = json.load(f)
+s['stop_requested'] = True
+with open('~/E320simulator/experiment_state.json', 'w') as f: json.dump(s, f, indent=2)
+"
+touch ~/E320simulator/.stop_watcher
+```
+
+**紧急停止**：
+```bash
+touch ~/E320simulator/.stop_watcher
+kill $(cat ~/E320simulator/.watcher.pid 2>/dev/null) 2>/dev/null
+qdel $(python3 -c "import json; print(json.load(open('experiment_state.json')).get('current_pbs_job_id',''))")
+```
+
+**恢复**（清除错误后重启）：
+```bash
+python3 -c "
+import json
+with open('experiment_state.json') as f: s = json.load(f)
+s['error_state'] = None; s['stop_requested'] = False; s['loop_status'] = 'idle'
+with open('experiment_state.json', 'w') as f: json.dump(s, f, indent=2)
+"
+rm -f ~/E320simulator/.stop_watcher
+nohup bash ~/subs/autonomous_watcher.sh > ~/logs/watcher.log 2>&1 &
+```
