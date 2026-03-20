@@ -2,18 +2,18 @@
 
 ## 当前阶段
 
-**阶段**：Scaling 完成；Benchmark OOM 问题未解决，需降低 --workers
+**阶段**：Benchmark 全部完成，所有方法已有完整定量结果
 **时间**：2026年3月20日
-**状态**：Scaling sweep 全部完成。Benchmark 256GB 版本仍在 epoch ~187 被 OOM kill，根因确认为 `--workers 8` 导致 8 个进程各持 35M clusters，需减少 workers 后重提交。
+**状态**：Benchmark `3914621.pbs`（去掉 `--force-retrain`）成功完成。非 ML + 全部 ML 模型推理结果已获得。InteractionNet 是现有最优 ML 模型，Transformer 和 EggNet 需要重新训练。
 
 ---
 
 ## 已完成工作（按时间倒序）
 
 ### 2026年3月20日
-- Benchmark `3913186.pbs`（256GB）完成，但仍在 epoch 187/200 被 OOM kill
-- 根因确认：`--workers 8` × 35M clusters = 单次作业需要 >256GB RAM
-- 非 ML 结果再次确认：Baseline 74.3%/42.5%，Hough 82.7%/46.1%（与上次一致）
+- **Benchmark `3914621.pbs` 完成**（耗时 ~3h10m）：所有方法完整推理结果获得
+- OOM 根因修复：去掉 `--force-retrain`，利用已有 checkpoints 跳过边图构建，直接推理
+- Benchmark `3913186.pbs`（256GB）OOM 根因确认：`build_labeled_edges_from_sim(35M clusters)` 的边图 DataFrame 超出内存，非 DataLoader workers 问题
 - Scaling job `3911702.pbs` 完成（耗时 ~5h，03月19日23:42落盘）
 - 分析 Scaling 结果（两轮 sweep：背景扫描 + 信号密度扫描），见下方详细表格
 
@@ -37,13 +37,21 @@
 
 ## 关键实验结果
 
-### Benchmark（10k 测试事件，信号占比 0.02%）
+### Benchmark（10k 测试事件，1173 真实径迹，信号占比 0.02%）
 
-| 方法 | 径迹效率 | 误判率 | 推理时间 | 备注 |
-|------|----------|--------|----------|------|
-| Baseline（斜率窗口+链式）| **74.3%** | **42.5%** | 553 s/10k events | |
-| Hough 变换 | **82.7%** | **46.1%** | 4545 s/10k events | |
-| ML 模型（EdgeMLP 等）| — | — | — | Benchmark 256GB 重跑中 |
+| 方法 | 径迹效率 | 误判率 | Mean RMS | 推理时间 | 备注 |
+|------|----------|--------|----------|----------|------|
+| Baseline | **74.3%** | 42.5% | 4.73 µm | 341 s | |
+| Hough | **82.7%** | 46.1% | 13.33 µm | 2880 s | 效率最高但 RMS 差 3× |
+| MLP | 74.3% | 40.4% | 4.67 µm | 2447 s | 与 Baseline 相当 |
+| GNN (ResGNN) | 51.4% | 43.5% | 4.78 µm | 2270 s | 低于 Baseline |
+| **InteractionNet** | **70.6%** | **14.3%** | **4.09 µm** | **767 s** | ★ 最优 ML：误判率最低，RMS最佳 |
+| EggNet | 1.4% | 10.5% | 4.95 µm | 713 s | 基本失效，checkpoint 需重训 |
+| HGNN | 14.2% | 10.2% | 4.14 µm | 712 s | 效率低但误判率好 |
+| Transformer | 2.2% | 99.7% | 4726 µm | 151 s | 完全失效，需从头重训 |
+
+*目标：径迹效率 ≥95%，误判率 ≤5%，推理时间 ≤10 ms/event*
+**注**：所有方法效率均远低于 95% 目标；InteractionNet 在误判率上接近目标（14.3% vs 5% 目标），是下一步重点优化方向。
 
 ### Scaling Sweep 1：背景强度扫描（mean_n_signal=0.5，1000 events）
 
@@ -95,21 +103,21 @@ Transformer 在 bg=700 下全线 0% 效率 / 100% 误判率，略。
 
 - **Transformer checkpoint 失效**：需要重新训练，或完全重新设计针对 E320 的 TrackFormer-Seed。
 - **EggNet NaN/低效率**：checkpoint 疑似有问题，需重新训练。
-- **Benchmark OOM 根因确认**：`--workers 8` 让 8 个进程各持 35M clusters，256GB 仍不够。需改用 `--workers 2` 或将 ML 训练从 benchmark 脚本中拆出单独提交。
-- **所有方法效率上限 ~83%，误判率在实际背景下远超 5% 目标**：需要专门针对 E320 重新训练。
+- **OOM 根因**：`build_labeled_edges_from_sim(35M clusters)` 构建全量边图超出内存。若需重新训练模型，须将边图构建与训练拆分为独立 job，或大幅减少训练集规模。
+- **所有方法效率上限 ~83%，远低于 95% 目标**：需专门针对 E320 设计并重新训练模型。
+- **EggNet 和 Transformer checkpoints 基本无效**：需重新训练。
+- **InteractionNet 是最有希望的起点**：误判率已降至 14.3%，但效率仍需从 70.6% 提升到 ≥95%。
 - `src/baseline.py:110-111`：divide-by-zero RuntimeWarning（dz=0），需修复。
 
 ---
 
 ## 下一步计划
 
-1. **修复 Benchmark OOM，重新提交**：将 `--workers 8` 改为 `--workers 2`，或拆分任务——ML 训练单独跑，不与数据生成混跑
-2. **重新训练 Transformer（TrackFormer-Seed）**：
-   - 现有 checkpoint 完全失效，从头设计针对 E320 低信噪比的训练流程
-   - 优先推进方向：TrackFormer-Seed（周期短，已有框架）
-3. **重新训练 EggNet**：排查 NaN 问题，调整训练超参数
-4. **针对 InteractionNet 优化**：在现有最优 ML 基础上，探索提升效率的方向（效率从 ~55% 提升到 ≥95% 需要根本性改进）
-5. **修复 baseline divide-by-zero**：`src/baseline.py:110-111`
+1. **分析 InteractionNet 失效案例**：当前 70.6% 效率 vs 95% 目标，差距主要来自哪类事件/径迹？（低动量？特殊几何？）
+2. **重新训练 Transformer（TrackFormer-Seed）**：现有 checkpoint 完全失效（99.7% fake），从头设计针对 E320 低信噪比的训练流程
+3. **重新训练 EggNet**：当前 1.4% 效率，checkpoint 基本无效，需重训或放弃
+4. **若需重训 ML 模型**：将边图构建（`build_labeled_edges_from_sim`）单独提交为独立 job，避免 OOM
+5. **修复 baseline divide-by-zero**：`src/baseline.py:110-111`（dz=0 时斜率计算）
 
 ---
 
