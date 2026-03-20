@@ -51,7 +51,7 @@ def compute_metrics(reco: pl.DataFrame, tracks: pl.DataFrame) -> dict:
             "match_5": 0, "match_4": 0, "match_3": 0,
             "match_2": 0, "match_1": 0, "match_0": 0,
             "n_matched": 0, "n_fake": 0,
-            "efficiency_%": 0.0, "fake_rate_%": 0.0,
+            "efficiency_%": 0.0, "fake_rate_%": 0.0, "f1_score_%": 0.0,
             "chi2_mean": float("nan"), "rms_mean_um": float("nan"),
         }
 
@@ -66,6 +66,10 @@ def compute_metrics(reco: pl.DataFrame, tracks: pl.DataFrame) -> dict:
     n_unique_matched = matched["matched_track_id"].n_unique()
     efficiency = n_unique_matched / n_truth * 100 if n_truth else 0.0
     fake_rate  = n_fake / n_kept * 100 if n_kept else 0.0
+
+    precision = n_matched / n_kept if n_kept else 0.0
+    recall    = n_unique_matched / n_truth if n_truth else 0.0
+    f1_score  = 2 * precision * recall / (precision + recall) * 100 if (precision + recall) else 0.0
 
     # Matching degree: count kept candidates by n_matched hits
     nm_arr = kept["n_matched"].to_numpy() if "n_matched" in kept.columns else np.zeros(n_kept, dtype=int)
@@ -84,6 +88,7 @@ def compute_metrics(reco: pl.DataFrame, tracks: pl.DataFrame) -> dict:
         "n_fake":       n_fake,
         "efficiency_%": round(efficiency, 2),
         "fake_rate_%":  round(fake_rate,  2),
+        "f1_score_%":   round(f1_score,   2),
         # fit quality
         "chi2_mean":   float(np.mean(kept["chi2"].to_numpy())),
         "rms_mean_um": float(np.mean(kept["rms"].to_numpy()) * 1e3),
@@ -109,10 +114,14 @@ def print_table(method_metrics: dict[str, dict]) -> None:
         ("─" * 22,              None,               ""),
         ("Efficiency",          "efficiency_%",     "%"),
         ("Fake rate",           "fake_rate_%",      "%"),
+        ("F1 score",            "f1_score_%",       "%"),
         ("─" * 22,              None,               ""),
         ("Mean χ²",             "chi2_mean",        ""),
         ("Mean RMS",            "rms_mean_um",      "µm"),
     ]
+
+    # Keys that need higher precision display
+    HIGH_PREC_KEYS = {"chi2_mean"}
 
     w = 24
     col_w = 12
@@ -129,7 +138,8 @@ def print_table(method_metrics: dict[str, dict]) -> None:
         for n in names:
             v = method_metrics[n][key]
             if isinstance(v, float):
-                parts += f"  {v:>{col_w - 2}.2f}{unit:>2}"
+                fmt = ".4f" if key in HIGH_PREC_KEYS else ".2f"
+                parts += f"  {v:>{col_w - 2}{fmt}}{unit:>2}"
             else:
                 parts += f"  {v:>{col_w - 2}d}{unit:>2}"
         print(parts)
