@@ -35,6 +35,8 @@ from scipy.optimize import linear_sum_assignment
 from src.models import E320TrackFormer
 from src.utils import NODE_FEAT_COLS_SRC, NODE_DIM
 from src.train_hit_filter import load_hit_filter_checkpoint
+import torch.distributed as dist
+import src.ddp as ddp
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -83,6 +85,7 @@ class TrackFormerConfig:
 
     # hardware
     device: str = "auto"
+    gradient_accumulation_steps: int = 1  # accumulate gradients over N events before optimizer step
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -399,16 +402,17 @@ def train_trackformer(
     if cfg is None:
         cfg = TrackFormerConfig()
 
-    device = _resolve_device(cfg)
-    print(f"[train_trackformer] device={device}  epochs={cfg.n_epochs}  "
-          f"d_model={cfg.d_model}  queries={cfg.max_queries}")
+    rank, world_size, is_ddp = ddp.setup_ddp()
+    device = ddp.resolve_device(cfg.device)
+    ddp.ddp_print(f"[train_trackformer] device={device}  epochs={cfg.n_epochs}  "
+                  f"d_model={cfg.d_model}  queries={cfg.max_queries}")
 
     # ── Load frozen hit filter (Stage 1) ─────────────────────────────────────
     hf_info = _load_hit_filter(cfg, device)
     if hf_info is not None:
         hf_info["model"].to(device)
-        print(f"[train_trackformer] hit filter loaded  "
-              f"threshold={cfg.hit_filter_threshold}")
+        ddp.ddp_print(f"[train_trackformer] hit filter loaded  "
+                      f"threshold={cfg.hit_filter_threshold}")
 
     # ── Train / val split ────────────────────────────────────────────────────
     all_events = np.array(clusters_df["event_id"].unique().sort().to_numpy(), copy=True)
@@ -420,7 +424,7 @@ def train_trackformer(
 
     train_df = clusters_df.filter(pl.col("event_id").is_in(list(train_eids)))
     val_df   = clusters_df.filter(pl.col("event_id").is_in(list(val_eids)))
-    print(f"[train_trackformer] train events={len(train_eids)}  val events={len(val_eids)}")
+    ddp.ddp_print(f"[train_trackformer] train events={len(train_eids)}  val events={len(val_eids)}")
 
     # ── Normalisation (computed from training hits) ───────────────────────────
     node_mean, node_std = _compute_normalisation(train_df)
@@ -434,7 +438,7 @@ def train_trackformer(
             out.append((nf, tm, n2l))
         return out
 
-    print("[train_trackformer] preprocessing events...")
+    ddp.ddp_print("[train_trackformer] preprocessing events...")
     train_events_raw = _preprocess_events(train_df)
     val_events_raw   = _preprocess_events(val_df)
 
@@ -451,39 +455,43 @@ def train_trackformer(
         train_events = _filter_events(train_events_raw)
         val_events   = _filter_events(val_events_raw)
         kept = np.mean([nf.shape[0] for nf, _, _ in train_events])
-        print(f"[train_trackformer] after hit filter: mean kept hits/event={kept:.1f}")
+        ddp.ddp_print(f"[train_trackformer] after hit filter: mean kept hits/event={kept:.1f}")
     else:
         train_events = train_events_raw
         val_events   = val_events_raw
 
     # Only train on events that have at least one signal track after filtering
-    train_events_with_truth = [(nf, tm, n2l) for nf, tm, n2l in train_events
-                               if tm.shape[0] > 0 and nf.shape[0] > 0]
-    print(f"[train_trackformer] train events with signal: {len(train_events_with_truth)}")
+    all_train_events_with_truth = [(nf, tm, n2l) for nf, tm, n2l in train_events
+                                   if tm.shape[0] > 0 and nf.shape[0] > 0]
+    local_train_events = ddp.shard_event_list(all_train_events_with_truth, rank, world_size)
+    ddp.ddp_print(f"[train_trackformer] train events with signal: {len(all_train_events_with_truth)}")
 
     # ── Model + optimiser ────────────────────────────────────────────────────
-    model = E320TrackFormer(
-        node_dim         = NODE_DIM,
-        d_model          = cfg.d_model,
-        n_heads          = cfg.n_heads,
-        n_encoder_layers = cfg.n_encoder_layers,
-        n_decoder_layers = cfg.n_decoder_layers,
-        dim_feedforward  = cfg.dim_feedforward,
-        max_queries      = cfg.max_queries,
-        dropout          = cfg.dropout,
-    ).to(device)
+    model, raw_model = ddp.maybe_wrap_ddp(
+        E320TrackFormer(
+            node_dim         = NODE_DIM,
+            d_model          = cfg.d_model,
+            n_heads          = cfg.n_heads,
+            n_encoder_layers = cfg.n_encoder_layers,
+            n_decoder_layers = cfg.n_decoder_layers,
+            dim_feedforward  = cfg.dim_feedforward,
+            max_queries      = cfg.max_queries,
+            dropout          = cfg.dropout,
+        ),
+        device,
+    )
 
-    n_params = sum(p.numel() for p in model.parameters())
-    print(f"[train_trackformer] params={n_params:,}")
+    n_params = sum(p.numel() for p in raw_model.parameters())
+    ddp.ddp_print(f"[train_trackformer] params={n_params:,}")
 
-    optimizer = optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    optimizer = optim.AdamW(raw_model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=cfg.n_epochs, eta_min=cfg.lr_eta_min
     )
 
-    # ── Checkpoint dir ───────────────────────────────────────────────────────
+    # ── Checkpoint dir (rank-0 only) ──────────────────────────────────────────
     ckpt_dir: Path | None = None
-    if cfg.checkpoint_dir:
+    if cfg.checkpoint_dir and ddp.is_main_process():
         ckpt_dir = Path(cfg.checkpoint_dir)
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         cfg_path = ckpt_dir / "config.json"
@@ -495,6 +503,7 @@ def train_trackformer(
     best_path: Path | None = None
     node_mean_dev = node_mean.to(device)
     node_std_dev  = node_std.to(device)
+    accum_steps = max(1, cfg.gradient_accumulation_steps)
     t0 = time.time()
 
     for epoch in range(1, cfg.n_epochs + 1):
@@ -502,17 +511,25 @@ def train_trackformer(
         epoch_loss = 0.0
         n_batches  = 0
 
-        rng.shuffle(train_events_with_truth)  # shuffle order each epoch
-        for nf_raw, truth_masks, _ in train_events_with_truth:
+        rng.shuffle(local_train_events)
+        optimizer.zero_grad()
+        accum_count = 0
+
+        for i, (nf_raw, truth_masks, _) in enumerate(local_train_events):
             nf = ((nf_raw - node_mean) / node_std).to(device)
             tm = truth_masks.to(device)
 
-            optimizer.zero_grad()
             out  = model(nf)
             loss = _set_prediction_loss(out, tm, cfg, device)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-            optimizer.step()
+            (loss / accum_steps).backward()
+            accum_count += 1
+
+            is_last = (i + 1) == len(local_train_events)
+            if accum_count >= accum_steps or is_last:
+                torch.nn.utils.clip_grad_norm_(raw_model.parameters(), cfg.grad_clip)
+                optimizer.step()
+                optimizer.zero_grad()
+                accum_count = 0
 
             epoch_loss += loss.item()
             n_batches  += 1
@@ -521,38 +538,42 @@ def train_trackformer(
         avg_loss = epoch_loss / max(n_batches, 1)
         row: dict = {"epoch": epoch, "train_loss": avg_loss}
 
-        # ── Validation ───────────────────────────────────────────────────────
+        # ── Validation (rank-0 only) ──────────────────────────────────────────
         if epoch % cfg.log_every == 0 or epoch == 1 or epoch == cfg.n_epochs:
-            metrics = _eval_efficiency(
-                model, val_events, device, node_mean_dev, node_std_dev, cfg
-            )
-            row.update(metrics)
-            elapsed = time.time() - t0
-            print(
-                f"Epoch {epoch:>3}/{cfg.n_epochs} | loss={avg_loss:.5f} | "
-                f"eff={metrics['efficiency']:.3f} | fake={metrics['fake_rate']:.3f} | "
-                f"t={elapsed:.0f}s"
-            )
+            if ddp.is_main_process():
+                metrics = _eval_efficiency(
+                    raw_model, val_events, device, node_mean_dev, node_std_dev, cfg
+                )
+                row.update(metrics)
+                elapsed = time.time() - t0
+                ddp.ddp_print(
+                    f"Epoch {epoch:>3}/{cfg.n_epochs} | loss={avg_loss:.5f} | "
+                    f"eff={metrics['efficiency']:.3f} | fake={metrics['fake_rate']:.3f} | "
+                    f"t={elapsed:.0f}s"
+                )
 
-            if metrics["efficiency"] > best_eff:
-                best_eff = metrics["efficiency"]
-                if ckpt_dir is not None:
-                    best_path = ckpt_dir / "best_model.pt"
-                    torch.save({
-                        "epoch":       epoch,
-                        "model_state": model.state_dict(),
-                        "best_eff":    best_eff,
-                        "node_mean":   node_mean,
-                        "node_std":    node_std,
-                        "config":      dataclasses.asdict(cfg),
-                    }, best_path)
+                if metrics["efficiency"] > best_eff:
+                    best_eff = metrics["efficiency"]
+                    if ckpt_dir is not None:
+                        best_path = ckpt_dir / "best_model.pt"
+                        torch.save({
+                            "epoch":       epoch,
+                            "model_state": raw_model.state_dict(),
+                            "best_eff":    best_eff,
+                            "node_mean":   node_mean,
+                            "node_std":    node_std,
+                            "config":      dataclasses.asdict(cfg),
+                        }, best_path)
+            if dist.is_initialized():
+                dist.barrier()
 
         history.append(row)
 
-    print(f"[train_trackformer] done  best_eff={best_eff:.3f}  checkpoint={best_path}")
+    ddp.ddp_print(f"[train_trackformer] done  best_eff={best_eff:.3f}  checkpoint={best_path}")
+    ddp.cleanup_ddp()
 
     return {
-        "model":     model.cpu(),
+        "model":     raw_model.cpu(),
         "history":   history,
         "node_mean": node_mean,
         "node_std":  node_std,

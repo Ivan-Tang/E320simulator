@@ -32,6 +32,8 @@ from src.models import (
     ResGNN, EggNet, HierarchicalGNN,
 )
 from src.losses import FocalLoss, HingeLoss
+import torch.distributed as dist
+import src.ddp as ddp
 from src.train_embedder import EmbedderTrainConfig, train_embedder
 from src.utils import (
     EDGE_DIM,
@@ -101,6 +103,7 @@ class TrainConfig:
 
     # hardware
     device: str = "auto"                 # "auto" | "cpu" | "mps" | "cuda"
+    gradient_accumulation_steps: int = 1  # accumulate gradients over N events before optimizer step
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -275,8 +278,9 @@ def train(
     if cfg is None:
         cfg = TrainConfig()
 
-    device = _resolve_device(cfg)
-    print(f"[train] device={device}  model={cfg.model_type}  epochs={cfg.n_epochs}")
+    rank, world_size, is_ddp = ddp.setup_ddp()
+    device = ddp.resolve_device(cfg.device)
+    ddp.ddp_print(f"[train] device={device}  model={cfg.model_type}  epochs={cfg.n_epochs}")
 
     # ── train / val split ────────────────────────────────────────────────────
     all_events = np.array(edges_df["event_id"].unique().sort().to_numpy(), copy=True)
@@ -290,15 +294,15 @@ def train(
     val_df   = edges_df.filter(pl.col("event_id").is_in(list(val_eids)))
 
     stats = edge_label_stats(edges_df)
-    print(f"[train] total edges={stats['n_total']:,}  "
-          f"pos={stats['n_positive']}  "
-          f"pos_frac={stats['positive_fraction']:.5f}")
-    print(f"[train] train events={len(train_eids)}  val events={len(val_eids)}")
+    ddp.ddp_print(f"[train] total edges={stats['n_total']:,}  "
+                  f"pos={stats['n_positive']}  "
+                  f"pos_frac={stats['positive_fraction']:.5f}")
+    ddp.ddp_print(f"[train] train events={len(train_eids)}  val events={len(val_eids)}")
 
     # per-split positive counts
     n_pos_train = int(train_df.filter(pl.col("edge_label") == 1).height)
     n_pos_val = int(val_df.filter(pl.col("edge_label") == 1).height)
-    print(f"[train] pos_train={n_pos_train}  pos_val={n_pos_val}")
+    ddp.ddp_print(f"[train] pos_train={n_pos_train}  pos_val={n_pos_val}")
 
     # ── normalisation ────────────────────────────────────────────────────────
     node_mean, node_std, edge_mean, edge_std = _compute_normalisation(train_df)
@@ -308,25 +312,29 @@ def train(
     node_dim_eff = NODE_DIM
     if embedder_info is not None:
         node_dim_eff = embedder_info["_emb_dim"]
-        print(f"[train] embedder pipeline: node_dim {NODE_DIM} → {node_dim_eff} (embedder replaces raw features)")
+        ddp.ddp_print(f"[train] embedder pipeline: node_dim {NODE_DIM} → {node_dim_eff} (embedder replaces raw features)")
 
     # ── model / optimiser ────────────────────────────────────────────────────
-    model     = _build_model(cfg, node_dim=node_dim_eff).to(device)
+    # HGNN may have unused parameters (last_embeddings is conditional)
+    _find_unused = cfg.model_type == "hgnn"
+    model, raw_model = ddp.maybe_wrap_ddp(
+        _build_model(cfg, node_dim=node_dim_eff), device,
+        find_unused_parameters=_find_unused,
+    )
     criterion = FocalLoss(alpha=cfg.focal_alpha, gamma=cfg.focal_gamma)
     emb_criterion = HingeLoss(margin=1.0) if cfg.model_type == "hgnn" and cfg.hgnn_emb_loss_weight > 0 else None
-    optimizer = optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    optimizer = optim.Adam(raw_model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=cfg.n_epochs, eta_min=cfg.lr_eta_min
     )
-    n_params = sum(p.numel() for p in model.parameters())
-    print(f"[train] params={n_params:,}")
+    n_params = sum(p.numel() for p in raw_model.parameters())
+    ddp.ddp_print(f"[train] params={n_params:,}")
 
-    # ── checkpoint dir ───────────────────────────────────────────────────────
+    # ── checkpoint dir (rank-0 only) ─────────────────────────────────────────
     ckpt_dir: Path | None = None
-    if cfg.checkpoint_dir:
+    if cfg.checkpoint_dir and ddp.is_main_process():
         ckpt_dir = Path(cfg.checkpoint_dir)
         ckpt_dir.mkdir(parents=True, exist_ok=True)
-        # save config alongside weights
         cfg_path = ckpt_dir / "config.json"
         cfg_path.write_text(json.dumps(dataclasses.asdict(cfg), indent=2))
 
@@ -336,12 +344,20 @@ def train(
     best_path: Path | None = None
     t0 = time.time()
 
+    # Pre-build and shard training event list for DDP
+    all_train_events = list(train_df.group_by("event_id"))
+    local_train_events = ddp.shard_event_list(all_train_events, rank, world_size)
+    accum_steps = max(1, cfg.gradient_accumulation_steps)
+
     for epoch in range(1, cfg.n_epochs + 1):
         model.train()
         epoch_loss = 0.0
         n_batches  = 0
 
-        for _, ev_df in train_df.group_by("event_id"):
+        optimizer.zero_grad()
+        accum_count = 0  # events processed since last optimizer step
+
+        for i, (_, ev_df) in enumerate(local_train_events):
             nf, ei, ef, lab, _ = event_to_tensors(ev_df)
             if cfg.skip_zero_pos_events and lab.sum() == 0:
                 continue
@@ -354,19 +370,27 @@ def train(
             ef  = ef.to(device)
             lab = lab.to(device)
 
-            optimizer.zero_grad()
             pred = model(nf, ei, ef)
             loss = criterion(pred, lab)
             # Optional embedding loss for HGNN (two-stage training from Liu et al. 2023)
-            if emb_criterion is not None and hasattr(model, "last_embeddings") and model.last_embeddings is not None:
-                emb = model.last_embeddings          # (N, emb_dim), L2-normalised
+            _inner_model = raw_model  # unwrapped reference for attribute access
+            if emb_criterion is not None and hasattr(_inner_model, "last_embeddings") and _inner_model.last_embeddings is not None:
+                emb = _inner_model.last_embeddings   # (N, emb_dim), L2-normalised
                 e_src = emb[ei[0]]                   # (E, emb_dim)
                 e_dst = emb[ei[1]]                   # (E, emb_dim)
-                dist = (e_src - e_dst).norm(dim=-1)  # (E,)
-                loss = loss + cfg.hgnn_emb_loss_weight * emb_criterion(dist, lab)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-            optimizer.step()
+                dist_ = (e_src - e_dst).norm(dim=-1) # (E,)
+                loss = loss + cfg.hgnn_emb_loss_weight * emb_criterion(dist_, lab)
+
+            # Scale loss for gradient accumulation
+            (loss / accum_steps).backward()
+            accum_count += 1
+
+            is_last_event = (i + 1) == len(local_train_events)
+            if accum_count >= accum_steps or is_last_event:
+                torch.nn.utils.clip_grad_norm_(raw_model.parameters(), cfg.grad_clip)
+                optimizer.step()
+                optimizer.zero_grad()
+                accum_count = 0
 
             epoch_loss += loss.item()
             n_batches  += 1
@@ -376,49 +400,54 @@ def train(
 
         row: dict = {"epoch": epoch, "train_loss": avg_loss}
 
-        # ── validation ───────────────────────────────────────────────────────
+        # ── validation (rank-0 only) ──────────────────────────────────────────
         if epoch % cfg.log_every == 0 or epoch == 1 or epoch == cfg.n_epochs:
-            metrics = _evaluate(
-                model, val_df, device,
-                node_mean, node_std, edge_mean, edge_std,
-                embedder_info=embedder_info,
-            )
-            row.update(metrics)
-            elapsed = time.time() - t0
-            print(
-                f"Epoch {epoch:>3}/{cfg.n_epochs} | "
-                f"loss={avg_loss:.6f} | "
-                f"AUC={metrics['auc']:.4f} | "
-                f"AP={metrics['ap']:.4f} | "
-                f"t={elapsed:.0f}s"
-            )
+            if ddp.is_main_process():
+                metrics = _evaluate(
+                    raw_model, val_df, device,
+                    node_mean, node_std, edge_mean, edge_std,
+                    embedder_info=embedder_info,
+                )
+                row.update(metrics)
+                elapsed = time.time() - t0
+                ddp.ddp_print(
+                    f"Epoch {epoch:>3}/{cfg.n_epochs} | "
+                    f"loss={avg_loss:.6f} | "
+                    f"AUC={metrics['auc']:.4f} | "
+                    f"AP={metrics['ap']:.4f} | "
+                    f"t={elapsed:.0f}s"
+                )
 
-            # ── save best checkpoint ──────────────────────────────────────────
-            if metrics["ap"] > best_ap:
-                best_ap = metrics["ap"]
-                if ckpt_dir is not None:
-                    best_path = ckpt_dir / "best_model.pt"
-                    torch.save(
-                        {
-                            "epoch":      epoch,
-                            "model_state": model.state_dict(),
-                            "optimizer_state": optimizer.state_dict(),
-                            "best_ap":    best_ap,
-                            "node_mean":  node_mean,
-                            "node_std":   node_std,
-                            "edge_mean":  edge_mean,
-                            "edge_std":   edge_std,
-                            "node_dim":   node_dim_eff,
-                        },
-                        best_path,
-                    )
+                # ── save best checkpoint ──────────────────────────────────────
+                if metrics["ap"] > best_ap:
+                    best_ap = metrics["ap"]
+                    if ckpt_dir is not None:
+                        best_path = ckpt_dir / "best_model.pt"
+                        torch.save(
+                            {
+                                "epoch":           epoch,
+                                "model_state":     raw_model.state_dict(),
+                                "optimizer_state": optimizer.state_dict(),
+                                "best_ap":         best_ap,
+                                "node_mean":       node_mean,
+                                "node_std":        node_std,
+                                "edge_mean":       edge_mean,
+                                "edge_std":        edge_std,
+                                "node_dim":        node_dim_eff,
+                            },
+                            best_path,
+                        )
+            # Sync all ranks after validation
+            if dist.is_initialized():
+                dist.barrier()
 
         history.append(row)
 
-    print(f"[train] done  best_AP={best_ap:.4f}  checkpoint={best_path}")
+    ddp.ddp_print(f"[train] done  best_AP={best_ap:.4f}  checkpoint={best_path}")
+    ddp.cleanup_ddp()
 
     return {
-        "model":      model.cpu(),
+        "model":      raw_model.cpu(),
         "history":    history,
         "node_mean":  node_mean,
         "node_std":   node_std,
@@ -539,6 +568,8 @@ def _cli() -> None:
     parser.add_argument("--checkpoint", default=None, help="Directory to save checkpoints")
     parser.add_argument("--embedder-checkpoint", default=None,
                         help="Path to pretrained embedder .pt for node feature augmentation")
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1,
+                        help="Accumulate gradients over N events before optimizer step (DDP / memory)")
     args = parser.parse_args()
 
     clusters_df = pl.read_parquet(args.clusters)
@@ -560,6 +591,7 @@ def _cli() -> None:
             device           = args.device,
             checkpoint_dir   = args.checkpoint,
             embedder_checkpoint = args.embedder_checkpoint,
+            gradient_accumulation_steps = args.gradient_accumulation_steps,
         )
         train(edges_df, cfg)
         return
