@@ -2,79 +2,112 @@
 
 ## 当前阶段
 
-**阶段**：Benchmark 已部分完成，Scaling 仍在运行，ML 完整训练待重跑
-**时间**：2026年3月19日
-**状态**：Baseline 和 Hough 已得到定量结果；Benchmark 中 ML 模型训练因 OOM 被 kill，未获得完整 ML 指标；Scaling job 仍在运行中（已运行 ~4h）。
+**阶段**：Scaling 已完成分析；Benchmark（256GB）仍在运行（~1h）
+**时间**：2026年3月20日
+**状态**：Scaling sweep 全部完成，得到各方法在不同背景/信号密度下的系统性结果。Transformer 彻底失效（效率0%），InteractionNet 是现有 ML 模型中综合表现最优的。新 Benchmark job（256GB）仍在跑。
 
 ---
 
 ## 已完成工作（按时间倒序）
 
+### 2026年3月20日
+- Scaling job `3911702.pbs` 完成（耗时 ~5h，03月19日23:42落盘）
+- 分析 Scaling 结果（两轮 sweep：背景扫描 + 信号密度扫描），见下方详细表格
+- 新 Benchmark job `3913186.pbs`（256GB）提交并运行中
+
 ### 2026年3月19日
-- Benchmark batch job 完成（部分）：获得 Baseline 和 Hough 定量结果（见下方表格）
-- Benchmark 中 ML 部分（Embedder epoch 186/200）被 OOM kill，ML 模型评估结果未写入
-- Scaling job（`3911702.pbs`）仍在运行，已运行约 4 小时
-- 整合两份 ML seeding 研究提案（GNN + Transformer）为统一文档 `research_proposal_ML_seeding.md`
-- 建立本进度记录文档和会话工作规范（CLAUDE.md）
+- Benchmark job `3912419.pbs`（64GB）部分完成：Baseline 和 Hough 定量结果获得，ML 部分 OOM kill
+- 重新提交 Benchmark job（256GB）：`3913186.pbs`
+- 整合两份 ML seeding 研究提案为统一文档 `research_proposal_ML_seeding.md`
+- 建立进度记录文档和会话工作规范（CLAUDE.md）
 
 ### ML 框架搭建（已完成）
-- `src/models.py`：实现 `EdgeMLP`、`InteractionNet`、`ResGNN`、`EggNet`、`HierarchicalGNN`、`TransformerEdgeClassifier`、`Embedder`、`TransformerEmbedder`
-- `src/layers.py`：实现 `MLP` 工厂、`PositionalEncoding3D`、`MultiHeadAttention`、Transformer 层
-- `src/losses.py`：实现 `FocalLoss`（类别不平衡）和 `HingeLoss`（度量学习）
-- `src/train.py`：边分类模型统一训练循环
-- `src/train_embedder.py`：Metric-learning 嵌入器训练 + KDTree 推理
-- `src/train_trackformer.py`：Transformer 端到端轨迹寻找
+- `src/models.py`：`EdgeMLP`、`InteractionNet`、`ResGNN`、`EggNet`、`HierarchicalGNN`、`TransformerEdgeClassifier`、`Embedder`、`TransformerEmbedder`
+- `src/layers.py`：`MLP` 工厂、`PositionalEncoding3D`、`MultiHeadAttention`、Transformer 层
+- `src/losses.py`：`FocalLoss`、`HingeLoss`
+- `src/train.py` / `src/train_embedder.py` / `src/train_trackformer.py`
 
-### Hough 变换追踪器（已完成）
-- `src/hough_baseline.py`：在 (θ, ρ) 空间的 Hough 变换追踪器
-- 脚本：`scripts/run_hough.py`
-
-### Baseline 算法（已完成）
-- `src/baseline.py`：斜率窗口边构建 + 贪心链式种子生成 + 3D 直线拟合
-- 脚本：`scripts/run_baseline.py`
-
-### 数据与模拟（已完成）
-- `src/simulator.py`：集群级快速模拟器（SimConfig 控制信号率、噪声、集群大小模型）
-- `src/geometry.py`：ALPIDE 传感器参数，5层几何，坐标变换（像素→芯片局部→TRK→LAB）
-- 数据路径：`/storage/agrp/yiwen/data_Run502`（Lustre，未备份）
+### Hough 变换 / Baseline 算法（已完成）
+- `src/hough_baseline.py`、`src/baseline.py`
+- 数据路径：`/storage/agrp/yiwen/data_Run502`（Lustre）
 
 ---
 
-## 关键实验结果（表格）
+## 关键实验结果
+
+### Benchmark（10k 测试事件，信号占比 0.02%）
 
 | 方法 | 径迹效率 | 误判率 | 推理时间 | 备注 |
 |------|----------|--------|----------|------|
-| Baseline（斜率窗口+链式）| **74.3%** | **42.5%** | 553 s/10k events | benchmark_output.log，10k 测试事件 |
-| Hough 变换 | **82.7%** | **46.1%** | 4545 s/10k events | benchmark_output.log，10k 测试事件 |
-| Embedder（metric-learning）| — | — | — | OOM killed @ epoch 186/200，未完成评估 |
-| ML 模型（EdgeMLP 等）| — | — | — | Benchmark OOM，未完成 |
-| EvoHierGNN | — | — | — | 尚未训练 |
-| TrackFormer-Seed | — | — | — | 尚未训练 |
+| Baseline（斜率窗口+链式）| **74.3%** | **42.5%** | 553 s/10k events | |
+| Hough 变换 | **82.7%** | **46.1%** | 4545 s/10k events | |
+| ML 模型（EdgeMLP 等）| — | — | — | Benchmark 256GB 重跑中 |
 
-测试集：10,000 events，1,173 真实径迹，信号占比 0.02%（极低信噪比）
-*目标值：径迹效率 ≥95%，误判率 ≤5%，推理时间 ≤10 ms/event（V100/RTX 3090）*
+### Scaling Sweep 1：背景强度扫描（mean_n_signal=0.5，1000 events）
 
-**注**：Hough 比 Baseline 效率高 8.4pp，但误判率更高（+3.6pp），且耗时是 Baseline 的 8 倍。两者误判率均远超目标，ML 方法的提升空间巨大。
+| bg_per_layer | ~hits/event | Baseline eff / fake | Hough eff / fake | MLP eff / fake | InteractionNet eff / fake | Transformer eff / fake |
+|---|---|---|---|---|---|---|
+| 0 | 0 | 73.5% / 0% | 80.0% / 0% | 73.5% / 0% | 61.3% / 0% | 40.3% / 0% |
+| 100 | 500 | 77.8% / 0% | 82.3% / 0% | 77.8% / 0% | 51.8% / 0% | 47.9% / **77.8%** |
+| 300 | 1500 | 73.9% / 1.1% | 78.1% / 0% | 73.9% / 0.3% | 49.5% / 0.4% | **0% / 100%** |
+| 500 | 2500 | 74.2% / 8.7% | 78.4% / 1.9% | 74.2% / 3.2% | 51.1% / 1.5% | **0% / 100%** |
+| 700 | 3500 | 72.9% / 16.2% | 77.1% / 17.4% | 72.9% / 9.8% | 53.8% / **1.6%** | **0% / 100%** |
+| 1000 | 5000 | 75.2% / 34.1% | 82.6% / 60.7% | 75.2% / 27.6% | 54.8% / **11.4%** | **0% / 100%** |
+
+其他模型（GNN：15-16%效率；EggNet：~4%效率；HGNN：10-22%效率）略。
+
+### Scaling Sweep 2：信号密度扫描（bg_per_layer=700，1000 events）
+
+| mean_n_signal | ~真实径迹数 | Baseline eff / fake | Hough eff / fake | MLP eff / fake | InteractionNet eff / fake |
+|---|---|---|---|---|---|
+| 0.1 | 105 | 70.5% / 46.0% | 82.9% / 46.6% | 70.5% / 31.5% | 50.5% / 8.6% |
+| 0.3 | 299 | 68.9% / 26.2% | 80.9% / 23.9% | 68.9% / 25.9% | 54.5% / 12.4% |
+| 0.5 | 468 | 72.9% / 16.2% | 77.1% / 17.4% | 72.9% / 15.8% | 61.3% / 5.3% |
+| 1.0 | 1029 | 73.5% / 9.0% | 83.3% / 8.6% | 73.5% / 9.0% | 58.9% / 2.6% |
+| 2.0 | 2004 | 75.4% / 3.9% | 83.1% / 5.7% | 75.4% / 3.9% | 59.7% / 2.0% |
+| 3.0 | 3041 | 74.7% / 3.2% | 82.7% / 3.8% | 74.7% / 3.2% | 59.1% / 1.3% |
+
+Transformer 在 bg=700 下全线 0% 效率 / 100% 误判率，略。
+
+*目标值：径迹效率 ≥95%，误判率 ≤5%，推理时间 ≤10 ms/event*
+
+---
+
+## 关键结论（Scaling 分析）
+
+1. **Transformer 彻底失效**：bg≥300（~1500 hits/event）时效率归零、误判率100%。现有 checkpoint 完全不适用于 E320 条件，需从头重新设计训练。
+
+2. **EggNet 也基本失效**：效率 ~4%，多个条件下出现 NaN，checkpoint 可能损坏或训练不收敛。
+
+3. **InteractionNet 是现有 ML 模型最优**：效率 ~50-61%（低于 Baseline 的 73-75%），但误判率控制显著更好（bg=1000 时 11.4% vs Baseline 34.1%）。在高背景下是效率与纯度最佳权衡。
+
+4. **MLP 与 Baseline 几乎等同**：效率相同，误判率略低，没有显著提升。
+
+5. **Hough 效率最高但误判率不可控**：bg=1000 时误判率高达 60.7%，不适合高背景场景。
+
+6. **所有现有方法效率上限约 83%，远低于 95% 目标**，且误判率在实际运行条件（bg~700）下普遍超标。→ 需要重新训练专门针对 E320 条件的模型。
 
 ---
 
 ## 已知问题 / Blockers
 
-- **Benchmark OOM**：`run_benchmark.py --epochs 200 --workers 8` 在 Embedder 训练阶段（epoch 186）被 OOM kill（64 GB RAM 不够）。需要减少 workers 或分拆训练任务重跑 ML 部分。
-- **Baseline/Hough 误判率极高（42-46%）**：在 0.02% 信号占比的极低信噪比下，传统方法表现差，凸显 ML 方法的必要性。
-- **Scaling job 尚未完成**：`3911702.pbs` 仍在运行，结果待分析。
-- `src/baseline.py:110-111`：存在 divide-by-zero RuntimeWarning（dz=0 时斜率计算），不影响结果但需修复。
+- **Transformer checkpoint 失效**：需要重新训练，或完全重新设计针对 E320 的 TrackFormer-Seed。
+- **EggNet NaN/低效率**：checkpoint 疑似有问题，需重新训练。
+- **Benchmark ML 结果待完成**：`3913186.pbs`（256GB）仍在运行，等待完整 ML 训练+评估结果。
+- **所有方法效率上限 ~83%，误判率在实际背景下远超 5% 目标**：需要专门针对 E320 重新训练。
+- `src/baseline.py:110-111`：divide-by-zero RuntimeWarning（dz=0），需修复。
 
 ---
 
 ## 下一步计划
 
-1. **等待 Scaling job 完成**：分析 scaling 结果，了解不同事件规模下算法性能变化
-2. **重跑 ML Benchmark**（解决 OOM）：
-   - 减少 `--workers` 数量（如从 8 改为 4），或
-   - 分拆：单独提交 embedder 训练 + 各 ML 模型评估的独立 job
-3. **修复 baseline divide-by-zero**：在 `src/baseline.py` 中加入 dz ≈ 0 的守卫条件
-4. **选择 ML 探索方向**：获得完整 ML benchmark 结果后，决定优先推进 TrackFormer-Seed 还是 EvoHierGNN
+1. **等待 Benchmark（256GB）完成**：获得完整 ML 训练结果，填充 Benchmark 结果表格
+2. **重新训练 Transformer（TrackFormer-Seed）**：
+   - 现有 checkpoint 完全失效，从头设计针对 E320 低信噪比的训练流程
+   - 优先推进方向：TrackFormer-Seed（周期短，已有框架）
+3. **重新训练 EggNet**：排查 NaN 问题，调整训练超参数
+4. **针对 InteractionNet 优化**：在现有最优 ML 基础上，探索提升效率的方向（效率从 ~55% 提升到 ≥95% 需要根本性改进）
+5. **修复 baseline divide-by-zero**：`src/baseline.py:110-111`
 
 ---
 
