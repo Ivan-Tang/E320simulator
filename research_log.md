@@ -39,4 +39,37 @@
 
 ---
 ### 实际结果（下轮填入）
+此作业结果未记录（state 被重置）。
+
+---
+
+## Loop 1 (最终版) — 2026-03-21T22:00
+
+### 上轮结果回顾
+- 首次运行（前两次 Loop 1 均因 state 手动重置未留下结果）
+- 基线：InteractionNet: efficiency=70.6%, fake_rate=14.3%；TransformerEdgeClassifier: efficiency=2.2%, fake_rate=99.7%（完全失效）
+
+### 当前假设
+如果将 TransformerEdgeClassifier 的全局自注意力（O(N²)，N~3500 hits/event）改为**探测器层内分组注意力**（按 layer_id 分 5 组，每组 ~700 hits，各组独立 self-attention），efficiency 应从 2.2% 提升到 >40%，因为：1）层内相同 track 的 hits 具有强局部相关性，2）每层的信噪比远好于全局（700 hits 中 5 个真实 hit vs 3500 hits 中 25 个真实 hit），3）消除了 O(N²) 梯度稀释问题。
+
+**风险**：层内 attention 可能无法捕获跨层信息（edge classification 使用 src/dst 来自不同层），但 edge feature（dx/dy/dz/slope）已编码跨层信息。
+
+### 代码修改
+- `src/models.py` 第 297-361 行：重写 `TransformerEdgeClassifier`
+  - 替换 `TransformerEmbedder`（全局 N 节点注意力）为直接 `input_proj` + `encoder_layers` + `norm`
+  - `forward()` 新增层内分组循环：按 `layer_id` 分 5 组，各组独立 self-attention
+  - 保持 `edge_encoder` 和 `classifier` 不变，外部接口不变
+
+### 预期结果
+- efficiency: >40%（从 2.2% 大幅提升）
+- fake_rate: <50%（从 99.7% 改善）
+- 训练 loss 应在 warmup 后单调下降，收敛比全局注意力快
+
+### PBS 作业
+脚本: ~/subs/auto_loop1_layer_attn.sh
+训练参数: d_model=64, n_heads=4, n_encoder_layers=2, dim_feedforward=256, dropout=0.0, focal_alpha=0.95, warmup_epochs=10, epochs=100, lr=1e-3
+提交时间: 2026-03-21T22:00
+
+---
+### 实际结果（下轮填入）
 （待填）

@@ -4,7 +4,7 @@
   "loop_count": 1,
   "max_loops": 15,
   "loop_start_time": "2026-03-21T21:00:00",
-  "current_pbs_job_id": null,
+  "current_pbs_job_id": "3924983.pbs",
   "current_loop_label": "loop1_small_warmup_focal",
   "current_loop_script": "~/subs/auto_loop1_small_warmup_focal.sh",
   "research_branch": "auto-research-transformer-convergence",
@@ -12,6 +12,6 @@
   "stop_requested": false,
   "goal_achieved": false,
   "error_state": null,
-  "last_updated": "2026-03-21T21:00:00",
+  "last_updated": "2026-03-21T21:10:00",
   "last_updated_by": "claude-auto-loop1"
 }
