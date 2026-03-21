@@ -71,5 +71,43 @@
 提交时间: 2026-03-21T22:00
 
 ---
+### 实际结果（本轮填入）
+- 结果：OOM killed（PBS job 3924983.pbs，训练进程在 git pull 后立即被 SIGKILL 杀死）
+- 根因：`build_labeled_edges_from_sim` 在全量 10k 训练事件（35M clusters）上构建边图超出内存
+- 注：experiment_state.json 记录的 job ID 与实际小_warmup_focal 作业一致（状态记录混乱）
+- 层内分组注意力代码已在 models.py 正确实现，但从未实际训练
+
+---
+
+## Loop 2 — 2026-03-22T01:05
+
+### 上轮结果回顾
+- efficiency: N/A（OOM killed，无任何 epoch 输出）| fake_rate: N/A | mean_rms: N/A
+- 评估: Loop 1 假设未能验证，唯一阻塞因素是 OOM。Layer-stratified attention 代码正确，训练从未开始。
+
+### 当前假设
+如果添加 `--max-events 2000` 限制训练到 2000 事件（避免 build_labeled_edges_from_sim OOM），
+用已实现的层内分组注意力 TransformerEdgeClassifier 训练，efficiency 应从 2.2% 提升到 >30%，
+因为架构设计正确（层内 self-attention + bias init + warmup），唯一失败原因是内存溢出。
+
+**风险**：2000 训练事件（原 10k 的 20%）可能正边样本不足导致 Focal loss 不稳定；
+但 focal_alpha=0.95 + warmup 应能缓解。
+
+### 代码修改
+- `src/train.py` 第 563 行附近：添加 `--max-events` CLI 参数（default=0 即不限制）
+  - 在 `build_labeled_edges_from_sim` 前添加事件数限制逻辑（头 N 个 event_id）
+
+### 预期结果
+- efficiency: >30%（首次成功完成训练）
+- fake_rate: <50%
+- 训练 loss 应在 warmup 后单调下降
+
+### PBS 作业
+脚本: ~/subs/auto_loop2_fix_oom.sh
+训练参数: max_events=2000, d_model=64, n_heads=4, n_encoder_layers=2, dim_feedforward=256,
+         dropout=0.0, focal_alpha=0.95, warmup_epochs=10, epochs=100, lr=1e-3
+提交时间: 2026-03-22T01:05
+
+---
 ### 实际结果（下轮填入）
 （待填）

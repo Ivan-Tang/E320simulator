@@ -1,31 +1,39 @@
 # 自主研究状态
 
-**更新时间**: 2026-03-21T21:10
-**当前循环**: 1 / 15
-**状态**: submitted（PBS 作业 3924983.pbs 已提交）
+**更新时间**: 2026-03-22T01:05
+**当前循环**: Loop 2 / 15
+**分支**: auto-research-transformer-convergence
 
 ---
 
 ## 当前假设
 
-探测器层内分组自注意力（d_model=64, 2层, warmup=10, focal_alpha=0.99）首次以正确配置训练。
-- 按 layer_id 分5组做 self-attention（~700 hits/层），比全局 O(N²) 更高效且有空间归纳偏置
-- Pre-LN + 输出 bias 初始化(-3.9) 防止初始全假率 99%
+限制训练到 2000 事件（--max-events 2000）避免 OOM，用层内分组注意力 TransformerEdgeClassifier
+首次成功完成训练，预期 efficiency >30%。
 
-## 上轮结果
+## 上轮结果（Loop 1 最终版）
 
-（首次运行，无上轮结果）
-- 基线参考：InteractionNet efficiency=70.6%, fake_rate=14.3%
-- Transformer 旧 checkpoint：efficiency=2.2%, fake_rate=99.7%（完全失效）
+| 指标 | 值 |
+|------|----|
+| track_efficiency | N/A（OOM killed） |
+| fake_rate | N/A |
+| mean_rms | N/A |
+| PBS job | 3924983.pbs |
+| 失败原因 | build_labeled_edges_from_sim 全量 10k 事件超出内存 |
+
+## 代码修改（Loop 2）
+
+- `src/train.py`: 添加 `--max-events` CLI 参数，限制训练事件数（default=0 即不限制）
+- `src/models.py`: TransformerEdgeClassifier 层内分组注意力（Loop 1 已实现，本轮首次训练）
 
 ## 当前 PBS 作业
 
 | 字段 | 值 |
 |------|-----|
-| 作业 ID | 3924983.pbs |
-| 脚本 | ~/subs/auto_loop1_layer_attn.sh |
-| 训练参数 | d_model=64, n_heads=4, 2层, dim_ff=256, warmup=10, epochs=100, lr=1e-3, focal_alpha=0.95 |
-| 输出目录 | /storage/agrp/yiwen/runs/loop1_layer_attn/ |
+| 作业 ID | 提交后更新 |
+| 脚本 | ~/subs/auto_loop2_fix_oom.sh |
+| 训练参数 | max_events=2000, d_model=64, n_heads=4, 2层, dim_ff=256, warmup=10, epochs=100, lr=1e-3, focal_alpha=0.95 |
+| 输出目录 | /storage/agrp/yiwen/runs/loop2_fix_oom/ |
 
 ## 架构变更摘要
 
@@ -34,12 +42,14 @@
 | Pre-LN (Pre-Norm) | src/layers.py | 更好梯度流，收敛更稳定 |
 | 层内分组注意力 | src/models.py | O(N²/5)，空间归纳偏置 |
 | 输出 bias=-3.9 | src/models.py | 初始预测~2% 正例，防99%假率 |
+| --max-events 限制 | src/train.py | **修复 OOM**，限制训练事件数 |
 
 ## 研究进展
 
 | Loop | 假设 | 结果 |
 |------|------|------|
-| 1 | 层内分组attn+Pre-LN+bias_init | 进行中（3924983.pbs）|
+| 1 (最终) | 层内分组 attn | OOM killed（基础设施问题）|
+| **2** | 限制 2000 事件 + 层内分组 attn | **进行中** |
 
 ## 成功标准
 

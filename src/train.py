@@ -562,10 +562,17 @@ def _cli() -> None:
     parser.add_argument("--checkpoint", default=None, help="Directory to save checkpoints")
     parser.add_argument("--embedder-checkpoint", default=None,
                         help="Path to pretrained embedder .pt for node feature augmentation")
+    parser.add_argument("--max-events", type=int, default=0,
+                        help="Limit training to N events (0=use all). Use to avoid OOM on large datasets.")
     args = parser.parse_args()
 
     clusters_df = pl.read_parquet(args.clusters)
     print(f"[cli] loaded {len(clusters_df):,} clusters")
+
+    if args.max_events > 0:
+        event_ids = clusters_df["event_id"].unique().sort().head(args.max_events)
+        clusters_df = clusters_df.filter(pl.col("event_id").is_in(event_ids))
+        print(f"[cli] limited to {len(clusters_df):,} clusters ({args.max_events} events)")
 
     if args.task == "edge":
         edges_df = build_labeled_edges_from_sim(clusters_df)
