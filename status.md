@@ -38,7 +38,7 @@
 | 项目 | 值 |
 |------|----|
 | 脚本 | ~/subs/auto_loop1_fix_cli_small.sh |
-| Job ID | （提交中） |
+| Job ID | 3924893.pbs |
 | 输出目录 | /storage/agrp/yiwen/runs/loop1_fix_cli_small/ |
 
 ## 研究进展简表
