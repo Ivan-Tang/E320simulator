@@ -1,9 +1,13 @@
 """
-Benchmark script — DDP via torch.multiprocessing.spawn + file:// init.
+Benchmark script — DDP via subprocess + file:// init (no torchrun, no mp.spawn).
 
-Identical logic to run_benchmark.py but replaces torchrun (_run_torchrun) with
-mp.spawn so that the c10d elastic rendezvous TCP store is never touched.
-This works around the SIGSEGV in c10d_rendezvous_backend.py on this cluster.
+Replaces torchrun with direct subprocess.Popen so that:
+  1. The c10d elastic rendezvous TCP store is never touched (no SIGSEGV).
+  2. Child processes are fully independent — no __main__ re-import
+     (avoids FileNotFoundError when NFS files change during a long run).
+
+Each subprocess receives RANK/WORLD_SIZE/LOCAL_RANK/DDP_INIT_METHOD via env vars.
+src/ddp.py reads DDP_INIT_METHOD to call init_process_group with file:// init.
 
 Usage (single-GPU):
     python scripts/run_benchmark_spawn.py --device cuda --epochs 200
@@ -16,13 +20,11 @@ from __future__ import annotations
 
 import argparse
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
 
-import torch
-import torch.distributed as dist
-import torch.multiprocessing as mp
 import polars as pl
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -48,50 +50,7 @@ TEST_TRACKS    = SIM_DIR / "sim_tracks_test.parquet"
 ML_MODELS = ["mlp", "gnn", "interaction_net", "eggnet", "hgnn", "transformer"]
 
 
-# ── mp.spawn DDP helper ────────────────────────────────────────────────────────
-
-def _spawn_worker(
-    rank: int,
-    world_size: int,
-    init_file: str,
-    module_name: str,
-    argv: list[str],
-) -> None:
-    """Worker launched by mp.spawn.  Initialises NCCL via file:// then runs CLI."""
-    os.environ["RANK"]       = str(rank)
-    os.environ["WORLD_SIZE"] = str(world_size)
-    os.environ["LOCAL_RANK"] = str(rank)
-
-    torch.cuda.set_device(rank)
-    dist.init_process_group(
-        backend="nccl",
-        init_method=f"file://{init_file}",
-        world_size=world_size,
-        rank=rank,
-    )
-
-    old_argv = sys.argv
-    sys.argv = [module_name] + argv
-    try:
-        if module_name == "src.train":
-            from src.train import _cli
-            _cli()
-        elif module_name == "src.train_embedder":
-            from src.train_embedder import _cli
-            _cli()
-        elif module_name == "src.train_trackformer":
-            from src.train_trackformer import _cli
-            _cli()
-        elif module_name == "src.train_hit_filter":
-            from src.train_hit_filter import _cli
-            _cli()
-        else:
-            raise ValueError(f"Unknown module: {module_name}")
-    finally:
-        sys.argv = old_argv
-        if dist.is_initialized():
-            dist.destroy_process_group()
-
+# ── subprocess DDP helper ─────────────────────────────────────────────────────
 
 def _run_spawn(
     module: str,
@@ -99,18 +58,47 @@ def _run_spawn(
     nproc: int,
     accum_steps: int,
 ) -> None:
-    """Launch a training module via mp.spawn (blocks until done)."""
+    """Launch nproc copies of a training module via subprocess (no torchrun).
+
+    Each process gets RANK/LOCAL_RANK/WORLD_SIZE/DDP_INIT_METHOD in its env.
+    src.ddp.setup_ddp() uses DDP_INIT_METHOD=file:// so NCCL never touches
+    the c10d TCP store that segfaults on this cluster.
+
+    Using subprocess.Popen (not mp.spawn) means child processes are fully
+    independent Python interpreters — no __main__ re-import, no NFS race.
+    """
     argv = extra_args + ["--gradient-accumulation-steps", str(accum_steps)]
-    init_file = f"/tmp/ddp_bench_init_{os.getpid()}_{module.replace('.', '_')}"
+    init_file = f"/tmp/ddp_init_{os.getpid()}_{module.replace('.', '_')}"
     if os.path.exists(init_file):
         os.remove(init_file)
-    print(f"  [mp.spawn] {module}  nproc={nproc}  args={argv}")
-    mp.spawn(
-        _spawn_worker,
-        args=(nproc, init_file, module, argv),
-        nprocs=nproc,
-        join=True,
-    )
+
+    print(f"  [subprocess-ddp] {module}  nproc={nproc}  init={init_file}")
+    print(f"  args={argv}")
+
+    base_env = os.environ.copy()
+    base_env["DDP_INIT_METHOD"] = f"file://{init_file}"
+    base_env["WORLD_SIZE"]      = str(nproc)
+
+    procs = []
+    for rank in range(nproc):
+        env = base_env.copy()
+        env["RANK"]       = str(rank)
+        env["LOCAL_RANK"] = str(rank)
+        cmd = [sys.executable, "-m", module] + argv
+        procs.append(subprocess.Popen(cmd, env=env))
+
+    failed = []
+    for rank, proc in enumerate(procs):
+        ret = proc.wait()
+        if ret != 0:
+            failed.append((rank, ret))
+    for proc in procs:
+        if proc.poll() is None:
+            proc.kill()
+
+    if failed:
+        details = ", ".join(f"rank {r} exit {c}" for r, c in failed)
+        raise RuntimeError(f"DDP subprocess(es) failed: {details}")
 
 
 # ── Training helper ───────────────────────────────────────────────────────────
