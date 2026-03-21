@@ -107,6 +107,7 @@
 训练参数: max_events=2000, d_model=64, n_heads=4, n_encoder_layers=2, dim_feedforward=256,
          dropout=0.0, focal_alpha=0.95, warmup_epochs=10, epochs=100, lr=1e-3
 提交时间: 2026-03-22T01:05
+PBS Job ID: 3925203.pbs
 
 ---
 ### 实际结果（下轮填入）

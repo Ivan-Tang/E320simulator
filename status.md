@@ -30,7 +30,7 @@
 
 | 字段 | 值 |
 |------|-----|
-| 作业 ID | 提交后更新 |
+| 作业 ID | 3925203.pbs |
 | 脚本 | ~/subs/auto_loop2_fix_oom.sh |
 | 训练参数 | max_events=2000, d_model=64, n_heads=4, 2层, dim_ff=256, warmup=10, epochs=100, lr=1e-3, focal_alpha=0.95 |
 | 输出目录 | /storage/agrp/yiwen/runs/loop2_fix_oom/ |
