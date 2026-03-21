@@ -11,7 +11,7 @@ d_model=64/2层 Transformer + warmup(10ep) + focal_alpha=0.99 应让 Transformer
 
 ## 当前 PBS 作业
 - **脚本**: ~/subs/auto_loop1_small_warmup_focal.sh
-- **作业 ID**: （提交后更新）
+- **作业 ID**: 3924920.pbs
 - **训练参数**: d_model=64, n_heads=4, 2层encoder, dim_feedforward=256, dropout=0.0, focal_alpha=0.99, warmup=10ep, 100ep total, lr=1e-3
 
 ## 上轮结果（基线）
