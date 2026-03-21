@@ -44,6 +44,10 @@ def setup_ddp() -> tuple[int, int, bool]:
     if not is_ddp_launched():
         return 0, 1, False
 
+    # Already initialised (e.g. by mp.spawn wrapper that called init_process_group directly)
+    if dist.is_initialized():
+        return dist.get_rank(), dist.get_world_size(), True
+
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
