@@ -23,9 +23,9 @@
 | 字段 | 值 |
 |------|-----|
 | 作业 ID | 3924983.pbs |
-| 脚本 | ~/subs/auto_loop1_small_warmup_focal.sh |
-| 训练参数 | d_model=64, n_heads=4, 2层, dim_ff=256, warmup=10, epochs=100, lr=1e-3, focal_alpha=0.99 |
-| 输出目录 | /storage/agrp/yiwen/runs/loop1_small_warmup_focal/ |
+| 脚本 | ~/subs/auto_loop1_layer_attn.sh |
+| 训练参数 | d_model=64, n_heads=4, 2层, dim_ff=256, warmup=10, epochs=100, lr=1e-3, focal_alpha=0.95 |
+| 输出目录 | /storage/agrp/yiwen/runs/loop1_layer_attn/ |
 
 ## 架构变更摘要
 
