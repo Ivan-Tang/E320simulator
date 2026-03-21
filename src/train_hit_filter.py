@@ -182,8 +182,11 @@ def train_hit_filter(
         cfg = HitFilterConfig()
 
     device = _resolve_device(cfg)
+    torch.manual_seed(cfg.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(cfg.seed)
     print(f"[train_hit_filter] device={device}  epochs={cfg.n_epochs}  "
-          f"d_model={cfg.d_model}  window={cfg.window_size}")
+          f"d_model={cfg.d_model}  window={cfg.window_size}  seed={cfg.seed}")
 
     # ── Class balance stats ───────────────────────────────────────────────────
     n_total  = len(clusters_df)

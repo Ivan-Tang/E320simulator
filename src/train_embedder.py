@@ -218,7 +218,10 @@ def train_embedder(
         cfg = EmbedderTrainConfig()
 
     device = _resolve_device(cfg)
-    print(f"[embed-train] device={device}  epochs={cfg.n_epochs}")
+    torch.manual_seed(cfg.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(cfg.seed)
+    print(f"[embed-train] device={device}  epochs={cfg.n_epochs}  seed={cfg.seed}")
 
     hits_a, hits_b, target = build_pair_dataset_from_clusters(clusters_df, cfg)
     if len(target) == 0:

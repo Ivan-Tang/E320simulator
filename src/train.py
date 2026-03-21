@@ -276,7 +276,10 @@ def train(
         cfg = TrainConfig()
 
     device = _resolve_device(cfg)
-    print(f"[train] device={device}  model={cfg.model_type}  epochs={cfg.n_epochs}")
+    torch.manual_seed(cfg.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(cfg.seed)
+    print(f"[train] device={device}  model={cfg.model_type}  epochs={cfg.n_epochs}  seed={cfg.seed}")
 
     # ── train / val split ────────────────────────────────────────────────────
     all_events = np.array(edges_df["event_id"].unique().sort().to_numpy(), copy=True)

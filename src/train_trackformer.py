@@ -400,8 +400,11 @@ def train_trackformer(
         cfg = TrackFormerConfig()
 
     device = _resolve_device(cfg)
+    torch.manual_seed(cfg.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(cfg.seed)
     print(f"[train_trackformer] device={device}  epochs={cfg.n_epochs}  "
-          f"d_model={cfg.d_model}  queries={cfg.max_queries}")
+          f"d_model={cfg.d_model}  queries={cfg.max_queries}  seed={cfg.seed}")
 
     # ── Load frozen hit filter (Stage 1) ─────────────────────────────────────
     hf_info = _load_hit_filter(cfg, device)
