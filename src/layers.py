@@ -123,15 +123,15 @@ class TransformerEncoderLayer(nn.Module):
         )
 
     def forward(self, x: Tensor, mask: Tensor = None) -> Tensor:
-        # Self-attention with residual
-        attn_out = self.self_attn(x, x, x, mask)
+        # Pre-LN: normalise before attention for better gradient flow
+        normed = self.norm1(x)
+        attn_out = self.self_attn(normed, normed, normed, mask)
         x = x + self.dropout1(attn_out)
-        x = self.norm1(x)
 
-        # Feedforward with residual
-        ffn_out = self.ffn(x)
+        # Pre-LN: normalise before FFN
+        normed = self.norm2(x)
+        ffn_out = self.ffn(normed)
         x = x + self.dropout2(ffn_out)
-        x = self.norm2(x)
 
         return x
 

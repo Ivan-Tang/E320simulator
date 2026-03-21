@@ -295,11 +295,15 @@ class TransformerEmbedder(nn.Module):
 
 
 class TransformerEdgeClassifier(nn.Module):
-    """Transformer-based edge classifier for track seeding.
+    """Transformer-based edge classifier with detector-layer-stratified attention.
 
-    Combines Transformer encoder for hit feature extraction with edge classification head.
-    Inspired by Stroud et al. (2024) but adapted for edge classification task.
+    Instead of global self-attention over all N hits (O(N²), N~3500 for bg=700),
+    applies self-attention within each of the 5 detector layers separately
+    (~700 hits/layer), reducing complexity to O(5 × (N/5)²) = O(N²/5) and
+    giving a strong spatial inductive bias: same-layer hits naturally share context.
     """
+
+    N_DETECTOR_LAYERS = 5   # E320 ALPIDE detector layers
 
     def __init__(
         self,
@@ -310,30 +314,32 @@ class TransformerEdgeClassifier(nn.Module):
         n_encoder_layers: int = 2,
         dim_feedforward: int = 256,
         dropout: float = 0.0,
-        max_len: int = 1000,
+        max_len: int = 1000,   # kept for API compatibility, not used
     ):
         super().__init__()
         self.node_dim = node_dim
         self.edge_dim = edge_dim
         self.d_model = d_model
 
-        # Node feature encoder
-        self.node_encoder = TransformerEmbedder(
-            in_dim=node_dim,
-            out_dim=d_model,
-            d_model=d_model,
-            n_heads=n_heads,
-            n_layers=n_encoder_layers,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            max_len=max_len,
-        )
+        # Project raw node features to d_model
+        self.input_proj = nn.Linear(node_dim, d_model)
+
+        # Per-layer transformer encoder (shared weights across layers)
+        self.encoder_layers = nn.ModuleList([
+            TransformerEncoderLayer(d_model, n_heads, dim_feedforward, dropout)
+            for _ in range(n_encoder_layers)
+        ])
+        self.norm = nn.LayerNorm(d_model)
 
         # Edge feature encoder (MLP)
         self.edge_encoder = MLP(edge_dim, d_model // 2, d_model, n_layers=2)
 
         # Edge classification head
         self.classifier = MLP(3 * d_model, d_model, 1, n_layers=2)
+        # Initialise output bias to log-prior: positive edges ~2% of candidates
+        # so sigmoid(bias) ≈ 0.02 → bias ≈ log(0.02/0.98) ≈ -3.9
+        # Prevents predicting ~0.5 for every edge at init (99%+ fake rate).
+        nn.init.constant_(self.classifier[-1].bias, -3.9)
 
     def forward(
         self,
@@ -341,24 +347,33 @@ class TransformerEdgeClassifier(nn.Module):
         edge_index: torch.Tensor,  # (2, E)
         edge_feat: torch.Tensor,   # (E, edge_dim)
     ) -> torch.Tensor:             # (E,)
-        # Encode node features with Transformer
-        # TransformerEmbedder expects (seq_len, in_dim) or (batch, seq_len, in_dim)
-        # Here we have single event, so shape is (N, node_dim)
-        node_emb = self.node_encoder(node_feat)  # (N, d_model)
+        N = node_feat.shape[0]
+        device = node_feat.device
+
+        # Project all nodes to d_model
+        x = self.input_proj(node_feat)  # (N, d_model)
+
+        # Detector-layer-stratified self-attention
+        # node_feat[:, 0] = layer_id (integer 0..N_DETECTOR_LAYERS-1)
+        layer_ids = node_feat[:, 0].long()
+        node_emb = torch.zeros(N, self.d_model, device=device, dtype=x.dtype)
+
+        for layer_i in range(self.N_DETECTOR_LAYERS):
+            layer_idx = (layer_ids == layer_i).nonzero(as_tuple=True)[0]
+            if layer_idx.numel() == 0:
+                continue
+            x_layer = x[layer_idx].unsqueeze(0)   # (1, n_i, d_model)
+            for enc in self.encoder_layers:
+                x_layer = enc(x_layer)
+            node_emb[layer_idx] = self.norm(x_layer.squeeze(0))  # (n_i, d_model)
 
         # Encode edge features
         edge_emb = self.edge_encoder(edge_feat)  # (E, d_model)
 
-        # Get source and destination node embeddings
+        # Classify edges
         src, dst = edge_index[0], edge_index[1]
-        src_emb = node_emb[src]  # (E, d_model)
-        dst_emb = node_emb[dst]  # (E, d_model)
-
-        # Concatenate and classify
-        combined = torch.cat([src_emb, dst_emb, edge_emb], dim=-1)  # (E, 3*d_model)
-        logits = self.classifier(combined)  # (E, 1)
-
-        return logits.squeeze(-1).sigmoid()
+        combined = torch.cat([node_emb[src], node_emb[dst], edge_emb], dim=-1)  # (E, 3*d_model)
+        return self.classifier(combined).squeeze(-1).sigmoid()
 
 
 class HitFilterEncoderLayer(nn.Module):

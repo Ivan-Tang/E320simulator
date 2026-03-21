@@ -1,34 +1,36 @@
 # 自主研究状态
 
-**更新时间**: 2026-03-21T19:55
-**循环进度**: 1 / 15
-**状态**: 🚀 PBS 作业已提交（重新提交，修复路径错误）
+**更新时间**: 2026-03-21T21:00
+**当前循环**: 1 / 15
+**状态**: submitted（PBS 作业提交中）
 
 ---
 
 ## 当前假设
-d_model=64/2层 Transformer + warmup(10ep) + focal_alpha=0.99 应让 TransformerEdgeClassifier 从完全失效（2.2%）收敛到 efficiency ≥30%
+
+小容量 Transformer（d_model=64, 2层 encoder, dim_ff=256, warmup=10 epochs, focal_alpha=0.99）首次以正确配置训练，efficiency 应从 2.2% 提升到 >30%。
+
+## 上轮结果
+
+（首次运行，无上轮结果）
+- 基线参考：InteractionNet efficiency=70.6%, fake_rate=14.3%
+- Transformer 旧 checkpoint：efficiency=2.2%, fake_rate=99.7%（完全失效）
 
 ## 当前 PBS 作业
-- **脚本**: ~/subs/auto_loop1_small_warmup_focal.sh
-- **作业 ID**: 3924920.pbs
-- **训练参数**: d_model=64, n_heads=4, 2层encoder, dim_feedforward=256, dropout=0.0, focal_alpha=0.99, warmup=10ep, 100ep total, lr=1e-3
 
-## 上轮结果（基线）
-| 指标 | 值 |
+| 字段 | 值 |
 |------|-----|
-| efficiency | 2.2% （完全失效） |
-| fake_rate | 99.7% |
-| mean_rms | 4726 µm |
-
-**对比目标**: efficiency ≥ 60%, fake_rate ≤ 20%
-
-## 代码变更摘要（Loop 1）
-- `src/models.py`: TransformerEdgeClassifier/Embedder 默认值缩小（d_model 256→64, 6层→2层）
-- `src/train.py`: TrainConfig 新增 warmup_epochs 字段；CLI 修复（添加 transformer 选项）；SequentialLR warmup 调度器
+| 作业 ID | （提交后更新）|
+| 脚本 | ~/subs/auto_loop1_small_warmup_focal.sh |
+| 训练参数 | d_model=64, n_heads=4, 2层, dim_ff=256, warmup=10, epochs=100, lr=1e-3 |
+| 输出目录 | /storage/agrp/yiwen/runs/loop1_small_warmup_focal/ |
 
 ## 研究进展
-| Loop | 假设 | efficiency | fake_rate | 结论 |
-|------|------|-----------|-----------|------|
-| 基线 | — | 2.2% | 99.7% | 完全失效 |
-| 1 | 小容量+warmup+focal_alpha=0.99 | 待填 | 待填 | 进行中 |
+
+| Loop | 假设 | 结果 |
+|------|------|------|
+| 1 | 小容量+warmup 首次收敛 | 进行中 |
+
+## 成功标准
+
+`track_efficiency >= 0.60 AND fake_rate <= 0.20`（10k 测试事件）
