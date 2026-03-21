@@ -122,6 +122,22 @@ conda run -n e320root pytest test/ -v
 - `--TRAIN_ARGS_HERE`：本次实验的完整训练参数
 - PBS 资源根据需要调整（通常 128gb/8cpus/1gpu/10h 足够）
 
+**生成脚本时必须遵守的路径规范**（避免已知 bug）：
+
+1. **PBS 日志用绝对路径**：
+   ```bash
+   #PBS -o /srv01/agrp/yiwen/logs/auto_LOOP_LABEL.out
+   #PBS -e /srv01/agrp/yiwen/logs/auto_LOOP_LABEL.err
+   ```
+   不得用相对路径（`logs/...`），因为 `~/E320simulator/logs/` 目录不存在。
+
+2. **进入项目目录用绝对路径**：
+   ```bash
+   PROJ_DIR="/srv01/agrp/yiwen/E320simulator"
+   cd "${PROJ_DIR}"
+   ```
+   不得用 `cd $PBS_O_WORKDIR && cd E320simulator`——PBS_O_WORKDIR 取决于 qsub 提交时的目录，若已在 E320simulator/ 内提交则会嵌套失败。
+
 ---
 
 ## 步骤 8：更新所有文档
