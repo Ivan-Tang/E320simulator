@@ -1,17 +1,17 @@
 {
   "schema_version": "2.0",
-  "loop_status": "submitted",
-  "loop_count": 1,
+  "loop_status": "idle",
+  "loop_count": 0,
   "max_loops": 15,
-  "loop_start_time": "2026-03-21T19:31:47",
-  "current_pbs_job_id": "3924920.pbs",
-  "current_loop_label": "loop1_small_warmup_focal",
-  "current_loop_script": "~/subs/auto_loop1_small_warmup_focal.sh",
+  "loop_start_time": "2026-03-21T20:14:40",
+  "current_pbs_job_id": null,
+  "current_loop_label": null,
+  "current_loop_script": null,
   "research_branch": "auto-research-transformer-convergence",
   "last_eval_results": null,
   "stop_requested": false,
   "goal_achieved": false,
   "error_state": null,
-  "last_updated": "2026-03-21T19:55:00",
-  "last_updated_by": "claude-loop1-resubmit"
+  "last_updated": "2026-03-21T20:14:40",
+  "last_updated_by": "manual-restart"
 }
