@@ -66,12 +66,12 @@ class TrainConfig:
     hgnn_emb_loss_weight: float = 0.0   # weight for HingeLoss on intermediate embeddings (0=disabled)
 
     # transformer-specific parameters
-    d_model: int = 256
-    n_heads: int = 8
-    n_encoder_layers: int = 6
-    n_decoder_layers: int = 6
-    dim_feedforward: int = 1024
-    dropout: float = 0.1
+    d_model: int = 64
+    n_heads: int = 4
+    n_encoder_layers: int = 2
+    n_decoder_layers: int = 2
+    dim_feedforward: int = 256
+    dropout: float = 0.0
     max_seeds: int = 100
 
     # loss
@@ -85,6 +85,7 @@ class TrainConfig:
 
     # scheduler
     n_epochs: int = 50
+    warmup_epochs: int = 0           # linear LR warmup epochs (0 = disabled)
     lr_eta_min: float = 1e-5             # CosineAnnealingLR floor
 
     # data
@@ -315,9 +316,18 @@ def train(
     criterion = FocalLoss(alpha=cfg.focal_alpha, gamma=cfg.focal_gamma)
     emb_criterion = HingeLoss(margin=1.0) if cfg.model_type == "hgnn" and cfg.hgnn_emb_loss_weight > 0 else None
     optimizer = optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+    cosine_sched = optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=cfg.n_epochs, eta_min=cfg.lr_eta_min
     )
+    if cfg.warmup_epochs > 0:
+        warmup_sched = optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=0.01, end_factor=1.0, total_iters=cfg.warmup_epochs
+        )
+        scheduler = optim.lr_scheduler.SequentialLR(
+            optimizer, schedulers=[warmup_sched, cosine_sched], milestones=[cfg.warmup_epochs]
+        )
+    else:
+        scheduler = cosine_sched
     n_params = sum(p.numel() for p in model.parameters())
     print(f"[train] params={n_params:,}")
 
@@ -516,7 +526,8 @@ def _cli() -> None:
                         help="Training task: edge classifier or hit embedder")
 
     # edge-model options
-    parser.add_argument("--model",    default="gnn", choices=["gnn", "mlp", "interaction_net", "eggnet", "hgnn"],
+    parser.add_argument("--model",    default="gnn",
+                        choices=["gnn", "mlp", "interaction_net", "eggnet", "hgnn", "transformer"],
                         help="Edge model type (used when --task=edge)")
     parser.add_argument("--epochs",   type=int, default=50)
     parser.add_argument("--hidden",   type=int, default=64)
@@ -525,6 +536,18 @@ def _cli() -> None:
                         help="Inner GNN rounds per iteration (eggnet only)")
     parser.add_argument("--no-recurrent", action="store_true",
                         help="Disable weight sharing across iterations (eggnet only)")
+    # transformer-specific options
+    parser.add_argument("--d-model",          type=int,   default=256)
+    parser.add_argument("--n-heads",          type=int,   default=8)
+    parser.add_argument("--n-encoder-layers", type=int,   default=6)
+    parser.add_argument("--dim-feedforward",  type=int,   default=1024)
+    parser.add_argument("--dropout",          type=float, default=0.1)
+    parser.add_argument("--warmup-epochs",    type=int,   default=0,
+                        help="Linear LR warmup epochs (0=disabled)")
+    parser.add_argument("--focal-alpha",      type=float, default=0.995)
+    parser.add_argument("--focal-gamma",      type=float, default=2.0)
+    parser.add_argument("--grad-clip",        type=float, default=1.0)
+    parser.add_argument("--weight-decay",     type=float, default=1e-5)
     parser.add_argument("--layers",   type=int, default=3,
                         help="Embedder MLP depth (used when --task=embedder)")
     parser.add_argument("--emb-dim",  type=int, default=8,
@@ -555,6 +578,16 @@ def _cli() -> None:
             n_mp             = args.n_mp,
             n_gnns_per_iter  = args.n_gnns_per_iter,
             recurrent        = not args.no_recurrent,
+            d_model          = args.d_model,
+            n_heads          = args.n_heads,
+            n_encoder_layers = args.n_encoder_layers,
+            dim_feedforward  = args.dim_feedforward,
+            dropout          = args.dropout,
+            warmup_epochs    = args.warmup_epochs,
+            focal_alpha      = args.focal_alpha,
+            focal_gamma      = args.focal_gamma,
+            grad_clip        = args.grad_clip,
+            weight_decay     = args.weight_decay,
             lr               = args.lr,
             val_fraction     = args.val_fraction,
             device           = args.device,

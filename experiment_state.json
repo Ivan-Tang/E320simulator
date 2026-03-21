@@ -1,17 +1,17 @@
 {
   "schema_version": "2.0",
-  "loop_status": "idle",
-  "loop_count": 0,
+  "loop_status": "submitted",
+  "loop_count": 1,
   "max_loops": 15,
   "loop_start_time": "2026-03-21T19:31:47",
   "current_pbs_job_id": null,
-  "current_loop_label": null,
-  "current_loop_script": null,
+  "current_loop_label": "loop1_fix_cli_small",
+  "current_loop_script": "~/subs/auto_loop1_fix_cli_small.sh",
   "research_branch": "auto-research-transformer-convergence",
   "last_eval_results": null,
   "stop_requested": false,
   "goal_achieved": false,
   "error_state": null,
-  "last_updated": "2026-03-21T19:31:47",
-  "last_updated_by": "start_research.sh"
+  "last_updated": "2026-03-21T20:00:00",
+  "last_updated_by": "claude-loop1"
 }

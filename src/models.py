@@ -218,11 +218,11 @@ class TransformerEmbedder(nn.Module):
         self,
         in_dim: int = NODE_DIM,
         out_dim: int = 3,
-        d_model: int = 256,
-        n_heads: int = 8,
-        n_layers: int = 6,
-        dim_feedforward: int = 1024,
-        dropout: float = 0.1,
+        d_model: int = 64,
+        n_heads: int = 4,
+        n_layers: int = 2,
+        dim_feedforward: int = 256,
+        dropout: float = 0.0,
         max_len: int = 1000,
     ):
         super().__init__()
@@ -305,11 +305,11 @@ class TransformerEdgeClassifier(nn.Module):
         self,
         node_dim: int = NODE_DIM,
         edge_dim: int = EDGE_DIM,
-        d_model: int = 256,
-        n_heads: int = 8,
-        n_encoder_layers: int = 6,
-        dim_feedforward: int = 1024,
-        dropout: float = 0.1,
+        d_model: int = 64,
+        n_heads: int = 4,
+        n_encoder_layers: int = 2,
+        dim_feedforward: int = 256,
+        dropout: float = 0.0,
         max_len: int = 1000,
     ):
         super().__init__()
