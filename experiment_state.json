@@ -4,14 +4,14 @@
   "loop_count": 1,
   "max_loops": 15,
   "loop_start_time": "2026-03-21T19:31:47",
-  "current_pbs_job_id": "3924893.pbs",
-  "current_loop_label": "loop1_fix_cli_small",
-  "current_loop_script": "~/subs/auto_loop1_fix_cli_small.sh",
+  "current_pbs_job_id": null,
+  "current_loop_label": "loop1_small_warmup_focal",
+  "current_loop_script": "~/subs/auto_loop1_small_warmup_focal.sh",
   "research_branch": "auto-research-transformer-convergence",
   "last_eval_results": null,
   "stop_requested": false,
   "goal_achieved": false,
   "error_state": null,
-  "last_updated": "2026-03-21T20:05:00",
-  "last_updated_by": "claude-loop1"
+  "last_updated": "2026-03-21T19:55:00",
+  "last_updated_by": "claude-loop1-resubmit"
 }

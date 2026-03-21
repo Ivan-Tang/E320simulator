@@ -30,8 +30,9 @@
 - loss 应在 warmup 后单调下降
 
 ### PBS 作业
-脚本: ~/subs/auto_loop1_fix_cli_small.sh
-提交时间: 2026-03-21
+脚本: ~/subs/auto_loop1_small_warmup_focal.sh（旧脚本 fix_cli_small.sh 有路径 bug，已换新脚本）
+训练参数: d_model=64, n_heads=4, n_encoder_layers=2, dim_feedforward=256, dropout=0.0, focal_alpha=0.99, warmup_epochs=10, epochs=100, lr=1e-3
+提交时间: 2026-03-21T19:50
 
 ---
 ### 实际结果（下轮填入）
