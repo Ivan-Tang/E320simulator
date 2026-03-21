@@ -272,23 +272,10 @@ pytest 必须通过才能 commit 代码。测试失败 → 修复代码 → 重�
 # 1. 填写研究目标
 vim ~/E320simulator/research_goal.md
 
-# 2. 创建研究分支
+# 2. 一键启动（自动建分支、初始化状态、启动 watcher、触发第一次循环）
 cd ~/E320simulator
-git checkout -b auto-research-{目标缩写}
-git push -u origin auto-research-{目标缩写}
-
-# 3. 初始化状态文件（填入 loop_start_time, research_branch, max_loops）
-vim ~/E320simulator/experiment_state.json
-
-# 4. 启动 watcher（后台守护进程）
-nohup bash ~/subs/autonomous_watcher.sh > ~/logs/watcher.log 2>&1 &
-echo "Watcher PID: $!"
-
-# 5. 手动触发第一次循环（冷启动）
-cd ~/E320simulator
-claude --print --dangerously-skip-permissions \
-  "$(cat autonomous_loop_prompt.md)" \
-  >> ~/logs/claude_init.log 2>&1 &
+bash start_research.sh "目标描述"           # 默认最大 15 轮
+bash start_research.sh "目标描述" 20        # 指定最大循环次数
 ```
 
 ### 停止与恢复
