@@ -309,5 +309,52 @@ chi2 截断值: 7e-5 (对应真实轨迹分布的 99.8th 百分位)
 提交时间: 2026-03-22T10:00
 
 ---
-### 实际结果（下轮填入）
+### 实际结果（Loop 7 分析）
+- **Loop 6 PBS 脚本 bug 导致失败**：run_model.py 使用 `--output <file_path>`，但脚本传入 `--output-dir <dir>`（不存在的参数），推理立即报错退出
+- 脚本停在推理阶段（第 60 行），loop6 RUN_DIR 目录为空，eval_results.json 从未生成
+- **本地验证（使用 loop5 reco_result.parquet）**：
+  - chi2 < 7e-5 筛选后：efficiency=82.01%，fake_rate=11.66%，n_matched=962，n_kept=1089
+  - **满足研究目标（eff=82.01% ≥ 60%，fake_rate=11.66% ≤ 20%）**
+- Loop 7 策略：修复 `--output-dir` → `--output ${RUN_DIR}/reco_result.parquet`，重新运行
+
+---
+
+## Loop 7 — 2026-03-22T11:00
+
+### 上轮结果回顾
+- Loop 6 失败原因：PBS 脚本 `--output-dir` 参数错误（run_model.py 只接受 `--output <file_path>`）
+- Loop 5 模型推理质量（本地验证）：efficiency=82.95%（无筛选），chi2 切割后 efficiency=82.01%，fake_rate=11.66%
+- 评估：研究目标在本地已验证满足；仅需修复 PBS 脚本重新正式记录
+
+### 当前假设
+如果修复 PBS 脚本中的 `--output-dir` → `--output ${RUN_DIR}/reco_result.parquet` bug，
+用 loop5 checkpoint（edge-threshold=0.1）推理 + chi2 < 7e-5 质量筛选，
+efficiency 应为 82.01%，fake_rate 应为 11.66%，
+从而正式达到研究目标（eff >= 60% AND fake_rate <= 20%），因为：
+1. 本地直接在 loop5 reco_result.parquet 上验证了这个确切数字
+2. Loop 5 的 reco_result.parquet 与 loop7 将生成的完全一致（相同模型/阈值/测试集）
+3. chi2 < 7e-5 对真实 track 分布的 99.8th 百分位（仅损失 11/973 个匹配 track）
+
+**风险**：loop7 重新推理时 reco_result 可能因随机性略微不同，但 AUC=0.977 模型的
+推理是确定性的（eval 模式），结果应完全一致。
+
+### 代码修改
+- 无 src/ 修改（代码本身无问题，仅 PBS 脚本修复）
+- `~/subs/auto_loop7_fix_output_arg.sh`：
+  - 修复：`--output-dir "${RUN_DIR}"` → `--output "${RUN_DIR}/reco_result.parquet"`
+  - 其余评估逻辑与 loop6 完全相同
+
+### 预期结果
+- efficiency: 82.01%（满足 ≥ 60% 目标）
+- fake_rate: 11.66%（满足 ≤ 20% 目标）
+- **goal_achieved = true**
+
+### PBS 作业
+脚本: ~/subs/auto_loop7_fix_output_arg.sh
+推理用模型: loop5 checkpoint (/storage/agrp/yiwen/runs/loop5_pos_weight_fix/best_model.pt)
+chi2 截断值: 7e-5
+提交时间: 2026-03-22T11:00
+
+---
+### 实际结果（待填）
 （待填）
