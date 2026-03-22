@@ -4,7 +4,7 @@
   "loop_count": 7,
   "max_loops": 15,
   "loop_start_time": "2026-03-22T11:00:00",
-  "current_pbs_job_id": "PENDING",
+  "current_pbs_job_id": "3925801.pbs",
   "current_loop_label": "loop7_fix_output_arg",
   "current_loop_script": "~/subs/auto_loop7_fix_output_arg.sh",
   "research_branch": "auto-research-transformer-convergence",

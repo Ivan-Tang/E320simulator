@@ -52,7 +52,7 @@
 
 - **脚本**: `~/subs/auto_loop7_fix_output_arg.sh`
 - **模型**: loop5 checkpoint（无需重训）
-- **Job ID**: 待更新
+- **Job ID**: 3925801.pbs
 
 ---
 
