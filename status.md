@@ -32,7 +32,7 @@
 
 | 字段 | 值 |
 |------|-----|
-| 作业 ID | （提交后填入）|
+| 作业 ID | 3925300.pbs |
 | 脚本 | ~/subs/auto_loop3_balanced_sampling.sh |
 | 训练参数 | max_events=2000, balanced_sampling=True, neg_pos_ratio=100, d_model=64, 2层, dim_ff=256, warmup=10, epochs=200, lr=1e-3, BCELoss |
 | 输出目录 | /storage/agrp/yiwen/runs/loop3_balanced_sampling/ |

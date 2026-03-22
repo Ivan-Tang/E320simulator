@@ -4,7 +4,7 @@
   "loop_count": 3,
   "max_loops": 15,
   "loop_start_time": "2026-03-22T03:00:00",
-  "current_pbs_job_id": null,
+  "current_pbs_job_id": "3925300.pbs",
   "current_loop_label": "loop3_balanced_sampling",
   "current_loop_script": "~/subs/auto_loop3_balanced_sampling.sh",
   "research_branch": "auto-research-transformer-convergence",
