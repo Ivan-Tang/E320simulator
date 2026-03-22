@@ -1,55 +1,56 @@
 # 自主研究状态
 
-**更新时间**: 2026-03-22T01:05
-**当前循环**: Loop 2 / 15
-**分支**: auto-research-transformer-convergence
+**最后更新**: 2026-03-22T03:00
+**当前循环**: Loop 3 / 15
+**研究分支**: auto-research-transformer-convergence
 
 ---
 
-## 当前假设
+## 当前假设（一句话）
 
-限制训练到 2000 事件（--max-events 2000）避免 OOM，用层内分组注意力 TransformerEdgeClassifier
-首次成功完成训练，预期 efficiency >30%。
+平衡小批次采样（1:100 正:负，BCELoss）迫使模型输出正边得分 > 0.5，修复阈值崩溃问题。
 
-## 上轮结果（Loop 1 最终版）
+---
 
-| 指标 | 值 |
-|------|----|
-| track_efficiency | N/A（OOM killed） |
-| fake_rate | N/A |
-| mean_rms | N/A |
-| PBS job | 3924983.pbs |
-| 失败原因 | build_labeled_edges_from_sim 全量 10k 事件超出内存 |
+## 上轮结果（Loop 2: loop2_fix_oom）
 
-## 代码修改（Loop 2）
+| 指标 | 数值 |
+|------|------|
+| track_efficiency | **0.0%** ❌ |
+| fake_rate | 0.0% |
+| n_kept | 0 |
+| AUC | 0.976 ✓ |
+| AP | 0.0006 |
+| mean_rms | NaN |
 
-- `src/train.py`: 添加 `--max-events` CLI 参数，限制训练事件数（default=0 即不限制）
-- `src/models.py`: TransformerEdgeClassifier 层内分组注意力（Loop 1 已实现，本轮首次训练）
+**根因**: 模型学到了好的排序（AUC=0.97）但所有边得分 << 0.5 推理阈值。
+极端类别不平衡（1:50,000 = pos_frac=0.00002）导致 FocalLoss 收敛到全零输出局部最优。
 
-## 当前 PBS 作业
+---
+
+## 当前 PBS 作业（Loop 3）
 
 | 字段 | 值 |
 |------|-----|
-| 作业 ID | 3925203.pbs |
-| 脚本 | ~/subs/auto_loop2_fix_oom.sh |
-| 训练参数 | max_events=2000, d_model=64, n_heads=4, 2层, dim_ff=256, warmup=10, epochs=100, lr=1e-3, focal_alpha=0.95 |
-| 输出目录 | /storage/agrp/yiwen/runs/loop2_fix_oom/ |
+| 作业 ID | （提交后填入）|
+| 脚本 | ~/subs/auto_loop3_balanced_sampling.sh |
+| 训练参数 | max_events=2000, balanced_sampling=True, neg_pos_ratio=100, d_model=64, 2层, dim_ff=256, warmup=10, epochs=200, lr=1e-3, BCELoss |
+| 输出目录 | /storage/agrp/yiwen/runs/loop3_balanced_sampling/ |
 
-## 架构变更摘要
+## Loop 3 代码修改
 
-| 变更 | 文件 | 效果 |
-|------|------|------|
-| Pre-LN (Pre-Norm) | src/layers.py | 更好梯度流，收敛更稳定 |
-| 层内分组注意力 | src/models.py | O(N²/5)，空间归纳偏置 |
-| 输出 bias=-3.9 | src/models.py | 初始预测~2% 正例，防99%假率 |
-| --max-events 限制 | src/train.py | **修复 OOM**，限制训练事件数 |
+- `src/train.py`: 新增 `balanced_sampling`、`neg_pos_ratio` 字段
+- `src/train.py`: 训练循环中每事件采样 pos + 100×neg，改用 `nn.BCELoss()`
+- `src/train.py`: balanced+transformer 时重置 classifier 偏置为 0.0（中性初始化）
+- `src/train.py` CLI: 新增 `--balanced-sampling`、`--neg-pos-ratio`
 
 ## 研究进展
 
-| Loop | 假设 | 结果 |
-|------|------|------|
-| 1 (最终) | 层内分组 attn | OOM killed（基础设施问题）|
-| **2** | 限制 2000 事件 + 层内分组 attn | **进行中** |
+| Loop | 假设 | 结果 | 关键发现 |
+|------|------|------|---------|
+| 1 | 层内分组注意力架构 | ❌ OOM | 代码正确，内存超限 |
+| 2 | --max-events 2000 修复 OOM | ❌ n_kept=0 | 训练成功但得分全 < 0.5 |
+| **3** | 平衡采样 + BCELoss | ⏳ **进行中** | 预期 efficiency >30% |
 
 ## 成功标准
 

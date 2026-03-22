@@ -1,17 +1,27 @@
 {
   "schema_version": "2.0",
   "loop_status": "submitted",
-  "loop_count": 2,
+  "loop_count": 3,
   "max_loops": 15,
-  "loop_start_time": "2026-03-22T01:05:00",
-  "current_pbs_job_id": "3925203.pbs",
-  "current_loop_label": "loop2_fix_oom",
-  "current_loop_script": "~/subs/auto_loop2_fix_oom.sh",
+  "loop_start_time": "2026-03-22T03:00:00",
+  "current_pbs_job_id": null,
+  "current_loop_label": "loop3_balanced_sampling",
+  "current_loop_script": "~/subs/auto_loop3_balanced_sampling.sh",
   "research_branch": "auto-research-transformer-convergence",
-  "last_eval_results": null,
+  "last_eval_results": {
+    "loop2_fix_oom": {
+      "track_efficiency": 0.0,
+      "fake_rate": 0.0,
+      "mean_rms": null,
+      "n_kept": 0,
+      "auc": 0.976,
+      "ap": 0.0006,
+      "root_cause": "all scores < 0.5 threshold due to 1:50000 class imbalance"
+    }
+  },
   "stop_requested": false,
   "goal_achieved": false,
   "error_state": null,
-  "last_updated": "2026-03-22T01:05:00",
-  "last_updated_by": "claude-auto-loop2"
+  "last_updated": "2026-03-22T03:00:00",
+  "last_updated_by": "claude-auto-loop3"
 }

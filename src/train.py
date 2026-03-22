@@ -100,6 +100,10 @@ class TrainConfig:
     # pretrained embedder for feature augmentation (two-stage pipeline)
     embedder_checkpoint: str | None = None  # path to best_embedder.pt; raw features are augmented with embedder output
 
+    # balanced mini-batch sampling (reduces extreme class imbalance for transformer)
+    balanced_sampling: bool = False
+    neg_pos_ratio: int = 100        # negatives per positive in balanced batch
+
     # hardware
     device: str = "auto"                 # "auto" | "cpu" | "mps" | "cuda"
 
@@ -313,7 +317,14 @@ def train(
 
     # ── model / optimiser ────────────────────────────────────────────────────
     model     = _build_model(cfg, node_dim=node_dim_eff).to(device)
-    criterion = FocalLoss(alpha=cfg.focal_alpha, gamma=cfg.focal_gamma)
+    # For balanced sampling, reset Transformer classifier bias to neutral (0.0)
+    # so sigmoid output ~0.5 at init; BCELoss on balanced data will calibrate it.
+    if cfg.balanced_sampling and cfg.model_type == "transformer":
+        model.classifier[-1].bias.data.fill_(0.0)
+    if cfg.balanced_sampling:
+        criterion = nn.BCELoss()
+    else:
+        criterion = FocalLoss(alpha=cfg.focal_alpha, gamma=cfg.focal_gamma)
     emb_criterion = HingeLoss(margin=1.0) if cfg.model_type == "hgnn" and cfg.hgnn_emb_loss_weight > 0 else None
     optimizer = optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     cosine_sched = optim.lr_scheduler.CosineAnnealingLR(
@@ -355,6 +366,18 @@ def train(
             nf, ei, ef, lab, _ = event_to_tensors(ev_df)
             if cfg.skip_zero_pos_events and lab.sum() == 0:
                 continue
+
+            # Balanced mini-batch: sample all positives + neg_pos_ratio×n_pos negatives
+            if cfg.balanced_sampling and int(lab.sum()) > 0:
+                pos_idx = torch.where(lab == 1)[0]
+                neg_idx = torch.where(lab == 0)[0]
+                n_neg = min(int(neg_idx.numel()), int(pos_idx.numel()) * cfg.neg_pos_ratio)
+                if n_neg > 0:
+                    neg_perm = torch.randperm(neg_idx.numel())[:n_neg]
+                    sel = torch.cat([pos_idx, neg_idx[neg_perm]])
+                    ei = ei[:, sel]
+                    ef = ef[sel]
+                    lab = lab[sel]
 
             if embedder_info is not None:
                 nf = _augment_with_embedder(nf, embedder_info)
@@ -564,6 +587,10 @@ def _cli() -> None:
                         help="Path to pretrained embedder .pt for node feature augmentation")
     parser.add_argument("--max-events", type=int, default=0,
                         help="Limit training to N events (0=use all). Use to avoid OOM on large datasets.")
+    parser.add_argument("--balanced-sampling", action="store_true",
+                        help="Sample balanced pos/neg mini-batches per event (fixes extreme class imbalance)")
+    parser.add_argument("--neg-pos-ratio", type=int, default=100,
+                        help="Negatives per positive in balanced mini-batch (default=100)")
     args = parser.parse_args()
 
     clusters_df = pl.read_parquet(args.clusters)
@@ -600,6 +627,8 @@ def _cli() -> None:
             device           = args.device,
             checkpoint_dir   = args.checkpoint,
             embedder_checkpoint = args.embedder_checkpoint,
+            balanced_sampling    = args.balanced_sampling,
+            neg_pos_ratio        = args.neg_pos_ratio,
         )
         train(edges_df, cfg)
         return

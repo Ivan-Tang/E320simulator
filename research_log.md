@@ -110,5 +110,53 @@
 PBS Job ID: 3925203.pbs
 
 ---
+### 实际结果（Loop 3 填入）
+- efficiency: 0.0% | fake_rate: 0.0% | mean_rms: NaN | n_kept: 0
+- AUC: 0.976, AP: 0.0006（模型有排序能力，但绝对分数全部 < 0.5）
+- 评估: 假设未成立。OOM 问题已解决，训练成功完成 100 epochs，但推理阈值失效：
+  模型学到了有效排序（AUC=0.97）却因极端类别不平衡（1:50,000）导致所有得分
+  << 0.5，n_kept=0 条径迹。根因：FocalLoss 在 pos_frac=0.00002 下仍被负样本主导，
+  模型收敛到所有输出趋近 0 的局部最优（得分约 0.001-0.01）。
+
+---
+
+## Loop 3 — 2026-03-22T03:00
+
+### 上轮结果回顾
+- efficiency: 0.0% | fake_rate: 0.0% | mean_rms: NaN
+- 评估: Loop 2 训练完成但全部失效。AUC=0.97 表明排序正确，但所有边得分 < 0.5 threshold。
+  根因：pos_frac=0.00002（1:50,000 不平衡），FocalLoss 收敛到全零输出局部最优。
+
+### 当前假设
+如果实现平衡小批次采样（balanced mini-batch：每个事件取所有正边 + 100× 负边，
+改用 BCELoss），模型将被迫学习将正样本得分推向 > 0.5，从而让
+efficiency 从 0% 提升到 >30%，因为：
+1. BCELoss 对 1:100 平衡批次中正样本提供足够梯度信号
+2. 中性 bias 初始化（0.0）使 sigmoid 初始输出 ~0.5，训练后正样本边分布 > 0.5
+3. 层内分组注意力架构本身是正确的（Loop 1 已验证），唯一问题是得分量级
+
+**风险**：1% 训练正例占比 vs 0.002% 测试正例占比 → 模型在推理时可能过于激进，
+fake_rate 偏高（但这比 efficiency=0 要好得多）。
+
+### 代码修改
+- `src/train.py` TrainConfig 新增字段：`balanced_sampling: bool = False`、`neg_pos_ratio: int = 100`
+- `src/train.py` 训练循环：添加平衡采样逻辑（select pos_idx + randperm(neg_idx)[:100×n_pos]）
+- `src/train.py` criterion 选择：`balanced_sampling=True` 时用 `nn.BCELoss()`
+- `src/train.py` 模型初始化：`balanced_sampling + transformer` 时将 classifier 最后层 bias 重置为 0.0
+- `src/train.py` CLI：新增 `--balanced-sampling` 和 `--neg-pos-ratio` 参数
+
+### 预期结果
+- efficiency: >30%（正边得分 > 0.5，n_kept > 0）
+- fake_rate: 可能偏高（10-50%），因模型在平衡数据上校准而非真实 0.002% 先验
+- 训练 loss: 从 ~0.69（BCE 初始）快速下降，收敛到 ~0.1-0.3
+
+### PBS 作业
+脚本: ~/subs/auto_loop3_balanced_sampling.sh
+训练参数: max_events=2000, balanced_sampling=True, neg_pos_ratio=100,
+         d_model=64, n_heads=4, n_encoder_layers=2, dim_feedforward=256,
+         dropout=0.0, warmup_epochs=10, epochs=200, lr=1e-3, BCELoss
+提交时间: 2026-03-22T03:00
+
+---
 ### 实际结果（下轮填入）
 （待填）
