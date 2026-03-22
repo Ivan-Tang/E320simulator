@@ -68,12 +68,12 @@ class TrainConfig:
     hgnn_emb_loss_weight: float = 0.0   # weight for HingeLoss on intermediate embeddings (0=disabled)
 
     # transformer-specific parameters
-    d_model: int = 256
-    n_heads: int = 8
-    n_encoder_layers: int = 6
-    n_decoder_layers: int = 6
-    dim_feedforward: int = 1024
-    dropout: float = 0.1
+    d_model: int = 64
+    n_heads: int = 4
+    n_encoder_layers: int = 2
+    n_decoder_layers: int = 2
+    dim_feedforward: int = 256
+    dropout: float = 0.0
     max_seeds: int = 100
 
     # loss
@@ -87,6 +87,7 @@ class TrainConfig:
 
     # scheduler
     n_epochs: int = 50
+    warmup_epochs: int = 0           # linear LR warmup epochs (0 = disabled)
     lr_eta_min: float = 1e-5             # CosineAnnealingLR floor
 
     # data
@@ -100,6 +101,10 @@ class TrainConfig:
 
     # pretrained embedder for feature augmentation (two-stage pipeline)
     embedder_checkpoint: str | None = None  # path to best_embedder.pt; raw features are augmented with embedder output
+
+    # balanced mini-batch sampling (reduces extreme class imbalance for transformer)
+    balanced_sampling: bool = False
+    neg_pos_ratio: int = 100        # negatives per positive in balanced batch
 
     # hardware
     device: str = "auto"                 # "auto" | "cpu" | "mps" | "cuda"
@@ -397,12 +402,28 @@ def train(
 
     # ── model / optimiser ────────────────────────────────────────────────────
     model     = _build_model(cfg, node_dim=node_dim_eff).to(device)
-    criterion = FocalLoss(alpha=cfg.focal_alpha, gamma=cfg.focal_gamma)
+    # For balanced sampling, reset Transformer classifier bias to neutral (0.0)
+    # so sigmoid output ~0.5 at init; BCELoss on balanced data will calibrate it.
+    if cfg.balanced_sampling and cfg.model_type == "transformer":
+        model.classifier[-1].bias.data.fill_(0.0)
+    if cfg.balanced_sampling:
+        criterion = None   # computed per-batch with pos_weight (see training loop)
+    else:
+        criterion = FocalLoss(alpha=cfg.focal_alpha, gamma=cfg.focal_gamma)
     emb_criterion = HingeLoss(margin=1.0) if cfg.model_type == "hgnn" and cfg.hgnn_emb_loss_weight > 0 else None
     optimizer = optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+    cosine_sched = optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=cfg.n_epochs, eta_min=cfg.lr_eta_min
     )
+    if cfg.warmup_epochs > 0:
+        warmup_sched = optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=0.01, end_factor=1.0, total_iters=cfg.warmup_epochs
+        )
+        scheduler = optim.lr_scheduler.SequentialLR(
+            optimizer, schedulers=[warmup_sched, cosine_sched], milestones=[cfg.warmup_epochs]
+        )
+    else:
+        scheduler = cosine_sched
     n_params = sum(p.numel() for p in model.parameters())
     print(f"[train] params={n_params:,}")
 
@@ -443,6 +464,18 @@ def train(
             if cfg.skip_zero_pos_events and lab.sum() == 0:
                 continue
 
+            # Balanced mini-batch: sample all positives + neg_pos_ratio×n_pos negatives
+            if cfg.balanced_sampling and int(lab.sum()) > 0:
+                pos_idx = torch.where(lab == 1)[0]
+                neg_idx = torch.where(lab == 0)[0]
+                n_neg = min(int(neg_idx.numel()), int(pos_idx.numel()) * cfg.neg_pos_ratio)
+                if n_neg > 0:
+                    neg_perm = torch.randperm(neg_idx.numel())[:n_neg]
+                    sel = torch.cat([pos_idx, neg_idx[neg_perm]])
+                    ei = ei[:, sel]
+                    ef = ef[sel]
+                    lab = lab[sel]
+
             if embedder_info is not None:
                 nf = _augment_with_embedder(nf, embedder_info)
             nf, ef = _normalise(nf, ef, node_mean, node_std, edge_mean, edge_std)
@@ -453,7 +486,19 @@ def train(
 
             optimizer.zero_grad()
             pred = model(nf, ei, ef)
-            loss = criterion(pred, lab)
+            if cfg.balanced_sampling:
+                # Give each positive edge neg_pos_ratio× more weight to counteract
+                # the 1:neg_pos_ratio imbalance within the balanced batch.
+                # Without pos_weight, the equilibrium score for positives is ~0.2
+                # (not 0.5), causing all inference scores to fall below threshold.
+                sample_weight = torch.where(
+                    lab == 1,
+                    torch.full_like(lab, float(cfg.neg_pos_ratio)),
+                    torch.ones_like(lab),
+                )
+                loss = nn.functional.binary_cross_entropy(pred, lab.float(), weight=sample_weight)
+            else:
+                loss = criterion(pred, lab)
             # Optional embedding loss for HGNN (two-stage training from Liu et al. 2023)
             if emb_criterion is not None and hasattr(model, "last_embeddings") and model.last_embeddings is not None:
                 emb = model.last_embeddings          # (N, emb_dim), L2-normalised
@@ -639,7 +684,8 @@ def _cli() -> None:
                         help="Events per parquet chunk when using --build-edges-to (default=200)")
 
     # edge-model options
-    parser.add_argument("--model",    default="gnn", choices=["gnn", "mlp", "interaction_net", "eggnet", "hgnn"],
+    parser.add_argument("--model",    default="gnn",
+                        choices=["gnn", "mlp", "interaction_net", "eggnet", "hgnn", "transformer"],
                         help="Edge model type (used when --task=edge)")
     parser.add_argument("--epochs",   type=int, default=50)
     parser.add_argument("--hidden",   type=int, default=64)
@@ -648,6 +694,18 @@ def _cli() -> None:
                         help="Inner GNN rounds per iteration (eggnet only)")
     parser.add_argument("--no-recurrent", action="store_true",
                         help="Disable weight sharing across iterations (eggnet only)")
+    # transformer-specific options
+    parser.add_argument("--d-model",          type=int,   default=256)
+    parser.add_argument("--n-heads",          type=int,   default=8)
+    parser.add_argument("--n-encoder-layers", type=int,   default=6)
+    parser.add_argument("--dim-feedforward",  type=int,   default=1024)
+    parser.add_argument("--dropout",          type=float, default=0.1)
+    parser.add_argument("--warmup-epochs",    type=int,   default=0,
+                        help="Linear LR warmup epochs (0=disabled)")
+    parser.add_argument("--focal-alpha",      type=float, default=0.995)
+    parser.add_argument("--focal-gamma",      type=float, default=2.0)
+    parser.add_argument("--grad-clip",        type=float, default=1.0)
+    parser.add_argument("--weight-decay",     type=float, default=1e-5)
     parser.add_argument("--layers",   type=int, default=3,
                         help="Embedder MLP depth (used when --task=embedder)")
     parser.add_argument("--emb-dim",  type=int, default=8,
@@ -663,7 +721,11 @@ def _cli() -> None:
     parser.add_argument("--embedder-checkpoint", default=None,
                         help="Path to pretrained embedder .pt for node feature augmentation")
     parser.add_argument("--max-events", type=int, default=0,
-                        help="Limit to N events when building edges (0=all)")
+                        help="Limit training to N events (0=use all). Use to avoid OOM on large datasets.")
+    parser.add_argument("--balanced-sampling", action="store_true",
+                        help="Sample balanced pos/neg mini-batches per event (fixes extreme class imbalance)")
+    parser.add_argument("--neg-pos-ratio", type=int, default=100,
+                        help="Negatives per positive in balanced mini-batch (default=100)")
     args = parser.parse_args()
 
     cfg = TrainConfig(
@@ -673,12 +735,29 @@ def _cli() -> None:
         n_mp             = args.n_mp,
         n_gnns_per_iter  = args.n_gnns_per_iter,
         recurrent        = not args.no_recurrent,
+        d_model          = args.d_model,
+        n_heads          = args.n_heads,
+        n_encoder_layers = args.n_encoder_layers,
+        dim_feedforward  = args.dim_feedforward,
+        dropout          = args.dropout,
+        warmup_epochs    = args.warmup_epochs,
+        focal_alpha      = args.focal_alpha,
+        focal_gamma      = args.focal_gamma,
+        grad_clip        = args.grad_clip,
+        weight_decay     = args.weight_decay,
         lr               = args.lr,
         val_fraction     = args.val_fraction,
         device           = args.device,
         checkpoint_dir   = args.checkpoint,
         embedder_checkpoint = args.embedder_checkpoint,
+        balanced_sampling    = args.balanced_sampling,
+        neg_pos_ratio        = args.neg_pos_ratio,
     )
+
+    if args.max_events > 0:
+        event_ids = clusters_df["event_id"].unique().sort().head(args.max_events)
+        clusters_df = clusters_df.filter(pl.col("event_id").is_in(event_ids))
+        print(f"[cli] limited to {len(clusters_df):,} clusters ({args.max_events} events)")
 
     if args.task == "edge":
         # ── Path A: use pre-built parquet edges directory ─────────────────────

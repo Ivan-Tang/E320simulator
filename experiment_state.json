@@ -1,17 +1,33 @@
 {
   "schema_version": "2.0",
-  "loop_status": "idle",
-  "loop_count": 0,
+  "loop_status": "completed",
+  "loop_count": 7,
   "max_loops": 15,
-  "loop_start_time": "2026-03-21T00:00:00",
-  "current_pbs_job_id": null,
-  "current_loop_label": null,
-  "current_loop_script": null,
-  "research_branch": "auto-research-transformer",
-  "last_eval_results": null,
+  "loop_start_time": "2026-03-22T11:00:00",
+  "current_pbs_job_id": "3925801.pbs",
+  "current_loop_label": "loop7_fix_output_arg",
+  "current_loop_script": "~/subs/auto_loop7_fix_output_arg.sh",
+  "research_branch": "auto-research-transformer-convergence",
+  "last_eval_results": {
+    "loop7_fix_output_arg": {
+      "track_efficiency": 0.8201,
+      "fake_rate": 0.1166,
+      "mean_rms": 0.004634,
+      "n_kept": 1089,
+      "n_truth": 1173,
+      "n_matched": 962,
+      "chi2_cut": 7e-05,
+      "without_chi2_cut": {
+        "track_efficiency": 0.8295,
+        "fake_rate": 0.3714,
+        "n_kept": 1548,
+        "n_matched": 973
+      }
+    }
+  },
   "stop_requested": false,
-  "goal_achieved": false,
+  "goal_achieved": true,
   "error_state": null,
-  "last_updated": "2026-03-21T00:00:00",
-  "last_updated_by": "human"
+  "last_updated": "2026-03-22T12:00:00",
+  "last_updated_by": "claude-auto-loop8-goal-achieved"
 }
