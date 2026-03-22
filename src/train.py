@@ -322,7 +322,7 @@ def train(
     if cfg.balanced_sampling and cfg.model_type == "transformer":
         model.classifier[-1].bias.data.fill_(0.0)
     if cfg.balanced_sampling:
-        criterion = nn.BCELoss()
+        criterion = None   # computed per-batch with pos_weight (see training loop)
     else:
         criterion = FocalLoss(alpha=cfg.focal_alpha, gamma=cfg.focal_gamma)
     emb_criterion = HingeLoss(margin=1.0) if cfg.model_type == "hgnn" and cfg.hgnn_emb_loss_weight > 0 else None
@@ -389,7 +389,19 @@ def train(
 
             optimizer.zero_grad()
             pred = model(nf, ei, ef)
-            loss = criterion(pred, lab)
+            if cfg.balanced_sampling:
+                # Give each positive edge neg_pos_ratio× more weight to counteract
+                # the 1:neg_pos_ratio imbalance within the balanced batch.
+                # Without pos_weight, the equilibrium score for positives is ~0.2
+                # (not 0.5), causing all inference scores to fall below threshold.
+                sample_weight = torch.where(
+                    lab == 1,
+                    torch.full_like(lab, float(cfg.neg_pos_ratio)),
+                    torch.ones_like(lab),
+                )
+                loss = nn.functional.binary_cross_entropy(pred, lab.float(), weight=sample_weight)
+            else:
+                loss = criterion(pred, lab)
             # Optional embedding loss for HGNN (two-stage training from Liu et al. 2023)
             if emb_criterion is not None and hasattr(model, "last_embeddings") and model.last_embeddings is not None:
                 emb = model.last_embeddings          # (N, emb_dim), L2-normalised

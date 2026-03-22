@@ -205,5 +205,59 @@ fake_rate 偏高（但这比 efficiency=0 要好得多）。
 提交时间: 2026-03-22T07:30
 
 ---
+### 实际结果（Loop 5 填入）
+- efficiency: 0.0% | fake_rate: 0.0% | mean_rms: N/A | n_kept: 0
+- 训练完成（200 epochs，loss 0.33→0.015，AUC=0.977，AP=0.0005）
+- reco_result.parquet 完全为空（0行0列）：所有事件无任何得分 > 0.5 的边
+- 评估：假设仍未成立（是 Loop 4 修复的第四个 bug）
+- **根因确诊**：BCELoss 在 1:100 balanced batch 中均分 loss：
+  - 每个正样本梯度贡献 = 1/101 × (-1/p_pos)
+  - 100 个负样本总梯度 = 100/101 × (1/(1-p_neg))
+  - 训练均衡点：-log(p_pos) ≈ 1.41 → p_pos ≈ 0.24（远低于 0.5 阈值！）
+  - 数学验证：epoch=200 时 loss≈0.015 对应 p_pos≈0.24，与空结果完全吻合
+
+---
+
+## Loop 5 — 2026-03-22T08:30
+
+### 上轮结果回顾
+- efficiency: 0.0% | fake_rate: 0.0% | mean_rms: N/A
+- 评估: Loop 4 训练完成（AUC=0.977，有排序能力），但所有推理得分 < 0.5。
+  根因数学确诊：BCELoss 在 1:100 balanced batch 中正样本均衡得分约 0.24，
+  非 0.5，因此 threshold=0.5 从不触发。balanced sampling 假设本身正确，
+  但 BCELoss 的梯度加权未被修正。
+
+### 当前假设
+如果对 balanced sampling 的损失函数添加 `pos_weight=neg_pos_ratio=100`
+（使每个正样本梯度贡献 100× 于每个负样本，与 1:100 比例对称），
+正样本边得分应超过 0.5，效率从 0% 提升到 >30%，因为：
+1. 修正后的梯度均衡点变为 p_pos → 1.0（而非 0.24）
+2. 架构和训练流程已验证正确（Loop 2-4 的 AUC=0.976-0.977）
+3. 使用较低推理阈值 0.1 作为安全网
+
+**风险**：pos_weight=100 可能导致模型对正样本过度拟合，fake_rate 偏高；
+但 AUC=0.977 说明模型有良好判别力，只需校准阈值。
+
+### 代码修改
+- `src/train.py` 第 324-325 行：将 `criterion = nn.BCELoss()` 改为 `criterion = None`
+- `src/train.py` 第 390-392 行：添加 per-sample pos_weight 加权 BCE 损失逻辑：
+  - 计算 sample_weight（正样本=neg_pos_ratio=100，负样本=1.0）
+  - 使用 `nn.functional.binary_cross_entropy(pred, lab.float(), weight=sample_weight)`
+
+### 预期结果
+- efficiency: >30%（正样本得分 > 0.5，n_kept > 0）
+- fake_rate: 可能偏高（10-60%），因 threshold=0.1 比较宽松
+- 训练 loss 初始值略高（~0.5）但应快速收敛，最终 loss 约 0.3-0.5（不再是 0.015，因为 p_pos→1 对应 BCELoss 近 0）
+
+### PBS 作业
+脚本: ~/subs/auto_loop5_pos_weight_fix.sh
+训练参数: clusters=sim_clusters_train.parquet, max_events=2000, balanced_sampling=True,
+         neg_pos_ratio=100, pos_weight=100（新增！）, d_model=64, n_heads=4,
+         n_encoder_layers=2, dim_feedforward=256, dropout=0.0, warmup_epochs=10,
+         epochs=200, lr=1e-3, BCELoss+pos_weight
+推断阈值: 0.1（安全网，修复后 0.5 也应工作）
+提交时间: 2026-03-22T08:30
+
+---
 ### 实际结果（下轮填入）
 （待填）
