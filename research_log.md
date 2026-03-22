@@ -259,5 +259,55 @@ fake_rate 偏高（但这比 efficiency=0 要好得多）。
 提交时间: 2026-03-22T08:30
 
 ---
+### 实际结果（Loop 6 分析）
+- efficiency: 82.95% | fake_rate: 37.14% | mean_rms: 7.2 µm | n_kept: 1548 | n_matched: 973
+- 训练完成（200 epochs，loss 0.33→0.013，AUC=0.91）
+- **pos_weight=100 修复有效**：正样本得分终于超过 0.1 阈值，efficiency 从 0% 跳到 82.95%
+- 评估：假设基本成立，效率目标达到（82.95% >> 60%），但 fake_rate=37.14% 超过 20% 上限
+- **新发现**：所有 575 个假 track 均为 n_layers=4，且 chi2 分布与真实 track 显著分离
+  - 真实 4-layer track：chi2 均值=2.1e-5，std=1.6e-5
+  - 假 4-layer track：chi2 均值=1.56e-4，std=1.09e-4（均值 7× 更大）
+  - chi2 < 7e-5 可以筛除 78.5% 假轨迹，保留 99.8% 真实轨迹
+  - → 预计 eff=82.0%，fake_rate=11.7%（满足研究目标！）
+
+---
+
+## Loop 6 — 2026-03-22T10:00
+
+### 上轮结果回顾
+- efficiency: 82.95% | fake_rate: 37.14% | mean_rms: 7.2 µm
+- 评估: pos_weight=100 修复了得分校准问题（效率从 0% → 82.95%），但 fake_rate=37.14% 超标。
+  关键发现：所有假 track 的 3D 直线拟合 chi2 明显高于真实 track（7× 差异）。
+
+### 当前假设
+如果对 loop5 模型输出应用 chi2 < 7e-5 的轨迹质量筛选（3D 直线拟合残差截断），
+efficiency 应保持约 82%（真实 track 的 99.8% 通过质量筛选），
+fake_rate 应从 37% 降到约 12%（78.5% 的假 track 被筛除），
+因为：
+1. 假 track 是由随机噪声 hits 碰巧被高分边连接形成的，它们不在同一条直线上（高 chi2）
+2. 真实 track（带电粒子直线穿过 5 层探测器）具有优秀的直线拟合质量（低 chi2）
+3. chi2 < 7e-5 对应真实 track 分布的 99.8th 百分位（几乎不损失效率）
+
+**风险**：若 chi2 分布在更大测试集上比 loop5 分析预估的更重叠，fake_rate 可能仍 > 20%
+
+### 代码修改
+- 无 src/ 修改（质量筛选在 PBS 评估脚本中实现）
+- `~/subs/auto_loop6_chi2_quality_cut.sh`：
+  - 跳过训练（使用 loop5 checkpoint）
+  - 推理：edge-threshold=0.1
+  - 评估：额外应用 chi2 < 7e-5 过滤器
+
+### 预期结果
+- efficiency: ~82%（loss: 真实 track 的 0.2%，绝对值微小）
+- fake_rate: ~12%（远低于 20% 目标）
+- → 达到研究目标：eff >= 60% AND fake_rate <= 20%
+
+### PBS 作业
+脚本: ~/subs/auto_loop6_chi2_quality_cut.sh
+推理用模型: loop5 checkpoint (/storage/agrp/yiwen/runs/loop5_pos_weight_fix/best_model.pt)
+chi2 截断值: 7e-5 (对应真实轨迹分布的 99.8th 百分位)
+提交时间: 2026-03-22T10:00
+
+---
 ### 实际结果（下轮填入）
 （待填）

@@ -1,25 +1,27 @@
 {
   "schema_version": "2.0",
   "loop_status": "submitted",
-  "loop_count": 5,
+  "loop_count": 6,
   "max_loops": 15,
-  "loop_start_time": "2026-03-22T08:30:00",
-  "current_pbs_job_id": "3925521.pbs",
-  "current_loop_label": "loop5_pos_weight_fix",
-  "current_loop_script": "~/subs/auto_loop5_pos_weight_fix.sh",
+  "loop_start_time": "2026-03-22T10:00:00",
+  "current_pbs_job_id": "",
+  "current_loop_label": "loop6_chi2_quality_cut",
+  "current_loop_script": "~/subs/auto_loop6_chi2_quality_cut.sh",
   "research_branch": "auto-research-transformer-convergence",
   "last_eval_results": {
-    "loop4_fix_clusters": {
-      "track_efficiency": 0.0,
-      "fake_rate": 0.0,
-      "mean_rms": null,
-      "n_kept": 0,
-      "root_cause": "BCELoss gradient imbalance: with 1:100 balanced batch, positive edge equilibrium score ~0.24 (not 0.5). AUC=0.977 proves model has discriminative power but scores never exceed 0.5 threshold."
+    "loop5_pos_weight_fix": {
+      "track_efficiency": 0.8295,
+      "fake_rate": 0.3714,
+      "mean_rms": 0.0072,
+      "n_kept": 1548,
+      "n_truth": 1173,
+      "n_matched": 973,
+      "root_cause": "threshold=0.1 too permissive; all 575 fake tracks are n_layers=4 with chi2 >> real tracks. chi2<7e-5 expected to achieve goal."
     }
   },
   "stop_requested": false,
   "goal_achieved": false,
   "error_state": null,
-  "last_updated": "2026-03-22T08:30:00",
-  "last_updated_by": "claude-auto-loop5"
+  "last_updated": "2026-03-22T10:00:00",
+  "last_updated_by": "claude-auto-loop6"
 }
