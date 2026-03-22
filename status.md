@@ -35,7 +35,7 @@ chi2 < 7e-5 的轨迹质量筛选可将 loop5 模型的 fake_rate 从 37% 降到
 
 | 字段 | 值 |
 |------|-----|
-| 作业 ID | 提交中... |
+| 作业 ID | **3925762.pbs** |
 | 脚本 | ~/subs/auto_loop6_chi2_quality_cut.sh |
 | 变更 | 无新训练，使用 loop5 checkpoint + chi2 < 7e-5 质量筛选 |
 | 推理阈值 | 0.1（同 loop5）|
