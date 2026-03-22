@@ -7,6 +7,8 @@ Non-ML (run on test only):
 
 ML (train on train, evaluate on test):
   - MLP, GNN (ResGNN), InteractionNet, EggNet, HGNN
+  - TransformerEdgeClassifier (edge classifier, balanced sampling)
+  - TrackFormer (two-stage: HitFilter + MaskFormer)
 
 Usage:
     cd /Users/IvanTang/hep/E320simulator
@@ -45,7 +47,9 @@ TEST_CLUSTERS  = SIM_DIR / "sim_clusters_test.parquet"
 TEST_TRACKS    = SIM_DIR / "sim_tracks_test.parquet"
 
 # ML model types to benchmark
-ML_MODELS = ["mlp", "gnn", "interaction_net", "eggnet", "hgnn", "transformer"]
+# "transformer_edge" = TransformerEdgeClassifier (edge classifier, balanced sampling)
+# "trackformer"      = TrackFormer two-stage (HitFilter + MaskFormer)
+ML_MODELS = ["mlp", "gnn", "interaction_net", "eggnet", "hgnn", "transformer_edge", "trackformer"]
 
 
 # ── Training helper ───────────────────────────────────────────────────────────
@@ -58,6 +62,8 @@ def train_ml_model(
     n_epochs: int = 50,
     force: bool = False,
     embedder_checkpoint: str | None = None,
+    balanced_sampling: bool = False,
+    neg_pos_ratio: int = 100,
 ) -> str:
     """Build edges, train model, and save checkpoint.  Returns checkpoint path."""
     ckpt_path = checkpoint_dir / "best_model.pt"
@@ -79,6 +85,8 @@ def train_ml_model(
         device              = device,
         checkpoint_dir      = str(checkpoint_dir),
         embedder_checkpoint = embedder_checkpoint,
+        balanced_sampling   = balanced_sampling,
+        neg_pos_ratio       = neg_pos_ratio,
     )
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     train(edges_df, cfg)
@@ -158,8 +166,39 @@ def main(
         ckpt_dir  = RUNS_DIR / model_type
         ckpt_path = str(ckpt_dir / "best_model.pt")
 
+        # ── TransformerEdgeClassifier: edge classifier with balanced sampling ──
+        if model_type == "transformer_edge":
+            t0 = time.perf_counter()
+            try:
+                ckpt_path = train_ml_model(
+                    "transformer", clusters_train, ckpt_dir,
+                    device=device, n_epochs=epochs, force=force_retrain,
+                    balanced_sampling=True, neg_pos_ratio=100,
+                )
+            except Exception as e:
+                print(f"  [ERROR] training failed: {e}")
+                continue
+            train_dt = time.perf_counter() - t0
+
+            t0 = time.perf_counter()
+            try:
+                result = run_edge_classifier_reco(
+                    clusters_test, tracks_test, ckpt_path,
+                    threshold=0.1, device=device,
+                )
+            except Exception as e:
+                print(f"  [ERROR] inference failed: {e}")
+                continue
+            infer_dt = time.perf_counter() - t0
+
+            out = OUT_DIR / f"{model_type}_test.parquet"
+            result.write_parquet(out)
+            reco_paths[model_type.upper()] = str(out)
+            print(f"  → {out}  (train {train_dt:.0f}s  infer {infer_dt:.1f}s)")
+            continue
+
         # ── TrackFormer: two-stage train + infer path ─────────────────────
-        if model_type == "transformer":
+        if model_type == "trackformer":
             ckpt_dir.mkdir(parents=True, exist_ok=True)
             hf_ckpt_path = str(ckpt_dir / "hit_filter.pt")
             tf_ckpt_path = str(ckpt_dir / "best_model.pt")
