@@ -158,5 +158,52 @@ fake_rate 偏高（但这比 efficiency=0 要好得多）。
 提交时间: 2026-03-22T03:00
 
 ---
+### 实际结果（Loop 4 填入）
+- efficiency: N/A（训练未运行）| fake_rate: N/A | mean_rms: N/A
+- 评估: **PBS 脚本有 3 个严重 bug 导致作业在训练阶段立即失败**：
+  1. 训练命令缺少 `--clusters` 参数（`train.py` 直接报错退出）
+  2. eval 步骤用 `--checkpoint` 而非 `--edge-checkpoint`（argparse 不认识该参数）
+  3. eval 步骤用相对路径 `sim_clusters_test.parquet` 且缺少 `--tracks`；预期输出为 parquet 但脚本等待 JSON
+
+  balanced sampling 架构代码本身正确，训练从未开始，假设仍未验证。
+
+---
+
+## Loop 4 — 2026-03-22T07:30
+
+### 上轮结果回顾
+- efficiency: N/A（训练从未运行，PBS 脚本 bug） | fake_rate: N/A | mean_rms: N/A
+- 评估: Loop 3 PBS 脚本有 3 处 bug（缺 --clusters、错误的 --checkpoint 参数名、eval 路径问题），balanced sampling 假设从未被验证，代码本身无问题。
+
+### 当前假设
+如果修复 Loop 3 的 3 个 PBS 脚本 bug（添加 --clusters 到训练命令、改 --checkpoint 为 --edge-checkpoint、添加 --tracks 并用绝对路径），用已实现的 balanced sampling（BCELoss + 1:100 pos:neg 比例）训练 200 epochs，efficiency 应从 0% 提升到 >30%，因为：
+1. 模型已有强排序能力（Loop 2 AUC=0.976），唯一失败原因是得分校准（所有得分 < 0.5）
+2. BCELoss 在 1:100 平衡批次中正边提供足够梯度，强迫正边得分 > 0.5
+3. Layer-stratified attention 架构正确（Loop 1 代码验证通过），训练从未失败过
+
+**风险**：balanced sampling（1:100）在推理时（真实 1:50000 比例）可能导致 fake_rate 偏高（模型以为 1% 边是正的），但这比 efficiency=0 好得多；可在后续循环调整阈值。
+
+### 代码修改
+- 无（src/ 代码无变更，所有修改均在 PBS 脚本层面）
+
+### PBS 脚本修复
+- `~/subs/auto_loop4_fix_clusters.sh`：
+  1. 训练：添加 `--clusters /storage/agrp/yiwen/data_Run502/simulation/sim_clusters_train.parquet`
+  2. eval：`--edge-checkpoint`（不是 `--checkpoint`），添加 `--tracks` 绝对路径
+  3. 评估输出：从 reco parquet 提取 efficiency/fake_rate/rms 并写入 eval_results.json
+
+### 预期结果
+- efficiency: >30%（正边得分 > 0.5，n_kept > 0）
+- fake_rate: 可能偏高（10-60%），因模型在 1:100 平衡数据上校准而非真实 0.002% 先验
+- 训练 loss: 从 ~0.69（BCE 初始）快速下降
+
+### PBS 作业
+脚本: ~/subs/auto_loop4_fix_clusters.sh
+训练参数: clusters=sim_clusters_train.parquet, max_events=2000, balanced_sampling=True,
+         neg_pos_ratio=100, d_model=64, n_heads=4, n_encoder_layers=2, dim_feedforward=256,
+         dropout=0.0, warmup_epochs=10, epochs=200, lr=1e-3, BCELoss
+提交时间: 2026-03-22T07:30
+
+---
 ### 实际结果（下轮填入）
 （待填）
