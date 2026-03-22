@@ -2,9 +2,20 @@
 
 ## 当前阶段
 
-**阶段**：Benchmark 全部完成，所有方法已有完整定量结果
-**时间**：2026年3月20日
-**状态**：Benchmark `3914621.pbs`（去掉 `--force-retrain`）成功完成。非 ML + 全部 ML 模型推理结果已获得。InteractionNet 是现有最优 ML 模型，Transformer 和 EggNet 需要重新训练。
+**阶段**：TransformerEdgeClassifier 自主研究完成，目标达成
+**时间**：2026年3月22日
+**状态**：Loop 7 完成，TransformerEdgeClassifier 最终 efficiency=82.01%，fake_rate=11.66%，正式超越 InteractionNet（70.6% / 14.3%）。
+
+### 自主研究最终结果（2026-03-22，Loop 7）
+
+| 方法 | 径迹效率 | 误判率 | Mean RMS | 备注 |
+|------|----------|--------|----------|------|
+| **TransformerEdgeClassifier** | **82.01%** | **11.66%** | **4.634 µm** | ★ **新最优** — 自主研究 Loop 5+7（chi2筛选）|
+| InteractionNet | 70.6% | 14.3% | 4.09 µm | 原最优 ML |
+| Baseline | 74.3% | 42.5% | 4.73 µm | 非 ML 基线 |
+
+最优 checkpoint：`/storage/agrp/yiwen/runs/loop5_pos_weight_fix/best_model.pt`
+推理配置：`--edge-threshold 0.1`，后处理 `chi2 < 7e-5`
 
 ---
 
