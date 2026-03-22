@@ -4,7 +4,7 @@
   "loop_count": 4,
   "max_loops": 15,
   "loop_start_time": "2026-03-22T07:30:00",
-  "current_pbs_job_id": "",
+  "current_pbs_job_id": "3925318.pbs",
   "current_loop_label": "loop4_fix_clusters",
   "current_loop_script": "~/subs/auto_loop4_fix_clusters.sh",
   "research_branch": "auto-research-transformer-convergence",

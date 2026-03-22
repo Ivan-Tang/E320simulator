@@ -32,7 +32,7 @@
 
 | 字段 | 值 |
 |------|-----|
-| 作业 ID | （等待 qsub） |
+| 作业 ID | **3925318.pbs** |
 | 脚本 | ~/subs/auto_loop4_fix_clusters.sh |
 | 训练参数 | clusters=sim_clusters_train.parquet, max_events=2000, balanced_sampling=True, neg_pos_ratio=100, d_model=64, 2层, dim_ff=256, warmup=10, epochs=200, lr=1e-3, BCELoss |
 | 输出目录 | /storage/agrp/yiwen/runs/loop4_fix_clusters/ |
