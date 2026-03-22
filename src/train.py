@@ -38,7 +38,9 @@ from src.utils import (
     EDGE_FEAT_COLS,
     NODE_DIM,
     NODE_FEAT_COLS_SRC,
+    ParquetEdgeSource,
     build_labeled_edges_from_sim,
+    build_edges_to_parquet,
     edge_label_stats,
     event_to_tensors,
 )
@@ -189,13 +191,46 @@ def _build_model(cfg: TrainConfig, node_dim: int = NODE_DIM) -> nn.Module:
 def _compute_normalisation(
     train_df: pl.DataFrame,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute per-feature mean/std from training edges."""
+    """Compute per-feature mean/std from training edges (in-memory path)."""
     node_np = train_df.select(NODE_FEAT_COLS_SRC).to_numpy(allow_copy=True).astype(np.float32)
     edge_np = train_df.select(EDGE_FEAT_COLS).to_numpy(allow_copy=True).astype(np.float32)
     node_mean = torch.tensor(node_np.mean(0), dtype=torch.float32)
     node_std  = torch.tensor(node_np.std(0).clip(1e-6), dtype=torch.float32)
     edge_mean = torch.tensor(edge_np.mean(0), dtype=torch.float32)
     edge_std  = torch.tensor(edge_np.std(0).clip(1e-6), dtype=torch.float32)
+    return node_mean, node_std, edge_mean, edge_std
+
+
+def _compute_normalisation_from_parquet(
+    edges_dir: Path,
+    train_eids: set[int],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute per-feature mean/std via streaming scan (parquet path).
+
+    Uses Polars lazy scan so the full dataset is never loaded into RAM.
+    """
+    all_cols = NODE_FEAT_COLS_SRC + EDGE_FEAT_COLS
+    lf = pl.scan_parquet(edges_dir / "chunk_*.parquet")
+    lf = lf.filter(pl.col("event_id").is_in(list(train_eids)))
+    stats = lf.select(
+        *[pl.col(c).mean().alias(f"{c}_mean") for c in all_cols],
+        *[pl.col(c).std().alias(f"{c}_std")   for c in all_cols],
+    ).collect()
+
+    def _t(names: list[str], suffix: str) -> torch.Tensor:
+        vals = [float(stats[f"{c}_{suffix}"][0] or 0.0) for c in names]
+        return torch.tensor(vals, dtype=torch.float32)
+
+    node_mean = _t(NODE_FEAT_COLS_SRC, "mean")
+    node_std  = torch.tensor(
+        [max(float(stats[f"{c}_std"][0] or 0.0), 1e-6) for c in NODE_FEAT_COLS_SRC],
+        dtype=torch.float32,
+    )
+    edge_mean = _t(EDGE_FEAT_COLS, "mean")
+    edge_std  = torch.tensor(
+        [max(float(stats[f"{c}_std"][0] or 0.0), 1e-6) for c in EDGE_FEAT_COLS],
+        dtype=torch.float32,
+    )
     return node_mean, node_std, edge_mean, edge_std
 
 
@@ -217,18 +252,30 @@ def _normalise(
 
 def _evaluate(
     model: nn.Module,
-    df: pl.DataFrame,
     device: torch.device,
     node_mean: torch.Tensor,
     node_std: torch.Tensor,
     edge_mean: torch.Tensor,
     edge_std: torch.Tensor,
     embedder_info: dict | None = None,
+    df: pl.DataFrame | None = None,
+    edge_source: ParquetEdgeSource | None = None,
+    event_ids: list[int] | None = None,
 ) -> dict[str, float]:
+    """Evaluate edge classifier.  Accepts either an in-memory DataFrame or a
+    ParquetEdgeSource (with an optional list of event IDs to evaluate)."""
     model.eval()
     all_scores, all_labels = [], []
+
+    if df is not None:
+        event_iter = ((eid, ev_df) for eid, ev_df in df.group_by("event_id"))
+    elif edge_source is not None:
+        event_iter = edge_source.iter_events(event_ids)
+    else:
+        raise ValueError("Either df or edge_source must be provided to _evaluate()")
+
     with torch.no_grad():
-        for _, ev_df in df.group_by("event_id"):
+        for _, ev_df in event_iter:
             nf, ei, ef, lab, _ = event_to_tensors(ev_df)
             if embedder_info is not None:
                 nf = _augment_with_embedder(nf, embedder_info)
@@ -250,17 +297,24 @@ def _evaluate(
 # ──────────────────────────────────────────────────────────────────────────────
 
 def train(
-    edges_df: pl.DataFrame,
+    edges_df: pl.DataFrame | None = None,
     cfg: TrainConfig | None = None,
+    *,
+    edges_dir: str | Path | None = None,
 ) -> dict:
     """Train an edge-classification model and return results dict.
 
     Parameters
     ----------
     edges_df:
-        Output of ``build_labeled_edges_from_sim``.
+        Output of ``build_labeled_edges_from_sim`` (in-memory path).
+        Mutually exclusive with ``edges_dir``.
     cfg:
         Training hyper-parameters.  Defaults to ``TrainConfig()``.
+    edges_dir:
+        Directory of parquet chunk files produced by
+        ``build_edges_to_parquet`` (low-memory path for large datasets).
+        Mutually exclusive with ``edges_df``.
 
     Returns
     -------
@@ -271,7 +325,21 @@ def train(
         edge_mean/std  – normalisation tensors
         best_ap        – best validation Average Precision
         checkpoint     – path to saved checkpoint (or None)
+        train_eids     – set of training event IDs
+        val_eids       – set of validation event IDs
     """
+    if edges_df is None and edges_dir is None:
+        raise ValueError("Provide either edges_df or edges_dir")
+    if edges_df is not None and edges_dir is not None:
+        raise ValueError("Provide edges_df OR edges_dir, not both")
+
+    use_parquet = edges_dir is not None
+    if use_parquet:
+        edges_dir = Path(edges_dir)
+        edge_source = ParquetEdgeSource(edges_dir)
+    else:
+        edge_source = None
+
     if cfg is None:
         cfg = TrainConfig()
 
@@ -282,29 +350,43 @@ def train(
     print(f"[train] device={device}  model={cfg.model_type}  epochs={cfg.n_epochs}  seed={cfg.seed}")
 
     # ── train / val split ────────────────────────────────────────────────────
-    all_events = np.array(edges_df["event_id"].unique().sort().to_numpy(), copy=True)
+    if use_parquet:
+        all_events = edge_source.event_ids.copy()
+    else:
+        all_events = np.array(edges_df["event_id"].unique().sort().to_numpy(), copy=True)
     rng = np.random.default_rng(cfg.seed)
     rng.shuffle(all_events)
     n_train = int(len(all_events) * (1 - cfg.val_fraction))
     train_eids = set(all_events[:n_train].tolist())
     val_eids   = set(all_events[n_train:].tolist())
 
-    train_df = edges_df.filter(pl.col("event_id").is_in(list(train_eids)))
-    val_df   = edges_df.filter(pl.col("event_id").is_in(list(val_eids)))
+    if use_parquet:
+        stats = edge_source.compute_edge_label_stats(train_eids | val_eids)
+        train_df = None
+        val_df   = None
+    else:
+        train_df = edges_df.filter(pl.col("event_id").is_in(list(train_eids)))
+        val_df   = edges_df.filter(pl.col("event_id").is_in(list(val_eids)))
+        stats = edge_label_stats(edges_df)
 
-    stats = edge_label_stats(edges_df)
     print(f"[train] total edges={stats['n_total']:,}  "
           f"pos={stats['n_positive']}  "
           f"pos_frac={stats['positive_fraction']:.5f}")
     print(f"[train] train events={len(train_eids)}  val events={len(val_eids)}")
 
-    # per-split positive counts
-    n_pos_train = int(train_df.filter(pl.col("edge_label") == 1).height)
-    n_pos_val = int(val_df.filter(pl.col("edge_label") == 1).height)
-    print(f"[train] pos_train={n_pos_train}  pos_val={n_pos_val}")
+    if not use_parquet:
+        n_pos_train = int(train_df.filter(pl.col("edge_label") == 1).height)
+        n_pos_val   = int(val_df.filter(pl.col("edge_label") == 1).height)
+        print(f"[train] pos_train={n_pos_train}  pos_val={n_pos_val}")
 
     # ── normalisation ────────────────────────────────────────────────────────
-    node_mean, node_std, edge_mean, edge_std = _compute_normalisation(train_df)
+    if use_parquet:
+        print("[train] computing normalisation stats via streaming scan …")
+        node_mean, node_std, edge_mean, edge_std = _compute_normalisation_from_parquet(
+            edges_dir, train_eids
+        )
+    else:
+        node_mean, node_std, edge_mean, edge_std = _compute_normalisation(train_df)
 
     # ── pretrained embedder (two-stage pipeline) ─────────────────────────────
     embedder_info = _load_embedder(cfg)
@@ -339,12 +421,24 @@ def train(
     best_path: Path | None = None
     t0 = time.time()
 
+    # Pre-compute shuffled train event list for epoch-level randomness (parquet path)
+    train_eids_list = sorted(train_eids)
+    val_eids_list   = sorted(val_eids)
+
     for epoch in range(1, cfg.n_epochs + 1):
         model.train()
         epoch_loss = 0.0
         n_batches  = 0
 
-        for _, ev_df in train_df.group_by("event_id"):
+        # Shuffle training event order each epoch for SGD diversity
+        rng.shuffle(train_eids_list)
+
+        if use_parquet:
+            epoch_event_iter = edge_source.iter_events(train_eids_list)
+        else:
+            epoch_event_iter = ((eid, ev_df) for eid, ev_df in train_df.group_by("event_id"))
+
+        for _, ev_df in epoch_event_iter:
             nf, ei, ef, lab, _ = event_to_tensors(ev_df)
             if cfg.skip_zero_pos_events and lab.sum() == 0:
                 continue
@@ -382,9 +476,12 @@ def train(
         # ── validation ───────────────────────────────────────────────────────
         if epoch % cfg.log_every == 0 or epoch == 1 or epoch == cfg.n_epochs:
             metrics = _evaluate(
-                model, val_df, device,
+                model, device,
                 node_mean, node_std, edge_mean, edge_std,
                 embedder_info=embedder_info,
+                df=val_df if not use_parquet else None,
+                edge_source=edge_source if use_parquet else None,
+                event_ids=val_eids_list if use_parquet else None,
             )
             row.update(metrics)
             elapsed = time.time() - t0
@@ -429,6 +526,9 @@ def train(
         "edge_std":   edge_std,
         "best_ap":    best_ap,
         "checkpoint": str(best_path) if best_path else None,
+        "train_eids": train_eids,
+        "val_eids":   val_eids,
+        # Kept for backward compatibility when using in-memory path
         "train_df":   train_df,
         "val_df":     val_df,
     }
@@ -488,6 +588,7 @@ def train_model(
     task: Literal["edge", "embedder"] = "edge",
     edge_cfg: TrainConfig | None = None,
     embed_cfg: EmbedderTrainConfig | None = None,
+    edges_dir: str | Path | None = None,
 ) -> dict:
     """Unified programmatic training API.
 
@@ -498,8 +599,18 @@ def train_model(
     task:
         - ``edge``: build candidate edges and train edge classifier.
         - ``embedder``: build hit pairs and train metric-learning embedder.
+    edges_dir:
+        Optional pre-built parquet edge directory (avoids OOM for large
+        datasets).  If provided for task="edge", ``clusters_df`` is used only
+        to build edges when the directory does not yet exist.
     """
     if task == "edge":
+        if edges_dir is not None:
+            edges_dir = Path(edges_dir)
+            if not edges_dir.exists() or not any(edges_dir.glob("chunk_*.parquet")):
+                build_edges_to_parquet(clusters_df, edges_dir,
+                                       cfg=edge_cfg and getattr(edge_cfg, "_baseline_cfg", None))
+            return train(cfg=edge_cfg, edges_dir=edges_dir)
         edges_df = build_labeled_edges_from_sim(clusters_df)
         return train(edges_df, edge_cfg)
 
@@ -514,9 +625,18 @@ def train_model(
 
 def _cli() -> None:
     parser = argparse.ArgumentParser(description="Unified trainer for edge models and embedder")
-    parser.add_argument("--clusters", required=True, help="Path to sim_clusters.parquet")
+    parser.add_argument("--clusters", default=None,
+                        help="Path to sim_clusters.parquet (required unless --edges-dir is given)")
     parser.add_argument("--task", default="edge", choices=["edge", "embedder"],
                         help="Training task: edge classifier or hit embedder")
+
+    # parquet edge cache options (avoids OOM for large datasets)
+    parser.add_argument("--edges-dir", default=None,
+                        help="Pre-built edges parquet directory (skips edge building, trains directly)")
+    parser.add_argument("--build-edges-to", default=None,
+                        help="Build edges to this directory then train from it (low-memory path)")
+    parser.add_argument("--chunk-size", type=int, default=200,
+                        help="Events per parquet chunk when using --build-edges-to (default=200)")
 
     # edge-model options
     parser.add_argument("--model",    default="gnn", choices=["gnn", "mlp", "interaction_net", "eggnet", "hgnn"],
@@ -542,28 +662,57 @@ def _cli() -> None:
     parser.add_argument("--checkpoint", default=None, help="Directory to save checkpoints")
     parser.add_argument("--embedder-checkpoint", default=None,
                         help="Path to pretrained embedder .pt for node feature augmentation")
+    parser.add_argument("--max-events", type=int, default=0,
+                        help="Limit to N events when building edges (0=all)")
     args = parser.parse_args()
 
-    clusters_df = pl.read_parquet(args.clusters)
-    print(f"[cli] loaded {len(clusters_df):,} clusters")
+    cfg = TrainConfig(
+        model_type       = args.model,
+        n_epochs         = args.epochs,
+        hidden           = args.hidden,
+        n_mp             = args.n_mp,
+        n_gnns_per_iter  = args.n_gnns_per_iter,
+        recurrent        = not args.no_recurrent,
+        lr               = args.lr,
+        val_fraction     = args.val_fraction,
+        device           = args.device,
+        checkpoint_dir   = args.checkpoint,
+        embedder_checkpoint = args.embedder_checkpoint,
+    )
 
     if args.task == "edge":
+        # ── Path A: use pre-built parquet edges directory ─────────────────────
+        if args.edges_dir:
+            print(f"[cli] loading edges from parquet dir: {args.edges_dir}")
+            train(cfg=cfg, edges_dir=args.edges_dir)
+            return
+
+        # ── Path B: build edges to disk then train from parquet ───────────────
+        if args.build_edges_to:
+            if not args.clusters:
+                parser.error("--clusters is required when using --build-edges-to")
+            clusters_df = pl.read_parquet(args.clusters)
+            print(f"[cli] loaded {len(clusters_df):,} clusters")
+            if args.max_events > 0:
+                eids = clusters_df["event_id"].unique().sort().head(args.max_events)
+                clusters_df = clusters_df.filter(pl.col("event_id").is_in(eids))
+                print(f"[cli] limited to {len(clusters_df):,} clusters ({args.max_events} events)")
+            build_edges_to_parquet(clusters_df, args.build_edges_to,
+                                   chunk_size=args.chunk_size)
+            train(cfg=cfg, edges_dir=args.build_edges_to)
+            return
+
+        # ── Path C: classic in-memory build + train ───────────────────────────
+        if not args.clusters:
+            parser.error("--clusters is required (or use --edges-dir / --build-edges-to)")
+        clusters_df = pl.read_parquet(args.clusters)
+        print(f"[cli] loaded {len(clusters_df):,} clusters")
+        if args.max_events > 0:
+            eids = clusters_df["event_id"].unique().sort().head(args.max_events)
+            clusters_df = clusters_df.filter(pl.col("event_id").is_in(eids))
+            print(f"[cli] limited to {len(clusters_df):,} clusters ({args.max_events} events)")
         edges_df = build_labeled_edges_from_sim(clusters_df)
         print(f"[cli] built {len(edges_df):,} candidate edges")
-
-        cfg = TrainConfig(
-            model_type       = args.model,
-            n_epochs         = args.epochs,
-            hidden           = args.hidden,
-            n_mp             = args.n_mp,
-            n_gnns_per_iter  = args.n_gnns_per_iter,
-            recurrent        = not args.no_recurrent,
-            lr               = args.lr,
-            val_fraction     = args.val_fraction,
-            device           = args.device,
-            checkpoint_dir   = args.checkpoint,
-            embedder_checkpoint = args.embedder_checkpoint,
-        )
         train(edges_df, cfg)
         return
 
