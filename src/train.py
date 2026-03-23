@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -572,8 +573,16 @@ def _cli() -> None:
                         help="Accumulate gradients over N events before optimizer step (DDP / memory)")
     args = parser.parse_args()
 
+    # Stagger data loading across DDP ranks to avoid concurrent Lustre reads
+    # triggering a Polars group_by assertion failure (left=0 right=35M).
+    _ddp_rank = int(os.environ.get("RANK", "0"))
+    if _ddp_rank > 0:
+        _stagger = _ddp_rank * 30
+        print(f"[cli] rank {_ddp_rank}: sleeping {_stagger}s to stagger Lustre reads", flush=True)
+        time.sleep(_stagger)
+
     clusters_df = pl.read_parquet(args.clusters)
-    print(f"[cli] loaded {len(clusters_df):,} clusters")
+    print(f"[cli] loaded {len(clusters_df):,} clusters", flush=True)
 
     if args.task == "edge":
         edges_df = build_labeled_edges_from_sim(clusters_df)
