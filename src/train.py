@@ -573,20 +573,29 @@ def _cli() -> None:
                         help="Accumulate gradients over N events before optimizer step (DDP / memory)")
     args = parser.parse_args()
 
-    # Stagger data loading across DDP ranks to avoid concurrent Lustre reads
-    # triggering a Polars group_by assertion failure (left=0 right=35M).
-    _ddp_rank = int(os.environ.get("RANK", "0"))
-    if _ddp_rank > 0:
-        _stagger = _ddp_rank * 30
-        print(f"[cli] rank {_ddp_rank}: sleeping {_stagger}s to stagger Lustre reads", flush=True)
-        time.sleep(_stagger)
+    # In DDP mode: rank 0 builds the edge table and writes a temp parquet;
+    # other ranks wait at a barrier then read the pre-built file.
+    # This avoids concurrent Lustre reads + Polars group_by triggering an
+    # internal assertion failure, and cuts edge-building work to 1× instead of N×.
+    rank, world_size, is_ddp = ddp.setup_ddp()
 
     clusters_df = pl.read_parquet(args.clusters)
-    print(f"[cli] loaded {len(clusters_df):,} clusters", flush=True)
+    print(f"[cli] rank {rank}: loaded {len(clusters_df):,} clusters", flush=True)
 
     if args.task == "edge":
-        edges_df = build_labeled_edges_from_sim(clusters_df)
-        print(f"[cli] built {len(edges_df):,} candidate edges")
+        _edge_cache = os.environ.get("DDP_INIT_METHOD", "").replace("file://", "") + "_edges.parquet"
+        if is_ddp:
+            if rank == 0:
+                edges_df = build_labeled_edges_from_sim(clusters_df)
+                print(f"[cli] rank 0: built {len(edges_df):,} edges → {_edge_cache}", flush=True)
+                edges_df.write_parquet(_edge_cache)
+            dist.barrier()  # all ranks wait for rank 0 to finish writing
+            if rank != 0:
+                edges_df = pl.read_parquet(_edge_cache)
+                print(f"[cli] rank {rank}: loaded {len(edges_df):,} edges from cache", flush=True)
+        else:
+            edges_df = build_labeled_edges_from_sim(clusters_df)
+            print(f"[cli] built {len(edges_df):,} candidate edges", flush=True)
 
         cfg = TrainConfig(
             model_type       = args.model,
@@ -603,6 +612,8 @@ def _cli() -> None:
             gradient_accumulation_steps = args.gradient_accumulation_steps,
         )
         train(edges_df, cfg)
+        if is_ddp and rank == 0 and os.path.exists(_edge_cache):
+            os.remove(_edge_cache)
         return
 
     embed_cfg = EmbedderTrainConfig(
