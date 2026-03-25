@@ -53,7 +53,8 @@ def setup_ddp() -> tuple[int, int, bool]:
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
     init_method = os.environ.get("DDP_INIT_METHOD", "env://")
-    dist.init_process_group(backend="nccl", init_method=init_method)
+    dist.init_process_group(backend="nccl", init_method=init_method,
+                            rank=rank, world_size=world_size)
     return rank, world_size, True
 
 
