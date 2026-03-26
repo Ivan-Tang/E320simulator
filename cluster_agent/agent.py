@@ -40,6 +40,12 @@ SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 SLACK_APP_TOKEN = os.environ["SLACK_APP_TOKEN"]
 SLACK_CHANNEL_ID = os.environ.get("SLACK_CHANNEL_ID", "")
 NOTIFY_EMAIL = os.environ.get("NOTIFY_EMAIL", "")
+LOGS_DIR = Path("/srv01/agrp/yiwen/logs")
+
+# 用户白名单：只有列出的 Slack User ID 可以使用 agent
+# 格式：ALLOWED_USER_IDS=U123456,U789ABC（逗号分隔，留空则不限制）
+_raw_ids = os.environ.get("ALLOWED_USER_IDS", "").strip()
+ALLOWED_USER_IDS: set[str] = {uid.strip() for uid in _raw_ids.split(",") if uid.strip()}
 
 MAX_CHUNK = 3800   # Slack 单条消息字符上限（留缓冲）
 MONITOR_INTERVAL = 60  # 状态轮询间隔（秒）
@@ -132,6 +138,11 @@ HELP_TEXT = """*E320 Research Agent — 命令列表*
 `!stop`               优雅停止 watcher（当前作业完成后停止）
 `!kill`               紧急停止（终止 watcher + 取消 PBS 作业）
 
+*系统管理*
+`!shell "cmd"`        直接执行 shell 命令
+`!update`             git pull + 自动重启 agent
+`!help`               显示此帮助
+
 *Claude CLI*
 其他任何文本 → 交给 Claude 处理（可讨论目标、分析结果、修改代码等）"""
 
@@ -219,6 +230,30 @@ def handle_command(text: str, say):
         out = run_shell(f"bash {PROJ_DIR}/stop_research.sh", timeout=30)
         say_long(say, f"```\n{out}\n```")
 
+    elif text.startswith("!shell"):
+        cmd = text[6:].strip().strip('"\'')
+        if not cmd:
+            say("用法：`!shell \"命令\"`")
+        else:
+            say(f"▶ `{cmd}`")
+            out = run_shell(cmd, cwd=str(PROJ_DIR), timeout=60)
+            say_long(say, f"```\n{out}\n```")
+
+    elif text == "!update":
+        say("🔄 正在后台拉取最新代码，约 10 秒后重启…")
+        script = (
+            f"sleep 3 && "
+            f"cd {PROJ_DIR} && git pull && "
+            f"bash {PROJ_DIR}/cluster_agent/stop_agent.sh && "
+            f"bash {PROJ_DIR}/cluster_agent/start_agent.sh"
+        )
+        subprocess.Popen(
+            ["bash", "-c", script],
+            start_new_session=True,
+            stdout=open(LOGS_DIR / "agent_update.log", "w"),
+            stderr=subprocess.STDOUT,
+        )
+
     else:
         # ── 自然语言 → Claude CLI ──
         run_claude_async(text, say)
@@ -226,11 +261,22 @@ def handle_command(text: str, say):
 
 # ── Slack 事件处理 ────────────────────────────────────────────────────────────
 
+def is_allowed(user_id: str) -> bool:
+    """检查用户是否在白名单中（白名单为空则允许所有人）。"""
+    if not ALLOWED_USER_IDS:
+        return True
+    return user_id in ALLOWED_USER_IDS
+
+
 @app.message(re.compile(r".*"))
 def handle_message(message, say):
     """处理所有直接消息（DM 或频道消息）。"""
     if message.get("bot_id"):
         return  # 忽略 bot 自己的消息
+    user_id = message.get("user", "")
+    if not is_allowed(user_id):
+        say(f"⛔ 用户 `{user_id}` 无权限使用此 agent。请联系管理员将你的 User ID 加入白名单。")
+        return
     text = message.get("text", "").strip()
     handle_command(text, say)
 
@@ -238,6 +284,10 @@ def handle_message(message, say):
 @app.event("app_mention")
 def handle_mention(event, say):
     """处理 @提及。"""
+    user_id = event.get("user", "")
+    if not is_allowed(user_id):
+        say(f"⛔ 用户 `{user_id}` 无权限。")
+        return
     text = event.get("text", "")
     text = re.sub(r"<@[A-Z0-9]+>", "", text).strip()
     handle_command(text, say)
