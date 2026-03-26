@@ -9,7 +9,7 @@
 #   2. 已在 .env 中填写 SLACK_BOT_TOKEN / SLACK_APP_TOKEN / SLACK_CHANNEL_ID
 # ============================================================
 
-set -euo pipefail
+set -eo pipefail
 
 PROJ_DIR="/srv01/agrp/yiwen/E320simulator"
 LOGS_DIR="/srv01/agrp/yiwen/logs"
@@ -44,8 +44,10 @@ fi
 # ── 激活 conda 并启动 ──
 echo "正在启动 E320 Research Agent..."
 
+set +u  # conda 内部脚本引用未定义变量，临时关闭 -u
 source /usr/wipp/conda/24.5.0/etc/profile.d/conda.sh
 conda activate e320root
+set -u
 
 mkdir -p "${LOGS_DIR}"
 cd "${PROJ_DIR}"
