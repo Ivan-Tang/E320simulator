@@ -116,17 +116,24 @@ def run_claude_async(message: str, say):
 
 HELP_TEXT = """*E320 Research Agent — 命令列表*
 
-`!help`               显示此帮助
+*查看状态*
 `!status`             查看 status.md（实时研究状态）
 `!log [N]`            最近 N 行 research_log.md（默认 80）
 `!state`              查看 experiment_state.json
 `!qstat`              PBS 作业队列状态
 `!jobs`               最近生成的 PBS 脚本
-`!start "目标" [N]`   启动 autoresearch（最大 N 轮，默认 15）
+
+*研究目标*
+`!goal`               查看当前 research_goal.md
+`!goal "内容"`        覆盖写入 research_goal.md（然后用 !start 启动）
+
+*控制研究循环*
+`!start "目标" [N]`   写入目标并启动 autoresearch（最大 N 轮，默认 15）
 `!stop`               优雅停止 watcher（当前作业完成后停止）
 `!kill`               紧急停止（终止 watcher + 取消 PBS 作业）
 
-其他任何文本 → 交给 Claude CLI 处理（全权限）"""
+*Claude CLI*
+其他任何文本 → 交给 Claude 处理（可讨论目标、分析结果、修改代码等）"""
 
 
 def handle_command(text: str, say):
@@ -161,6 +168,26 @@ def handle_command(text: str, say):
     elif text == "!jobs":
         out = run_shell("ls -lt ~/subs/auto_loop*.sh 2>/dev/null | head -15", cwd="/tmp", timeout=10)
         say(f"```\n{out}\n```")
+
+    elif text.startswith("!goal"):
+        arg_str = text[5:].strip()
+        goal_file = PROJ_DIR / "research_goal.md"
+
+        if not arg_str:
+            # !goal — 查看当前内容
+            out = run_shell(f"cat {goal_file}", timeout=5)
+            say_long(say, f"*当前 research_goal.md:*\n```\n{out}\n```")
+        else:
+            # !goal "内容" — 覆盖写入
+            try:
+                content = shlex.split(arg_str)[0]
+            except ValueError:
+                content = arg_str.strip('"\'')
+            try:
+                goal_file.write_text(content + "\n", encoding="utf-8")
+                say(f"✅ research_goal.md 已更新。\n```\n{content}\n```\n用 `!start \"{content[:30]}...\" [N]` 启动研究。")
+            except Exception as e:
+                say(f"❌ 写入失败: {e}")
 
     elif text.startswith("!start"):
         arg_str = text[6:].strip()
