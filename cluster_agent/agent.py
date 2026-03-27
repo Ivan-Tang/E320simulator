@@ -246,7 +246,7 @@ def handle_command(text: str, say):
         script = (
             f"sleep 3 && "
             f"cd {PROJ_DIR} && git pull && "
-            f"bash {PROJ_DIR}/cluster_agent/stop_agent.sh && "
+            f"pkill -f 'python.*agent.py' || true && sleep 2 && "
             f"bash {PROJ_DIR}/cluster_agent/start_agent.sh"
         )
         subprocess.Popen(
