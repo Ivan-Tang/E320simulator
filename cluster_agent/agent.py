@@ -186,17 +186,19 @@ def handle_command(text: str, say):
 
         if not arg_str:
             # !goal — 查看当前内容
+            branch = run_shell("git branch --show-current", timeout=5)
             out = run_shell(f"cat {goal_file}", timeout=5)
-            say_long(say, f"*当前 research_goal.md:*\n```\n{out}\n```")
+            say_long(say, f"*当前 research_goal.md* (branch: `{branch}`):\n```\n{out}\n```")
         else:
-            # !goal "内容" — 覆盖写入
+            # !goal "内容" — 切回 master 再写入
             try:
                 content = shlex.split(arg_str)[0]
             except ValueError:
                 content = arg_str.strip('"\'')
             try:
+                checkout_out = run_shell("git checkout master", timeout=10)
                 goal_file.write_text(content + "\n", encoding="utf-8")
-                say(f"✅ research_goal.md 已更新。\n```\n{content}\n```\n用 `!start \"{content[:30]}...\" [N]` 启动研究。")
+                say(f"✅ 已切到 master，research_goal.md 已更新。\n```\n{content}\n```\n用 `!start \"{content[:40]}\" [N]` 启动研究。")
             except Exception as e:
                 say(f"❌ 写入失败: {e}")
 
