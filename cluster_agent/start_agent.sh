@@ -52,7 +52,7 @@ set -u
 mkdir -p "${LOGS_DIR}"
 cd "${PROJ_DIR}"
 
-nohup python cluster_agent/agent.py > "${LOG_FILE}" 2>&1 &
+nohup env PYTHONUNBUFFERED=1 python cluster_agent/agent.py > "${LOG_FILE}" 2>&1 &
 AGENT_PID=$!
 echo "${AGENT_PID}" > "${PID_FILE}"
 
