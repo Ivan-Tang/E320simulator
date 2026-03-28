@@ -51,6 +51,8 @@ MAX_CHUNK = 3800       # Slack 单条消息字符上限（留缓冲）
 MONITOR_INTERVAL = 60  # 状态轮询间隔（秒）
 CLAUDE_TIMEOUT = 600   # claude --print 超时（秒）
 MAX_HISTORY_TURNS = 10 # 拉取 Slack 历史的最大轮数
+PBS_POLL_INTERVAL = 60 # qstat 轮询间隔（秒）
+PBS_USER = "yiwen"     # 监控的 PBS 用户名
 
 app = App(token=SLACK_BOT_TOKEN)
 
@@ -363,6 +365,92 @@ def handle_mention(event, say):
     handle_command(text, _threaded_say(say, thread_ts), channel=channel)
 
 
+# ── PBS 作业监控 ──────────────────────────────────────────────────────────────
+
+def _parse_qstat(output: str) -> dict[str, dict]:
+    """解析 qstat -u <user> 输出，返回 {job_id: {"name", "status", "queue"}}。"""
+    jobs = {}
+    lines = output.strip().splitlines()
+    # 跳过 header（前 5 行），之后每行是一个作业
+    for line in lines[5:]:
+        parts = line.split()
+        if len(parts) < 11:
+            continue
+        job_id = parts[0]          # e.g. 3925801.pbs
+        queue  = parts[2]          # e.g. gpuE
+        name   = parts[3]          # e.g. auto_loop7
+        status = parts[-2]         # S 列：Q/R/E/C/H
+        jobs[job_id] = {"name": name, "status": status, "queue": queue}
+    return jobs
+
+
+def _job_log_tail(name: str, lines: int = 5) -> str:
+    """尝试读取作业的 .out 日志末尾几行，失败则返回空字符串。"""
+    log_path = LOGS_DIR / f"{name}.out"
+    if not log_path.exists():
+        # 也试试 auto_ 前缀
+        log_path = LOGS_DIR / f"auto_{name}.out"
+    if not log_path.exists():
+        return ""
+    try:
+        result = subprocess.run(
+            ["tail", f"-{lines}", str(log_path)],
+            capture_output=True, text=True, timeout=5,
+        )
+        return result.stdout.strip()
+    except Exception:
+        return ""
+
+
+def monitor_pbs_jobs():
+    """后台线程：每 PBS_POLL_INTERVAL 秒轮询 qstat，状态变化时发 Slack 通知。"""
+    known: dict[str, dict] = {}
+    first_run = True
+
+    while True:
+        try:
+            result = subprocess.run(
+                ["qstat", "-u", PBS_USER],
+                capture_output=True, text=True, timeout=15,
+            )
+            current = _parse_qstat(result.stdout)
+
+            if first_run:
+                # 首次启动：静默记录当前状态，不发通知
+                known = current
+                first_run = False
+            else:
+                # 检测新作业 / 状态变化 / 作业消失
+                for jid, info in current.items():
+                    prev = known.get(jid)
+                    if prev is None:
+                        # 新入队
+                        post_to_channel(
+                            f"📋 PBS 作业 `{jid}` *{info['name']}* 已入队 (queue: {info['queue']})"
+                        )
+                    elif prev["status"] != info["status"] and info["status"] == "R":
+                        # 开始运行
+                        post_to_channel(
+                            f"▶️ PBS 作业 `{jid}` *{info['name']}* 开始运行"
+                        )
+
+                for jid, info in known.items():
+                    if jid not in current:
+                        # 作业消失（完成或失败）
+                        tail = _job_log_tail(info["name"])
+                        msg = f"✅ PBS 作业 `{jid}` *{info['name']}* 已结束"
+                        if tail:
+                            msg += f"\n```\n{tail[-800:]}\n```"
+                        post_to_channel(msg)
+
+                known = current
+
+        except Exception as e:
+            print(f"[pbs-monitor] 异常: {e}", file=sys.stderr)
+
+        time.sleep(PBS_POLL_INTERVAL)
+
+
 # ── 后台状态监控 ──────────────────────────────────────────────────────────────
 
 def monitor_experiment_state():
@@ -454,7 +542,8 @@ def main():
 
     # 启动后台监控线程
     threading.Thread(target=monitor_experiment_state, daemon=True, name="state-monitor").start()
-    print(f"[agent] 状态监控线程已启动（每 {MONITOR_INTERVAL}s 轮询）")
+    threading.Thread(target=monitor_pbs_jobs, daemon=True, name="pbs-monitor").start()
+    print(f"[agent] 监控线程已启动（state: {MONITOR_INTERVAL}s, PBS: {PBS_POLL_INTERVAL}s）")
 
     # 发送上线通知
     if SLACK_CHANNEL_ID:
