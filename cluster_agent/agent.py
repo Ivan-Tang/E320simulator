@@ -243,7 +243,7 @@ def handle_command(text: str, say, channel: str = ""):
             try:
                 content = shlex.split(arg_str)[0]
             except ValueError:
-                content = arg_str.strip('"\'')
+                content = arg_str.strip('"\'\u201c\u201d\u2018\u2019')
             try:
                 checkout_out = run_shell("git checkout master", timeout=10)
                 goal_file.write_text(content + "\n", encoding="utf-8")
@@ -282,9 +282,10 @@ def handle_command(text: str, say, channel: str = ""):
         say_long(say, f"```\n{out}\n```")
 
     elif text.startswith("!shell"):
-        cmd = text[6:].strip().strip('"\'')
+        # 去掉各种引号（ASCII 直引号 + Unicode 弯引号）
+        cmd = text[6:].strip().strip('"\'\u201c\u201d\u2018\u2019')
         if not cmd:
-            say("用法：`!shell \"命令\"`")
+            say("用法：`!shell 命令`（不需要加引号）")
         else:
             say(f"▶ `{cmd}`")
             out = run_shell(cmd, cwd=str(PROJ_DIR), timeout=60)
