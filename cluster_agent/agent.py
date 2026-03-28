@@ -50,14 +50,9 @@ ALLOWED_USER_IDS: set[str] = {uid.strip() for uid in _raw_ids.split(",") if uid.
 MAX_CHUNK = 3800       # Slack 单条消息字符上限（留缓冲）
 MONITOR_INTERVAL = 60  # 状态轮询间隔（秒）
 CLAUDE_TIMEOUT = 600   # claude --print 超时（秒）
-MAX_HISTORY_TURNS = 10 # 每个 session 最多保留的对话轮数
+MAX_HISTORY_TURNS = 10 # 拉取 Slack 历史的最大轮数
 
 app = App(token=SLACK_BOT_TOKEN)
-
-# ── 对话历史 (session_key → [{"role": "user"|"assistant", "text": "..."}])
-# session_key：thread_ts（thread 内继续对话）或 channel+ts（新消息开新会话）
-_history_lock = threading.Lock()
-conversation_history: dict[str, list] = {}
 
 
 # ── 工具函数 ─────────────────────────────────────────────────────────────────
@@ -99,37 +94,58 @@ def run_shell(cmd: str, cwd=None, timeout=30) -> str:
         return f"(错误: {e})"
 
 
-def _build_prompt(session_key: str, message: str) -> str:
-    """把历史对话拼成 Claude prompt。无历史时直接返回原消息。"""
-    with _history_lock:
-        history = conversation_history.get(session_key, [])
-    if not history:
-        return message
-    lines = ["以下是我们本次对话的历史记录：", ""]
-    for turn in history:
-        role = "用户" if turn["role"] == "user" else "助手"
-        lines.append(f"{role}: {turn['text']}")
-    lines += ["", "请基于以上上下文回复用户最新消息：", message]
+def _fetch_channel_history(channel: str) -> list[dict]:
+    """用 Slack API 拉取频道/DM 最近消息，时间正序返回。"""
+    try:
+        result = app.client.conversations_history(
+            channel=channel,
+            limit=MAX_HISTORY_TURNS * 2 + 1,  # 多取一条（当前消息本身会被排除）
+        )
+        msgs = result.get("messages", [])
+        return list(reversed(msgs))  # Slack 返回最新在前，翻转为时间正序
+    except Exception as e:
+        print(f"[agent] 拉取历史失败: {e}", file=sys.stderr)
+        return []
+
+
+def _build_prompt_from_slack(channel: str, current_text: str) -> str:
+    """从 Slack 历史构建带上下文的 Claude prompt。"""
+    msgs = _fetch_channel_history(channel)
+    if not msgs:
+        return current_text
+
+    history_lines = []
+    for msg in msgs:
+        text = msg.get("text", "").strip()
+        if not text:
+            continue
+        # 跳过 !命令 及其触发的 bot 回复（避免状态输出污染上下文）
+        if text.startswith("!"):
+            continue
+        is_bot = bool(msg.get("bot_id"))
+        # 跳过 bot 的 "⏳" 占位消息
+        if is_bot and text.startswith("⏳"):
+            continue
+        role = "助手" if is_bot else "用户"
+        history_lines.append(f"{role}: {text}")
+
+    # 最后一条是当前消息，排除（避免重复）
+    if history_lines and history_lines[-1] == f"用户: {current_text}":
+        history_lines = history_lines[:-1]
+
+    if not history_lines:
+        return current_text
+
+    lines = ["以下是我们最近的对话历史：", ""] + history_lines + \
+            ["", "请基于以上上下文回复用户最新消息：", current_text]
     return "\n".join(lines)
 
 
-def _append_history(session_key: str, role: str, text: str):
-    """向 session 历史追加一条记录，超出上限时丢弃最早的。"""
-    with _history_lock:
-        hist = conversation_history.setdefault(session_key, [])
-        hist.append({"role": role, "text": text})
-        # 按"轮"裁剪（一轮 = user + assistant），保留最近 MAX_HISTORY_TURNS 轮
-        if len(hist) > MAX_HISTORY_TURNS * 2:
-            conversation_history[session_key] = hist[-(MAX_HISTORY_TURNS * 2):]
-
-
-def run_claude_async(message: str, say, session_key: str = ""):
-    """在后台线程运行 claude --print，完成后将输出发回 Slack，并维护对话历史。"""
+def run_claude_async(message: str, say, channel: str = ""):
+    """在后台线程运行 claude --print，完成后将输出发回 Slack。"""
     def _worker():
         say("⏳ Claude 处理中，请稍候…")
-        prompt = _build_prompt(session_key, message)
-        if session_key:
-            _append_history(session_key, "user", message)
+        prompt = _build_prompt_from_slack(channel, message) if channel else message
         try:
             result = subprocess.run(
                 ["claude", "--print", "--dangerously-skip-permissions", prompt],
@@ -146,8 +162,6 @@ def run_claude_async(message: str, say, session_key: str = ""):
         except Exception as e:
             response = f"❌ 执行异常: {e}"
 
-        if session_key:
-            _append_history(session_key, "assistant", response)
         say_long(say, response)
 
     threading.Thread(target=_worker, daemon=True).start()
@@ -182,7 +196,7 @@ HELP_TEXT = """*E320 Research Agent — 命令列表*
 其他任何文本 → 交给 Claude 处理（可讨论目标、分析结果、修改代码等）"""
 
 
-def handle_command(text: str, say, session_key: str = ""):
+def handle_command(text: str, say, channel: str = ""):
     """根据文本路由到对应处理逻辑。"""
     text = text.strip()
 
@@ -292,8 +306,8 @@ def handle_command(text: str, say, session_key: str = ""):
         )
 
     else:
-        # ── 自然语言 → Claude CLI（带对话历史）──
-        run_claude_async(text, say, session_key=session_key)
+        # ── 自然语言 → Claude CLI（带 Slack 历史上下文）──
+        run_claude_async(text, say, channel=channel)
 
 
 # ── Slack 事件处理 ────────────────────────────────────────────────────────────
@@ -303,18 +317,6 @@ def is_allowed(user_id: str) -> bool:
     if not ALLOWED_USER_IDS:
         return True
     return user_id in ALLOWED_USER_IDS
-
-
-def _session_key(message: dict) -> str:
-    """
-    确定 session key：
-    - 若消息在某个 thread 里（有 thread_ts），用 thread_ts → 同 thread 共享历史
-    - 否则用 channel + ts → 每条顶层消息开一个新会话
-    """
-    thread_ts = message.get("thread_ts")
-    if thread_ts:
-        return thread_ts
-    return f"{message.get('channel', '')}:{message.get('ts', '')}"
 
 
 def _threaded_say(say, thread_ts: str):
@@ -341,8 +343,9 @@ def handle_message(message, say):
         say(f"⛔ 用户 `{user_id}` 无权限使用此 agent。请联系管理员将你的 User ID 加入白名单。")
         return
     # thread_ts: 已在 thread 中则用 thread_ts，否则用自身 ts 开新 thread
+    channel = message.get("channel", "")
     thread_ts = message.get("thread_ts") or message.get("ts", "")
-    handle_command(text, _threaded_say(say, thread_ts), session_key=_session_key(message))
+    handle_command(text, _threaded_say(say, thread_ts), channel=channel)
 
 
 @app.event("app_mention")
@@ -354,8 +357,9 @@ def handle_mention(event, say):
         return
     text = event.get("text", "")
     text = re.sub(r"<@[A-Z0-9]+>", "", text).strip()
+    channel = event.get("channel", "")
     thread_ts = event.get("thread_ts") or event.get("ts", "")
-    handle_command(text, _threaded_say(say, thread_ts), session_key=_session_key(event))
+    handle_command(text, _threaded_say(say, thread_ts), channel=channel)
 
 
 # ── 后台状态监控 ──────────────────────────────────────────────────────────────
