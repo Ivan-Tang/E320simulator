@@ -47,7 +47,7 @@ TEST_TRACKS    = SIM_DIR / "sim_tracks_test.parquet"
 EDGES_TRAIN    = SIM_DIR / "edges_train.parquet"
 
 # ML model types to benchmark
-ML_MODELS = ["mlp", "gnn", "interaction_net", "eggnet", "hgnn", "transformer"]
+ML_MODELS = ["mlp", "gnn", "interaction_net", "eggnet", "hgnn"]
 
 
 # ── DDP subprocess helper ──────────────────────────────────────────────────────
@@ -188,6 +188,8 @@ def main(
     baseline_cfg = BaselineConfig(n_workers=workers)
     hough_cfg    = HoughConfig(n_workers=workers)
 
+    n_test_events = clusters_test["event_id"].n_unique()
+
     reco_paths: dict[str, str] = {}
 
     # ── Non-ML algorithms ─────────────────────────────────────────────────────
@@ -202,10 +204,11 @@ def main(
         t0 = time.perf_counter()
         result = fn()
         dt = time.perf_counter() - t0
+        per_evt_ms = dt / n_test_events * 1e3
         out = OUT_DIR / f"{name.lower()}_test.parquet"
         result.write_parquet(out)
         reco_paths[name] = str(out)
-        print(f"  → {out}  ({dt:.1f}s)")
+        print(f"  → {out}  ({dt:.1f}s total  {per_evt_ms:.2f} ms/event)")
 
     # ── Stage 0: Shared metric-learning embedder (hinge loss) ────────────────
     print("\n" + "=" * 65)
@@ -350,7 +353,8 @@ def main(
             out = OUT_DIR / f"{model_type}_test.parquet"
             result.write_parquet(out)
             reco_paths[model_type.upper()] = str(out)
-            print(f"  → {out}  (hf_train {hf_train_dt:.0f}s  tf_train {tf_train_dt:.0f}s  infer {infer_dt:.1f}s)")
+            per_evt_ms = infer_dt / n_test_events * 1e3
+            print(f"  → {out}  (hf_train {hf_train_dt:.0f}s  tf_train {tf_train_dt:.0f}s  infer {infer_dt:.1f}s  {per_evt_ms:.2f} ms/event)")
             continue
 
         # ── Edge-classification models ─────────────────────────────────────
@@ -382,7 +386,8 @@ def main(
         out = OUT_DIR / f"{model_type}_test.parquet"
         result.write_parquet(out)
         reco_paths[model_type.upper()] = str(out)
-        print(f"  → {out}  (train {train_dt:.0f}s  infer {infer_dt:.1f}s)")
+        per_evt_ms = infer_dt / n_test_events * 1e3
+        print(f"  → {out}  (train {train_dt:.0f}s  infer {infer_dt:.1f}s  {per_evt_ms:.2f} ms/event)")
 
     # ── Comparison table ──────────────────────────────────────────────────────
     print("\n" + "=" * 65)

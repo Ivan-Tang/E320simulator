@@ -112,8 +112,7 @@ def _build_edges(
         with np.errstate(divide="ignore", invalid="ignore"):
             s_x = dx / dz
             s_y = dy / dz
-
-        ok = (np.abs(s_x) < cfg.slope_x_max) & (np.abs(s_y) < cfg.slope_y_max)
+            ok = (np.abs(s_x) < cfg.slope_x_max) & (np.abs(s_y) < cfg.slope_y_max)
         ia, ib = np.where(ok)
         if len(ia) == 0:
             continue
