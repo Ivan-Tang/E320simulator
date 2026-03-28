@@ -291,8 +291,8 @@ def train(
     train_eids = set(all_events[:n_train].tolist())
     val_eids   = set(all_events[n_train:].tolist())
 
-    train_df = edges_df.filter(pl.col("event_id").is_in(list(train_eids)))
-    val_df   = edges_df.filter(pl.col("event_id").is_in(list(val_eids)))
+    train_df = edges_df.filter(pl.col("event_id").is_in(list(train_eids))).rechunk()
+    val_df   = edges_df.filter(pl.col("event_id").is_in(list(val_eids))).rechunk()
 
     stats = edge_label_stats(edges_df)
     ddp.ddp_print(f"[train] total edges={stats['n_total']:,}  "
