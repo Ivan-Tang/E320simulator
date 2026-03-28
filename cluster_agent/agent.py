@@ -317,6 +317,17 @@ def _session_key(message: dict) -> str:
     return f"{message.get('channel', '')}:{message.get('ts', '')}"
 
 
+def _threaded_say(say, thread_ts: str):
+    """
+    返回一个始终在指定 thread 内回复的 say 函数。
+    - 对于顶层消息：thread_ts = 消息自身的 ts，回复会创建新 thread
+    - 对于 thread 内消息：thread_ts = 所在 thread 的 ts，回复保持在同一 thread
+    """
+    def _say(text, **kwargs):
+        say(text, thread_ts=thread_ts, **kwargs)
+    return _say
+
+
 @app.message(re.compile(r".*"))
 def handle_message(message, say):
     """处理所有直接消息（DM 或频道消息）。"""
@@ -327,7 +338,9 @@ def handle_message(message, say):
         say(f"⛔ 用户 `{user_id}` 无权限使用此 agent。请联系管理员将你的 User ID 加入白名单。")
         return
     text = message.get("text", "").strip()
-    handle_command(text, say, session_key=_session_key(message))
+    # thread_ts: 已在 thread 中则用 thread_ts，否则用自身 ts 开新 thread
+    thread_ts = message.get("thread_ts") or message.get("ts", "")
+    handle_command(text, _threaded_say(say, thread_ts), session_key=_session_key(message))
 
 
 @app.event("app_mention")
@@ -339,7 +352,8 @@ def handle_mention(event, say):
         return
     text = event.get("text", "")
     text = re.sub(r"<@[A-Z0-9]+>", "", text).strip()
-    handle_command(text, say, session_key=_session_key(event))
+    thread_ts = event.get("thread_ts") or event.get("ts", "")
+    handle_command(text, _threaded_say(say, thread_ts), session_key=_session_key(event))
 
 
 # ── 后台状态监控 ──────────────────────────────────────────────────────────────
