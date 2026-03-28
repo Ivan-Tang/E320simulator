@@ -244,7 +244,12 @@ def build_labeled_edges_from_sim(
     if missing:
         raise ValueError(f"clusters_df is missing columns: {missing}")
 
-    records: list[dict] = []
+    # Accumulate per-event DataFrames; batch-concat every _BATCH events to
+    # avoid holding millions of Python dicts in memory (the original approach
+    # caused OOM / segfault on large datasets).
+    _BATCH = 500
+    frames: list[pl.DataFrame] = []
+    batched: list[pl.DataFrame] = []
 
     for eid, ev in clusters_df.group_by("event_id"):
         ev = ev.sort("node_id")
@@ -288,41 +293,49 @@ def build_labeled_edges_from_sim(
         edge_label     = ((tid_i == tid_j) & (tid_i >= 0)).astype(np.int8)
         is_signal_edge = ((edge_label == 1) & sig_i & sig_j).astype(np.int8)
 
-        for k in range(len(src)):
-            records.append({
-                "event_id":       event_id_val,
-                "src_node":       int(src[k]),
-                "dst_node":       int(dst[k]),
-                "src_layer":      int(sl[k]),
-                "dst_layer":      int(dl[k]),
-                "dx_mm":          float(dx[k]),
-                "dy_mm":          float(dy[k]),
-                "dz_mm":          float(dz[k]),
-                "dr_mm":          float(dr[k]),
-                "slope_x":        float(sx[k]),
-                "slope_y":        float(sy[k]),
-                "x_i":            float(xi[k]),
-                "y_i":            float(yi[k]),
-                "z_i":            float(zi[k]),
-                "size_x_i":       int(size_x_arr[li[k]]),
-                "size_y_i":       int(size_y_arr[li[k]]),
-                "size_i":         int(size_arr[li[k]]),
-                "x_j":            float(xj[k]),
-                "y_j":            float(yj[k]),
-                "z_j":            float(zj[k]),
-                "size_x_j":       int(size_x_arr[lj[k]]),
-                "size_y_j":       int(size_y_arr[lj[k]]),
-                "size_j":         int(size_arr[lj[k]]),
-                "track_id_i":     int(tid_i[k]),
-                "track_id_j":     int(tid_j[k]),
-                "edge_label":     int(edge_label[k]),
-                "is_signal_edge": int(is_signal_edge[k]),
-            })
+        n = len(src)
+        frames.append(pl.DataFrame({
+            "event_id":       np.full(n, event_id_val, dtype=np.int64),
+            "src_node":       src.astype(np.int64),
+            "dst_node":       dst.astype(np.int64),
+            "src_layer":      sl.astype(np.int64),
+            "dst_layer":      dl.astype(np.int64),
+            "dx_mm":          dx.astype(np.float64),
+            "dy_mm":          dy.astype(np.float64),
+            "dz_mm":          dz.astype(np.float64),
+            "dr_mm":          dr.astype(np.float64),
+            "slope_x":        sx.astype(np.float64),
+            "slope_y":        sy.astype(np.float64),
+            "x_i":            xi.astype(np.float64),
+            "y_i":            yi.astype(np.float64),
+            "z_i":            zi.astype(np.float64),
+            "size_x_i":       size_x_arr[li].astype(np.int64),
+            "size_y_i":       size_y_arr[li].astype(np.int64),
+            "size_i":         size_arr[li].astype(np.int64),
+            "x_j":            xj.astype(np.float64),
+            "y_j":            yj.astype(np.float64),
+            "z_j":            zj.astype(np.float64),
+            "size_x_j":       size_x_arr[lj].astype(np.int64),
+            "size_y_j":       size_y_arr[lj].astype(np.int64),
+            "size_j":         size_arr[lj].astype(np.int64),
+            "track_id_i":     tid_i.astype(np.int64),
+            "track_id_j":     tid_j.astype(np.int64),
+            "edge_label":     edge_label.astype(np.int64),
+            "is_signal_edge": is_signal_edge.astype(np.int64),
+        }))
 
-    if not records:
+        if len(frames) >= _BATCH:
+            batched.append(pl.concat(frames))
+            frames.clear()
+
+    if frames:
+        batched.append(pl.concat(frames))
+        frames.clear()
+
+    if not batched:
         return pl.DataFrame()
 
-    return pl.from_dicts(records)
+    return pl.concat(batched)
 
 def edge_label_stats(edges_df: pl.DataFrame) -> dict:
     """Return class-balance statistics for an edge table.
