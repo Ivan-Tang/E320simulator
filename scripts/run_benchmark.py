@@ -44,6 +44,7 @@ from src.config import DATA_ROOT, SIM_DIR, RUNS_DIR, OUTPUTS_DIR as OUT_DIR
 TRAIN_CLUSTERS = SIM_DIR / "sim_clusters_train.parquet"
 TEST_CLUSTERS  = SIM_DIR / "sim_clusters_test.parquet"
 TEST_TRACKS    = SIM_DIR / "sim_tracks_test.parquet"
+EDGES_TRAIN    = SIM_DIR / "edges_train.parquet"
 
 # ML model types to benchmark
 ML_MODELS = ["mlp", "gnn", "interaction_net", "eggnet", "hgnn", "transformer"]
@@ -73,7 +74,7 @@ def _run_torchrun(
 
 def train_ml_model(
     model_type: str,
-    clusters_df: pl.DataFrame,
+    edges_df: pl.DataFrame,
     checkpoint_dir: Path,
     device: str = "mps",
     n_epochs: int = 50,
@@ -82,26 +83,23 @@ def train_ml_model(
     ddp_nproc: int = 1,
     accum_steps: int = 1,
 ) -> str:
-    """Build edges, train model, and save checkpoint.  Returns checkpoint path."""
+    """Train model on pre-built edges and save checkpoint.  Returns checkpoint path."""
     ckpt_path = checkpoint_dir / "best_model.pt"
     if ckpt_path.exists() and not force:
         print(f"  checkpoint exists → skipping training: {ckpt_path}")
         return str(ckpt_path)
 
-    print(f"  Building labeled edges from {clusters_df['event_id'].n_unique():,} events "
-          f"({len(clusters_df):,} clusters)...")
-    edges_df = build_labeled_edges_from_sim(clusters_df)
-    print(f"  Built {len(edges_df):,} candidate edges")
-
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     if ddp_nproc > 1:
-        # Save edges to a temp parquet so the subprocess can read them
-        tmp_edges = checkpoint_dir / "_tmp_edges.parquet"
-        edges_df.write_parquet(tmp_edges)
+        # Write edges to a file so the torchrun subprocess can read them via --edges
+        tmp_edges = EDGES_TRAIN if EDGES_TRAIN.exists() else checkpoint_dir / "_tmp_edges.parquet"
+        if not tmp_edges.exists():
+            print(f"  Writing edges cache for DDP subprocess → {tmp_edges}")
+            edges_df.write_parquet(tmp_edges)
         extra = [
             "--task", "edge",
-            "--clusters", str(TRAIN_CLUSTERS),   # passed to build_labeled_edges internally
+            "--edges", str(tmp_edges),
             "--model", model_type,
             "--epochs", str(n_epochs),
             "--device", "auto",
@@ -204,6 +202,25 @@ def main(
         train_embedder(clusters_train, emb_cfg)
     print(f"  embedder → {embedder_ckpt}  ({time.perf_counter() - t0:.0f}s)")
 
+    # ── Shared edge table (built once, reused by all ML models) ──────────────
+    print("\n" + "=" * 65)
+    print("Building/loading edge table for ML training...")
+    if EDGES_TRAIN.exists():
+        print(f"  Loading pre-built edges from {EDGES_TRAIN} ...")
+        t0 = time.perf_counter()
+        edges_train = pl.read_parquet(EDGES_TRAIN)
+        print(f"  Loaded {len(edges_train):,} edges  ({time.perf_counter() - t0:.1f}s)")
+    else:
+        print(f"  Building labeled edges from "
+              f"{clusters_train['event_id'].n_unique():,} events ...")
+        t0 = time.perf_counter()
+        edges_train = build_labeled_edges_from_sim(clusters_train)
+        dt = time.perf_counter() - t0
+        print(f"  Built {len(edges_train):,} candidate edges  ({dt:.1f}s)")
+        print(f"  Writing to {EDGES_TRAIN} ...")
+        edges_train.write_parquet(EDGES_TRAIN)
+        print(f"  Done  ({time.perf_counter() - t0:.1f}s total)")
+
     # ── ML algorithms ─────────────────────────────────────────────────────────
     print("\n" + "=" * 65)
     print(f"ML algorithms  (train={epochs} epochs on {device}, then test)")
@@ -305,7 +322,7 @@ def main(
         t0 = time.perf_counter()
         try:
             ckpt_path = train_ml_model(
-                model_type, clusters_train, ckpt_dir,
+                model_type, edges_train, ckpt_dir,
                 device=device, n_epochs=epochs, force=force_retrain,
                 embedder_checkpoint=str(embedder_ckpt),
                 ddp_nproc=ddp_nproc, accum_steps=accum_steps,
