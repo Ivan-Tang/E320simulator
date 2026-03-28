@@ -52,22 +52,57 @@ ML_MODELS = ["mlp", "gnn", "interaction_net", "eggnet", "hgnn", "transformer"]
 
 # ── DDP subprocess helper ──────────────────────────────────────────────────────
 
-def _run_torchrun(
+def _run_ddp_spawn(
     module: str,
     extra_args: list[str],
     nproc: int,
     accum_steps: int,
 ) -> None:
-    """Launch a training module via torchrun (blocks until done)."""
-    cmd = [
-        sys.executable, "-m", "torch.distributed.run",
-        "--standalone", f"--nproc_per_node={nproc}",
-        "-m", module,
+    """Launch a training module with DDP via subprocess + file:// rendezvous.
+
+    Avoids ``torchrun --standalone`` which segfaults on this cluster due to a
+    bug in ``c10d_rendezvous_backend._call_store``.  Instead we manually spawn
+    one subprocess per rank, set RANK / LOCAL_RANK / WORLD_SIZE, and use a
+    temporary file as the rendezvous store.
+    """
+    import os, tempfile, time as _time
+    init_file = os.path.join(tempfile.gettempdir(),
+                             f"ddp_init_{int(_time.time())}.store")
+    env_base = os.environ.copy()
+    env_base["WORLD_SIZE"] = str(nproc)
+    env_base["MASTER_ADDR"] = "localhost"
+    env_base["MASTER_PORT"] = "29400"
+    env_base["DDP_INIT_METHOD"] = f"file://{init_file}"
+    env_base["NCCL_P2P_DISABLE"] = "1"   # required on this cluster
+
+    cmd_suffix = [
+        sys.executable, "-m", module,
         *extra_args,
         "--gradient-accumulation-steps", str(accum_steps),
     ]
-    print(f"  [torchrun] {' '.join(cmd)}")
-    subprocess.run(cmd, check=True)
+    print(f"  [ddp-spawn] {nproc}× {' '.join(cmd_suffix)}")
+    procs = []
+    for rank in range(nproc):
+        env = env_base.copy()
+        env["RANK"] = str(rank)
+        env["LOCAL_RANK"] = str(rank)
+        procs.append(subprocess.Popen(cmd_suffix, env=env))
+
+    failed = False
+    for rank, proc in enumerate(procs):
+        code = proc.wait()
+        if code != 0:
+            print(f"  [ddp-spawn] rank {rank} exited with code {code}")
+            failed = True
+
+    # Clean up rendezvous file
+    try:
+        os.remove(init_file)
+    except FileNotFoundError:
+        pass
+
+    if failed:
+        raise subprocess.CalledProcessError(1, cmd_suffix)
 
 
 # ── Training helper ───────────────────────────────────────────────────────────
@@ -107,7 +142,7 @@ def train_ml_model(
         ]
         if embedder_checkpoint:
             extra += ["--embedder-checkpoint", embedder_checkpoint]
-        _run_torchrun("src.train", extra, nproc=ddp_nproc, accum_steps=accum_steps)
+        _run_ddp_spawn("src.train", extra, nproc=ddp_nproc, accum_steps=accum_steps)
     else:
         cfg = TrainConfig(
             model_type          = model_type,
@@ -182,7 +217,7 @@ def main(
     if embedder_ckpt.exists() and not force_retrain:
         print(f"  checkpoint exists → skipping: {embedder_ckpt}")
     elif ddp_nproc > 1:
-        _run_torchrun(
+        _run_ddp_spawn(
             "src.train",
             ["--task", "embedder",
              "--clusters", str(TRAIN_CLUSTERS),
@@ -243,7 +278,7 @@ def main(
                     print(f"  [Stage 1] hit filter checkpoint exists → skipping: {hf_ckpt_path}")
                 elif ddp_nproc > 1:
                     print("  [Stage 1] Training hit filter (DDP)...")
-                    _run_torchrun(
+                    _run_ddp_spawn(
                         "src.train_hit_filter",
                         ["--clusters", str(TRAIN_CLUSTERS),
                          "--epochs", str(epochs),
@@ -272,7 +307,7 @@ def main(
                     print(f"  [Stage 2] trackformer checkpoint exists → skipping: {tf_ckpt_path}")
                 elif ddp_nproc > 1:
                     print("  [Stage 2] Training MaskFormer on filtered hits (DDP)...")
-                    _run_torchrun(
+                    _run_ddp_spawn(
                         "src.train_trackformer",
                         ["--clusters", str(TRAIN_CLUSTERS),
                          "--epochs", str(epochs),
