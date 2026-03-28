@@ -49,7 +49,7 @@ ALLOWED_USER_IDS: set[str] = {uid.strip() for uid in _raw_ids.split(",") if uid.
 
 MAX_CHUNK = 3800       # Slack 单条消息字符上限（留缓冲）
 MONITOR_INTERVAL = 60  # 状态轮询间隔（秒）
-CLAUDE_TIMEOUT = 300   # claude --print 超时（秒）
+CLAUDE_TIMEOUT = 600   # claude --print 超时（秒）
 MAX_HISTORY_TURNS = 10 # 每个 session 最多保留的对话轮数
 
 app = App(token=SLACK_BOT_TOKEN)
@@ -333,11 +333,13 @@ def handle_message(message, say):
     """处理所有直接消息（DM 或频道消息）。"""
     if message.get("bot_id"):
         return  # 忽略 bot 自己的消息
+    text = message.get("text", "").strip()
+    if re.search(r"<@[A-Z0-9]+>", text):
+        return  # 有@提及，交给 app_mention handler 处理，避免重复回复
     user_id = message.get("user", "")
     if not is_allowed(user_id):
         say(f"⛔ 用户 `{user_id}` 无权限使用此 agent。请联系管理员将你的 User ID 加入白名单。")
         return
-    text = message.get("text", "").strip()
     # thread_ts: 已在 thread 中则用 thread_ts，否则用自身 ts 开新 thread
     thread_ts = message.get("thread_ts") or message.get("ts", "")
     handle_command(text, _threaded_say(say, thread_ts), session_key=_session_key(message))
