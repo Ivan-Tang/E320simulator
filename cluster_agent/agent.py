@@ -47,11 +47,17 @@ LOGS_DIR = Path("/srv01/agrp/yiwen/logs")
 _raw_ids = os.environ.get("ALLOWED_USER_IDS", "").strip()
 ALLOWED_USER_IDS: set[str] = {uid.strip() for uid in _raw_ids.split(",") if uid.strip()}
 
-MAX_CHUNK = 3800   # Slack 单条消息字符上限（留缓冲）
+MAX_CHUNK = 3800       # Slack 单条消息字符上限（留缓冲）
 MONITOR_INTERVAL = 60  # 状态轮询间隔（秒）
 CLAUDE_TIMEOUT = 300   # claude --print 超时（秒）
+MAX_HISTORY_TURNS = 10 # 每个 session 最多保留的对话轮数
 
 app = App(token=SLACK_BOT_TOKEN)
+
+# ── 对话历史 (session_key → [{"role": "user"|"assistant", "text": "..."}])
+# session_key：thread_ts（thread 内继续对话）或 channel+ts（新消息开新会话）
+_history_lock = threading.Lock()
+conversation_history: dict[str, list] = {}
 
 
 # ── 工具函数 ─────────────────────────────────────────────────────────────────
@@ -93,13 +99,40 @@ def run_shell(cmd: str, cwd=None, timeout=30) -> str:
         return f"(错误: {e})"
 
 
-def run_claude_async(message: str, say):
-    """在后台线程运行 claude --print，完成后将输出发回 Slack。"""
+def _build_prompt(session_key: str, message: str) -> str:
+    """把历史对话拼成 Claude prompt。无历史时直接返回原消息。"""
+    with _history_lock:
+        history = conversation_history.get(session_key, [])
+    if not history:
+        return message
+    lines = ["以下是我们本次对话的历史记录：", ""]
+    for turn in history:
+        role = "用户" if turn["role"] == "user" else "助手"
+        lines.append(f"{role}: {turn['text']}")
+    lines += ["", "请基于以上上下文回复用户最新消息：", message]
+    return "\n".join(lines)
+
+
+def _append_history(session_key: str, role: str, text: str):
+    """向 session 历史追加一条记录，超出上限时丢弃最早的。"""
+    with _history_lock:
+        hist = conversation_history.setdefault(session_key, [])
+        hist.append({"role": role, "text": text})
+        # 按"轮"裁剪（一轮 = user + assistant），保留最近 MAX_HISTORY_TURNS 轮
+        if len(hist) > MAX_HISTORY_TURNS * 2:
+            conversation_history[session_key] = hist[-(MAX_HISTORY_TURNS * 2):]
+
+
+def run_claude_async(message: str, say, session_key: str = ""):
+    """在后台线程运行 claude --print，完成后将输出发回 Slack，并维护对话历史。"""
     def _worker():
         say("⏳ Claude 处理中，请稍候…")
+        prompt = _build_prompt(session_key, message)
+        if session_key:
+            _append_history(session_key, "user", message)
         try:
             result = subprocess.run(
-                ["claude", "--print", "--dangerously-skip-permissions", message],
+                ["claude", "--print", "--dangerously-skip-permissions", prompt],
                 capture_output=True, text=True,
                 cwd=str(PROJ_DIR), timeout=CLAUDE_TIMEOUT,
             )
@@ -113,6 +146,8 @@ def run_claude_async(message: str, say):
         except Exception as e:
             response = f"❌ 执行异常: {e}"
 
+        if session_key:
+            _append_history(session_key, "assistant", response)
         say_long(say, response)
 
     threading.Thread(target=_worker, daemon=True).start()
@@ -147,7 +182,7 @@ HELP_TEXT = """*E320 Research Agent — 命令列表*
 其他任何文本 → 交给 Claude 处理（可讨论目标、分析结果、修改代码等）"""
 
 
-def handle_command(text: str, say):
+def handle_command(text: str, say, session_key: str = ""):
     """根据文本路由到对应处理逻辑。"""
     text = text.strip()
 
@@ -257,8 +292,8 @@ def handle_command(text: str, say):
         )
 
     else:
-        # ── 自然语言 → Claude CLI ──
-        run_claude_async(text, say)
+        # ── 自然语言 → Claude CLI（带对话历史）──
+        run_claude_async(text, say, session_key=session_key)
 
 
 # ── Slack 事件处理 ────────────────────────────────────────────────────────────
@@ -268,6 +303,18 @@ def is_allowed(user_id: str) -> bool:
     if not ALLOWED_USER_IDS:
         return True
     return user_id in ALLOWED_USER_IDS
+
+
+def _session_key(message: dict) -> str:
+    """
+    确定 session key：
+    - 若消息在某个 thread 里（有 thread_ts），用 thread_ts → 同 thread 共享历史
+    - 否则用 channel + ts → 每条顶层消息开一个新会话
+    """
+    thread_ts = message.get("thread_ts")
+    if thread_ts:
+        return thread_ts
+    return f"{message.get('channel', '')}:{message.get('ts', '')}"
 
 
 @app.message(re.compile(r".*"))
@@ -280,7 +327,7 @@ def handle_message(message, say):
         say(f"⛔ 用户 `{user_id}` 无权限使用此 agent。请联系管理员将你的 User ID 加入白名单。")
         return
     text = message.get("text", "").strip()
-    handle_command(text, say)
+    handle_command(text, say, session_key=_session_key(message))
 
 
 @app.event("app_mention")
@@ -292,7 +339,7 @@ def handle_mention(event, say):
         return
     text = event.get("text", "")
     text = re.sub(r"<@[A-Z0-9]+>", "", text).strip()
-    handle_command(text, say)
+    handle_command(text, say, session_key=_session_key(event))
 
 
 # ── 后台状态监控 ──────────────────────────────────────────────────────────────
