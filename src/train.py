@@ -541,7 +541,10 @@ def train_model(
 
 def _cli() -> None:
     parser = argparse.ArgumentParser(description="Unified trainer for edge models and embedder")
-    parser.add_argument("--clusters", required=True, help="Path to sim_clusters.parquet")
+    parser.add_argument("--clusters", default=None, help="Path to sim_clusters.parquet")
+    parser.add_argument("--edges", default=None,
+                        help="Path to pre-built edges.parquet (skips cluster loading and "
+                             "build_labeled_edges_from_sim; required when --clusters is omitted)")
     parser.add_argument("--task", default="edge", choices=["edge", "embedder"],
                         help="Training task: edge classifier or hit embedder")
 
@@ -573,29 +576,37 @@ def _cli() -> None:
                         help="Accumulate gradients over N events before optimizer step (DDP / memory)")
     args = parser.parse_args()
 
+    if args.edges is None and args.clusters is None:
+        parser.error("one of --clusters or --edges is required")
+
     # In DDP mode: rank 0 builds the edge table and writes a temp parquet;
     # other ranks wait at a barrier then read the pre-built file.
     # This avoids concurrent Lustre reads + Polars group_by triggering an
     # internal assertion failure, and cuts edge-building work to 1× instead of N×.
     rank, world_size, is_ddp = ddp.setup_ddp()
 
-    clusters_df = pl.read_parquet(args.clusters)
-    print(f"[cli] rank {rank}: loaded {len(clusters_df):,} clusters", flush=True)
-
     if args.task == "edge":
-        _edge_cache = os.environ.get("DDP_INIT_METHOD", "").replace("file://", "") + "_edges.parquet"
-        if is_ddp:
-            if rank == 0:
-                edges_df = build_labeled_edges_from_sim(clusters_df)
-                print(f"[cli] rank 0: built {len(edges_df):,} edges → {_edge_cache}", flush=True)
-                edges_df.write_parquet(_edge_cache)
-            dist.barrier()  # all ranks wait for rank 0 to finish writing
-            if rank != 0:
-                edges_df = pl.read_parquet(_edge_cache)
-                print(f"[cli] rank {rank}: loaded {len(edges_df):,} edges from cache", flush=True)
+        if args.edges is not None:
+            # Pre-built edge table supplied directly — all ranks load it.
+            edges_df = pl.read_parquet(args.edges)
+            print(f"[cli] rank {rank}: loaded {len(edges_df):,} edges from {args.edges}", flush=True)
+            _edge_cache = None
         else:
-            edges_df = build_labeled_edges_from_sim(clusters_df)
-            print(f"[cli] built {len(edges_df):,} candidate edges", flush=True)
+            clusters_df = pl.read_parquet(args.clusters)
+            print(f"[cli] rank {rank}: loaded {len(clusters_df):,} clusters", flush=True)
+            _edge_cache = os.environ.get("DDP_INIT_METHOD", "").replace("file://", "") + "_edges.parquet"
+            if is_ddp:
+                if rank == 0:
+                    edges_df = build_labeled_edges_from_sim(clusters_df)
+                    print(f"[cli] rank 0: built {len(edges_df):,} edges → {_edge_cache}", flush=True)
+                    edges_df.write_parquet(_edge_cache)
+                dist.barrier()  # all ranks wait for rank 0 to finish writing
+                if rank != 0:
+                    edges_df = pl.read_parquet(_edge_cache)
+                    print(f"[cli] rank {rank}: loaded {len(edges_df):,} edges from cache", flush=True)
+            else:
+                edges_df = build_labeled_edges_from_sim(clusters_df)
+                print(f"[cli] built {len(edges_df):,} candidate edges", flush=True)
 
         cfg = TrainConfig(
             model_type       = args.model,
@@ -612,10 +623,14 @@ def _cli() -> None:
             gradient_accumulation_steps = args.gradient_accumulation_steps,
         )
         train(edges_df, cfg)
-        if is_ddp and rank == 0 and os.path.exists(_edge_cache):
+        if is_ddp and rank == 0 and _edge_cache and os.path.exists(_edge_cache):
             os.remove(_edge_cache)
         return
 
+    if args.clusters is None:
+        parser.error("--clusters is required for --task=embedder")
+    clusters_df = pl.read_parquet(args.clusters)
+    print(f"[cli] rank {rank}: loaded {len(clusters_df):,} clusters", flush=True)
     embed_cfg = EmbedderTrainConfig(
         n_epochs=args.epochs,
         batch_size=4096,
