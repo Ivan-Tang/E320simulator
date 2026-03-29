@@ -236,13 +236,20 @@ def main(
             accum_steps=accum_steps,
         )
     else:
-        emb_cfg = EmbedderTrainConfig(
-            emb_dim        = 8,
-            n_epochs       = epochs,
-            device         = device,
-            checkpoint_dir = str(embedder_dir),
-        )
-        train_embedder(clusters_train, emb_cfg)
+        # Run in subprocess so GPU memory is fully released when embedder exits,
+        # avoiding CUDA fragmentation that would affect subsequent ML model training.
+        cmd = [
+            sys.executable, "-m", "src.train",
+            "--task", "embedder",
+            "--clusters", str(TRAIN_CLUSTERS),
+            "--epochs", str(epochs),
+            "--device", device,
+            "--checkpoint", str(embedder_dir),
+        ]
+        print(f"  [spawn] {' '.join(cmd)}")
+        emb_result = subprocess.run(cmd)
+        if emb_result.returncode != 0:
+            raise subprocess.CalledProcessError(emb_result.returncode, cmd)
     print(f"  embedder → {embedder_ckpt}  ({time.perf_counter() - t0:.0f}s)")
 
     # ── Shared edge table (built once, reused by all ML models) ──────────────
@@ -382,20 +389,30 @@ def main(
             continue
         train_dt = time.perf_counter() - t0
 
-        # Inference
+        # Inference — run in subprocess to fully release GPU memory between models.
+        # This prevents CUDA fragmentation/segfaults in the main process that
+        # accumulate across 5+ models when running in-process.
+        out = OUT_DIR / f"{model_type}_test.parquet"
         t0 = time.perf_counter()
         try:
-            result = run_edge_classifier_reco(
-                clusters_test, tracks_test, ckpt_path,
-                threshold=0.5, device=device,
-            )
+            infer_cmd = [
+                sys.executable, "-m", "scripts.run_model",
+                "--mode", "edge",
+                "--clusters", str(TEST_CLUSTERS),
+                "--tracks", str(TEST_TRACKS),
+                "--edge-checkpoint", ckpt_path,
+                "--device", device,
+                "--output", str(out),
+            ]
+            print(f"  [spawn] {' '.join(infer_cmd)}")
+            infer_result = subprocess.run(infer_cmd)
+            if infer_result.returncode != 0:
+                raise subprocess.CalledProcessError(infer_result.returncode, infer_cmd)
         except Exception as e:
             print(f"  [ERROR] inference failed: {e}")
             continue
         infer_dt = time.perf_counter() - t0
 
-        out = OUT_DIR / f"{model_type}_test.parquet"
-        result.write_parquet(out)
         reco_paths[model_type.upper()] = str(out)
         per_evt_ms = infer_dt / n_test_events * 1e3
         print(f"  → {out}  (train {train_dt:.0f}s  infer {infer_dt:.1f}s  {per_evt_ms:.2f} ms/event)")
