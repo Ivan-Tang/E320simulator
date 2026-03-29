@@ -49,7 +49,7 @@ ALLOWED_USER_IDS: set[str] = {uid.strip() for uid in _raw_ids.split(",") if uid.
 
 MAX_CHUNK = 3800   # Slack 单条消息字符上限（留缓冲）
 MONITOR_INTERVAL = 60  # 状态轮询间隔（秒）
-CLAUDE_TIMEOUT = 600   # claude --print 超时（秒）
+CLAUDE_TIMEOUT = 3600  # claude --print 超时（秒）
 
 app = App(token=SLACK_BOT_TOKEN)
 

@@ -386,6 +386,11 @@ def train(
                 e_dst = emb[ei[1]]                   # (E, emb_dim)
                 dist_ = (e_src - e_dst).norm(dim=-1) # (E,)
                 loss = loss + cfg.hgnn_emb_loss_weight * emb_criterion(dist_, lab)
+            # Release last_embeddings immediately after use (or non-use) to avoid
+            # accumulation of stale CUDA tensors across events, which can fragment
+            # GPU memory and trigger a segfault in later epochs.
+            if hasattr(_inner_model, "last_embeddings"):
+                _inner_model.last_embeddings = None
 
             # Scale loss for gradient accumulation
             (loss / accum_steps).backward()

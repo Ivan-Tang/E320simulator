@@ -131,7 +131,13 @@ def train_ml_model(
     # or OOM-ing model leaves 21+ GiB of PyTorch CUDA allocations in the parent
     # process, causing every subsequent model to OOM as well.
     edges_file = EDGES_TRAIN if EDGES_TRAIN.exists() else checkpoint_dir / "_tmp_edges.parquet"
-    if not edges_file.exists():
+    if edges_file.exists():
+        # Validate schema — a stale file from before edge_label was added would crash training
+        _cols = set(pl.read_parquet_schema(edges_file).names())
+        if "edge_label" not in _cols:
+            print(f"  Stale edges file {edges_file} (no edge_label), overwriting...")
+            edges_df.write_parquet(edges_file)
+    else:
         print(f"  Writing edges cache → {edges_file}")
         edges_df.write_parquet(edges_file)
 
@@ -242,12 +248,18 @@ def main(
     # ── Shared edge table (built once, reused by all ML models) ──────────────
     print("\n" + "=" * 65)
     print("Building/loading edge table for ML training...")
+    _REQUIRED_EDGE_COLS = {"edge_label", "event_id", "is_signal_edge"}
     if EDGES_TRAIN.exists():
-        print(f"  Loading pre-built edges from {EDGES_TRAIN} ...")
-        t0 = time.perf_counter()
-        edges_train = pl.read_parquet(EDGES_TRAIN)
-        print(f"  Loaded {len(edges_train):,} edges  ({time.perf_counter() - t0:.1f}s)")
-    else:
+        _cached_cols = set(pl.read_parquet_schema(EDGES_TRAIN).names())
+        if not _REQUIRED_EDGE_COLS.issubset(_cached_cols):
+            print(f"  Stale edge cache (missing {_REQUIRED_EDGE_COLS - _cached_cols}), deleting and rebuilding...")
+            EDGES_TRAIN.unlink()
+        else:
+            print(f"  Loading pre-built edges from {EDGES_TRAIN} ...")
+            t0 = time.perf_counter()
+            edges_train = pl.read_parquet(EDGES_TRAIN)
+            print(f"  Loaded {len(edges_train):,} edges  ({time.perf_counter() - t0:.1f}s)")
+    if not EDGES_TRAIN.exists():
         print(f"  Building labeled edges from "
               f"{clusters_train['event_id'].n_unique():,} events ...")
         t0 = time.perf_counter()
