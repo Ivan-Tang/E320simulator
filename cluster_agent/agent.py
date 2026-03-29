@@ -54,6 +54,19 @@ MAX_HISTORY_TURNS = 10 # 拉取 Slack 历史的最大轮数
 PBS_POLL_INTERVAL = 60 # qstat 轮询间隔（秒）
 PBS_USER = "yiwen"     # 监控的 PBS 用户名
 
+# 可通过 !model 动态切换；None 表示使用 claude 默认模型
+CLAUDE_MODEL: str | None = os.environ.get("CLAUDE_MODEL") or None
+
+# 已知模型简称映射
+MODEL_ALIASES: dict[str, str] = {
+    "opus":    "claude-opus-4-6",
+    "sonnet":  "claude-sonnet-4-6",
+    "haiku":   "claude-haiku-4-5-20251001",
+    "opus4":   "claude-opus-4-6",
+    "sonnet4": "claude-sonnet-4-6",
+    "haiku4":  "claude-haiku-4-5-20251001",
+}
+
 app = App(token=SLACK_BOT_TOKEN)
 
 
@@ -146,11 +159,16 @@ def _build_prompt_from_slack(channel: str, current_text: str) -> str:
 def run_claude_async(message: str, say, channel: str = ""):
     """在后台线程运行 claude --print，完成后将输出发回 Slack。"""
     def _worker():
-        say("⏳ Claude 处理中，请稍候…")
+        model_label = f" [{CLAUDE_MODEL}]" if CLAUDE_MODEL else ""
+        say(f"⏳ Claude{model_label} 处理中，请稍候…")
         prompt = _build_prompt_from_slack(channel, message) if channel else message
+        cmd = ["claude", "--print", "--dangerously-skip-permissions"]
+        if CLAUDE_MODEL:
+            cmd += ["--model", CLAUDE_MODEL]
+        cmd.append(prompt)
         try:
             result = subprocess.run(
-                ["claude", "--print", "--dangerously-skip-permissions", prompt],
+                cmd,
                 capture_output=True, text=True,
                 cwd=str(PROJ_DIR), timeout=CLAUDE_TIMEOUT,
             )
@@ -191,6 +209,7 @@ HELP_TEXT = """*E320 Research Agent — 命令列表*
 
 *系统管理*
 `!shell "cmd"`        直接执行 shell 命令
+`!model`              查看/切换 Claude 模型（opus/sonnet/haiku）
 `!update`             git pull + 自动重启 agent
 `!help`               显示此帮助
 
@@ -292,6 +311,21 @@ def handle_command(text: str, say, channel: str = ""):
             say(f"▶ `{cmd}`")
             out = run_shell(cmd, cwd=str(PROJ_DIR), timeout=60)
             say_long(say, f"```\n{out}\n```")
+
+    elif text.startswith("!model"):
+        global CLAUDE_MODEL
+        arg = text[6:].strip().strip('"\'\u201c\u201d\u2018\u2019')
+        if not arg:
+            current = CLAUDE_MODEL or "(默认，由 claude CLI 决定)"
+            aliases_str = "\n".join(f"  `{k}` → `{v}`" for k, v in MODEL_ALIASES.items())
+            say(f"*当前模型*: `{current}`\n\n*可用简称*:\n{aliases_str}\n\n用法: `!model sonnet` 或 `!model claude-opus-4-6`\n`!model default` 恢复默认")
+        elif arg.lower() == "default":
+            CLAUDE_MODEL = None
+            say("✅ 已恢复默认模型（由 claude CLI 决定）")
+        else:
+            resolved = MODEL_ALIASES.get(arg.lower(), arg)
+            CLAUDE_MODEL = resolved
+            say(f"✅ 模型已切换为 `{resolved}`")
 
     elif text == "!update":
         say("🔄 正在后台拉取最新代码，约 10 秒后重启…")
