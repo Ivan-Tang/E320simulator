@@ -54,8 +54,9 @@ MAX_HISTORY_TURNS = 10 # 拉取 Slack 历史的最大轮数
 PBS_POLL_INTERVAL = 60 # qstat 轮询间隔（秒）
 PBS_USER = "yiwen"     # 监控的 PBS 用户名
 
-# 可通过 !model 动态切换；None 表示使用 claude 默认模型
+# 可通过 !model / !effort 动态切换；None 表示使用 claude 默认值
 CLAUDE_MODEL: str | None = os.environ.get("CLAUDE_MODEL") or None
+CLAUDE_EFFORT: str | None = os.environ.get("CLAUDE_EFFORT") or None  # low/medium/high/max
 
 # 已知模型简称映射
 MODEL_ALIASES: dict[str, str] = {
@@ -66,6 +67,7 @@ MODEL_ALIASES: dict[str, str] = {
     "sonnet4": "claude-sonnet-4-6",
     "haiku4":  "claude-haiku-4-5-20251001",
 }
+VALID_EFFORTS = {"low", "medium", "high", "max"}
 
 app = App(token=SLACK_BOT_TOKEN)
 
@@ -159,12 +161,19 @@ def _build_prompt_from_slack(channel: str, current_text: str) -> str:
 def run_claude_async(message: str, say, channel: str = ""):
     """在后台线程运行 claude --print，完成后将输出发回 Slack。"""
     def _worker():
-        model_label = f" [{CLAUDE_MODEL}]" if CLAUDE_MODEL else ""
-        say(f"⏳ Claude{model_label} 处理中，请稍候…")
+        labels = []
+        if CLAUDE_MODEL:
+            labels.append(CLAUDE_MODEL)
+        if CLAUDE_EFFORT:
+            labels.append(f"effort={CLAUDE_EFFORT}")
+        label_str = f" [{', '.join(labels)}]" if labels else ""
+        say(f"⏳ Claude{label_str} 处理中，请稍候…")
         prompt = _build_prompt_from_slack(channel, message) if channel else message
         cmd = ["claude", "--print", "--dangerously-skip-permissions"]
         if CLAUDE_MODEL:
             cmd += ["--model", CLAUDE_MODEL]
+        if CLAUDE_EFFORT:
+            cmd += ["--effort", CLAUDE_EFFORT]
         cmd.append(prompt)
         try:
             result = subprocess.run(
@@ -210,6 +219,7 @@ HELP_TEXT = """*E320 Research Agent — 命令列表*
 *系统管理*
 `!shell "cmd"`        直接执行 shell 命令
 `!model`              查看/切换 Claude 模型（opus/sonnet/haiku）
+`!effort`             查看/切换 effort（low/medium/high/max）
 `!update`             git pull + 自动重启 agent
 `!help`               显示此帮助
 
@@ -311,6 +321,21 @@ def handle_command(text: str, say, channel: str = ""):
             say(f"▶ `{cmd}`")
             out = run_shell(cmd, cwd=str(PROJ_DIR), timeout=60)
             say_long(say, f"```\n{out}\n```")
+
+    elif text.startswith("!effort"):
+        global CLAUDE_EFFORT
+        arg = text[7:].strip().strip('"\'\u201c\u201d\u2018\u2019').lower()
+        if not arg:
+            current = CLAUDE_EFFORT or "(默认，由模型决定)"
+            say(f"*当前 effort*: `{current}`\n\n可选值: `low` | `medium` | `high` | `max`（max 仅限 opus）\n`!effort default` 恢复默认")
+        elif arg == "default":
+            CLAUDE_EFFORT = None
+            say("✅ 已恢复默认 effort")
+        elif arg in VALID_EFFORTS:
+            CLAUDE_EFFORT = arg
+            say(f"✅ effort 已切换为 `{arg}`")
+        else:
+            say(f"❌ 无效的 effort 值 `{arg}`，可选: low / medium / high / max")
 
     elif text.startswith("!model"):
         global CLAUDE_MODEL
