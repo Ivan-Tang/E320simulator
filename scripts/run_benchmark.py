@@ -126,35 +126,34 @@ def train_ml_model(
 
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
+    # Always use a subprocess (single- or multi-GPU) so that each model's GPU
+    # memory is fully released when its subprocess exits.  Without this, a failed
+    # or OOM-ing model leaves 21+ GiB of PyTorch CUDA allocations in the parent
+    # process, causing every subsequent model to OOM as well.
+    edges_file = EDGES_TRAIN if EDGES_TRAIN.exists() else checkpoint_dir / "_tmp_edges.parquet"
+    if not edges_file.exists():
+        print(f"  Writing edges cache → {edges_file}")
+        edges_df.write_parquet(edges_file)
+
+    extra_args = [
+        "--task", "edge",
+        "--edges", str(edges_file),
+        "--model", model_type,
+        "--epochs", str(n_epochs),
+        "--device", "auto" if ddp_nproc > 1 else device,
+        "--checkpoint", str(checkpoint_dir),
+    ]
+    if embedder_checkpoint:
+        extra_args += ["--embedder-checkpoint", embedder_checkpoint]
+
     if ddp_nproc > 1:
-        # Write edges to a file so the torchrun subprocess can read them via --edges
-        tmp_edges = EDGES_TRAIN if EDGES_TRAIN.exists() else checkpoint_dir / "_tmp_edges.parquet"
-        if not tmp_edges.exists():
-            print(f"  Writing edges cache for DDP subprocess → {tmp_edges}")
-            edges_df.write_parquet(tmp_edges)
-        extra = [
-            "--task", "edge",
-            "--edges", str(tmp_edges),
-            "--model", model_type,
-            "--epochs", str(n_epochs),
-            "--device", "auto",
-            "--checkpoint", str(checkpoint_dir),
-        ]
-        if embedder_checkpoint:
-            extra += ["--embedder-checkpoint", embedder_checkpoint]
-        _run_ddp_spawn("src.train", extra, nproc=ddp_nproc, accum_steps=accum_steps)
+        _run_ddp_spawn("src.train", extra_args, nproc=ddp_nproc, accum_steps=accum_steps)
     else:
-        cfg = TrainConfig(
-            model_type          = model_type,
-            n_epochs            = n_epochs,
-            hidden              = 64,
-            n_mp                = 2,
-            lr                  = 3e-4,
-            device              = device,
-            checkpoint_dir      = str(checkpoint_dir),
-            embedder_checkpoint = embedder_checkpoint,
-        )
-        train(edges_df, cfg)
+        cmd = [sys.executable, "-m", "src.train", *extra_args]
+        print(f"  [spawn] {' '.join(cmd)}")
+        result = subprocess.run(cmd)
+        if result.returncode != 0:
+            raise subprocess.CalledProcessError(result.returncode, cmd)
     return str(ckpt_path)
 
 
@@ -376,7 +375,7 @@ def main(
         try:
             result = run_edge_classifier_reco(
                 clusters_test, tracks_test, ckpt_path,
-                threshold=0.1, device=device,
+                threshold=0.5, device=device,
             )
         except Exception as e:
             print(f"  [ERROR] inference failed: {e}")

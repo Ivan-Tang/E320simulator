@@ -348,6 +348,11 @@ def train(
     # Pre-build and shard training event list for DDP
     all_train_events = list(train_df.group_by("event_id"))
     local_train_events = ddp.shard_event_list(all_train_events, rank, world_size)
+    # Rechunk each per-event DataFrame so it owns its memory independently.
+    # Without this, the group-by slices share internal Arrow buffers with train_df;
+    # after many epochs Polars' internal GC can corrupt the column-name strings,
+    # causing "unable to find column; valid columns: ['\0\0\0...' ]" errors.
+    local_train_events = [(k, df.rechunk()) for k, df in local_train_events]
     accum_steps = max(1, cfg.gradient_accumulation_steps)
 
     for epoch in range(1, cfg.n_epochs + 1):
