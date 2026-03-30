@@ -231,8 +231,16 @@ def _evaluate(
 ) -> dict[str, float]:
     model.eval()
     all_scores, all_labels = [], []
+    # Use sort-based slicing instead of group_by to avoid Polars Rust thread panic.
+    _df = df.sort("event_id").rechunk()
+    _eids = _df["event_id"].to_numpy()
+    _u_eids, _bdry = np.unique(_eids, return_index=True)
+    _n = len(_df)
     with torch.no_grad():
-        for _, ev_df in df.group_by("event_id"):
+        for i, eid in enumerate(_u_eids):
+            start = int(_bdry[i])
+            end = int(_bdry[i + 1]) if i + 1 < len(_u_eids) else _n
+            ev_df = _df[start:end]
             nf, ei, ef, lab, _ = event_to_tensors(ev_df)
             if embedder_info is not None:
                 nf = _augment_with_embedder(nf, embedder_info)
@@ -345,14 +353,23 @@ def train(
     best_path: Path | None = None
     t0 = time.time()
 
-    # Pre-build and shard training event list for DDP
-    all_train_events = list(train_df.group_by("event_id"))
+    # Pre-build training event list using sort-based slicing.
+    # DO NOT use train_df.group_by("event_id") here: on large DataFrames (>100M rows)
+    # Polars dispatches group_by to background Rust threads (polars-N) which hit an
+    # internal assertion failure (frame/mod.rs assertion `left == right`) due to a
+    # length inconsistency in rechunked Arrow buffers.  That Rust thread panic causes
+    # a SIGSEGV in the subprocess with no Python traceback, making it appear as a
+    # mysterious "Segmentation fault" in the PBS job log.  Sort + searchsorted avoids
+    # the parallel group_by entirely.
+    train_df = train_df.sort("event_id").rechunk()
+    _eids_np = train_df["event_id"].to_numpy()
+    _unique_eids, _boundaries = np.unique(_eids_np, return_index=True)
+    _n_rows = len(train_df)
+    all_train_events = [
+        (int(eid), train_df[int(_boundaries[i]) : (int(_boundaries[i + 1]) if i + 1 < len(_unique_eids) else _n_rows)])
+        for i, eid in enumerate(_unique_eids)
+    ]
     local_train_events = ddp.shard_event_list(all_train_events, rank, world_size)
-    # Rechunk each per-event DataFrame so it owns its memory independently.
-    # Without this, the group-by slices share internal Arrow buffers with train_df;
-    # after many epochs Polars' internal GC can corrupt the column-name strings,
-    # causing "unable to find column; valid columns: ['\0\0\0...' ]" errors.
-    local_train_events = [(k, df.rechunk()) for k, df in local_train_events]
     accum_steps = max(1, cfg.gradient_accumulation_steps)
 
     for epoch in range(1, cfg.n_epochs + 1):

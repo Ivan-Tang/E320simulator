@@ -109,7 +109,6 @@ def _run_ddp_spawn(
 
 def train_ml_model(
     model_type: str,
-    edges_df: pl.DataFrame,
     checkpoint_dir: Path,
     device: str = "mps",
     n_epochs: int = 50,
@@ -126,20 +125,10 @@ def train_ml_model(
 
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    # Always use a subprocess (single- or multi-GPU) so that each model's GPU
-    # memory is fully released when its subprocess exits.  Without this, a failed
-    # or OOM-ing model leaves 21+ GiB of PyTorch CUDA allocations in the parent
-    # process, causing every subsequent model to OOM as well.
-    edges_file = EDGES_TRAIN if EDGES_TRAIN.exists() else checkpoint_dir / "_tmp_edges.parquet"
-    if edges_file.exists():
-        # Validate schema — a stale file from before edge_label was added would crash training
-        _cols = set(pl.read_parquet_schema(edges_file).names())
-        if "edge_label" not in _cols:
-            print(f"  Stale edges file {edges_file} (no edge_label), overwriting...")
-            edges_df.write_parquet(edges_file)
-    else:
-        print(f"  Writing edges cache → {edges_file}")
-        edges_df.write_parquet(edges_file)
+    # EDGES_TRAIN must already exist (validated in main before entering the ML loop).
+    if not EDGES_TRAIN.exists():
+        raise FileNotFoundError(f"Edge cache missing: {EDGES_TRAIN}")
+    edges_file = EDGES_TRAIN
 
     extra_args = [
         "--task", "edge",
@@ -262,10 +251,7 @@ def main(
             print(f"  Stale edge cache (missing {_REQUIRED_EDGE_COLS - _cached_cols}), deleting and rebuilding...")
             EDGES_TRAIN.unlink()
         else:
-            print(f"  Loading pre-built edges from {EDGES_TRAIN} ...")
-            t0 = time.perf_counter()
-            edges_train = pl.read_parquet(EDGES_TRAIN)
-            print(f"  Loaded {len(edges_train):,} edges  ({time.perf_counter() - t0:.1f}s)")
+            print(f"  Edge cache valid → {EDGES_TRAIN}  (each training subprocess reads it directly)")
     if not EDGES_TRAIN.exists():
         print(f"  Building labeled edges from "
               f"{clusters_train['event_id'].n_unique():,} events ...")
@@ -275,6 +261,7 @@ def main(
         print(f"  Built {len(edges_train):,} candidate edges  ({dt:.1f}s)")
         print(f"  Writing to {EDGES_TRAIN} ...")
         edges_train.write_parquet(EDGES_TRAIN)
+        del edges_train  # free ~14 GB before ML training subprocesses start
         print(f"  Done  ({time.perf_counter() - t0:.1f}s total)")
 
     # ── ML algorithms ─────────────────────────────────────────────────────────
@@ -379,7 +366,7 @@ def main(
         t0 = time.perf_counter()
         try:
             ckpt_path = train_ml_model(
-                model_type, edges_train, ckpt_dir,
+                model_type, ckpt_dir,
                 device=device, n_epochs=epochs, force=force_retrain,
                 embedder_checkpoint=str(embedder_ckpt),
                 ddp_nproc=ddp_nproc, accum_steps=accum_steps,
