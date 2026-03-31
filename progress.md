@@ -122,6 +122,31 @@ Transformer 在 bg=700 下全线 0% 效率 / 100% 误判率，略。
 
 ---
 
+## 2026年3月31日 — 合并冲突解决
+
+### 完成工作
+
+解决了 `feature/ddp` 分支与 `master` 之间的 7 个文件合并冲突（共 20+ 个冲突块）：
+
+- **策略**：对 `src/train*.py`、`scripts/run_benchmark.py` 取 DDP 侧（`src/ddp.py` 提供 backward-compatible 单卡降级）；对 `src/utils.py`、`cluster_agent/agent.py` 取 HEAD 侧
+- **额外修复**：`src/train.py` 中 `_evaluate` 函数签名从 `(model, device, ...)` 改为 `(model, df, device, ...)` 以匹配 DDP 版调用约定
+- **关键改进**（来自 DDP 侧）：Polars `group_by` → sort-based slicing，修复大 DataFrame 上的 Rust thread panic（segfault in PBS）
+- **测试**：全部 86 个 pytest 测试通过
+- **推送**：已 push 至 remote，PBS 作业可以看到最新代码
+
+### 单卡 benchmark 使用方式
+
+```bash
+# 提交 PBS 作业
+qsub subs/benchmark.sh
+# 或交互式（小规模测试）
+conda run -n e320root python scripts/run_benchmark.py --device cuda --epochs 200 --workers 8
+```
+
+DDP 参数 `--ddp-nproc` 默认为 1（单卡），无需特殊配置。
+
+---
+
 ## 下一步计划
 
 1. **分析 InteractionNet 失效案例**：当前 70.6% 效率 vs 95% 目标，差距主要来自哪类事件/径迹？（低动量？特殊几何？）
