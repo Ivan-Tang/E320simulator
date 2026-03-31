@@ -103,11 +103,11 @@ Transformer 在 bg=700 下全线 0% 效率 / 100% 误判率，略。
 
 - **Transformer checkpoint 失效**：需要重新训练，或完全重新设计针对 E320 的 TrackFormer-Seed。
 - **EggNet NaN/低效率**：checkpoint 疑似有问题，需重新训练。
-- **OOM 根因**：`build_labeled_edges_from_sim(35M clusters)` 构建全量边图超出内存。若需重新训练模型，须将边图构建与训练拆分为独立 job，或大幅减少训练集规模。
+- ~~**OOM 根因**：`build_labeled_edges_from_sim(35M clusters)` 构建全量边图超出内存~~。**已修复**：`scripts/build_edges.py` 实现分批（200 events/batch）流式写 Parquet 的独立预处理脚本，可单独作为 PBS job 运行。
 - **所有方法效率上限 ~83%，远低于 95% 目标**：需专门针对 E320 设计并重新训练模型。
 - **EggNet 和 Transformer checkpoints 基本无效**：需重新训练。
 - **InteractionNet 是最有希望的起点**：误判率已降至 14.3%，但效率仍需从 70.6% 提升到 ≥95%。
-- `src/baseline.py:110-111`：divide-by-zero RuntimeWarning（dz=0），需修复。
+- ~~`src/baseline.py:110-111`：divide-by-zero RuntimeWarning（dz=0）~~。**已修复**：`np.errstate(divide="ignore", invalid="ignore")` 已包裹斜率计算（`baseline.py:112-114`）。
 
 ---
 
@@ -116,8 +116,7 @@ Transformer 在 bg=700 下全线 0% 效率 / 100% 误判率，略。
 1. **分析 InteractionNet 失效案例**：当前 70.6% 效率 vs 95% 目标，差距主要来自哪类事件/径迹？（低动量？特殊几何？）
 2. **重新训练 Transformer（TrackFormer-Seed）**：现有 checkpoint 完全失效（99.7% fake），从头设计针对 E320 低信噪比的训练流程
 3. **重新训练 EggNet**：当前 1.4% 效率，checkpoint 基本无效，需重训或放弃
-4. **若需重训 ML 模型**：将边图构建（`build_labeled_edges_from_sim`）单独提交为独立 job，避免 OOM
-5. **修复 baseline divide-by-zero**：`src/baseline.py:110-111`（dz=0 时斜率计算）
+4. **若需重训 ML 模型**：使用 `scripts/build_edges.py` 单独提交边图构建 job，再提交训练 job（OOM 问题已解决）
 
 ---
 
