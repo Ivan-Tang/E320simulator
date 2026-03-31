@@ -17,6 +17,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -45,51 +46,111 @@ from src.config import DATA_ROOT, SIM_DIR, RUNS_DIR, OUTPUTS_DIR as OUT_DIR
 TRAIN_CLUSTERS = SIM_DIR / "sim_clusters_train.parquet"
 TEST_CLUSTERS  = SIM_DIR / "sim_clusters_test.parquet"
 TEST_TRACKS    = SIM_DIR / "sim_tracks_test.parquet"
+EDGES_TRAIN    = SIM_DIR / "edges_train.parquet"
 
 # ML model types to benchmark
-# "transformer_edge" = TransformerEdgeClassifier (edge classifier, balanced sampling)
-# "trackformer"      = TrackFormer two-stage (HitFilter + MaskFormer)
-ML_MODELS = ["mlp", "gnn", "interaction_net", "eggnet", "hgnn", "transformer_edge", "trackformer"]
+ML_MODELS = ["mlp", "gnn", "interaction_net", "eggnet", "hgnn"]
+
+
+# ── DDP subprocess helper ──────────────────────────────────────────────────────
+
+def _run_ddp_spawn(
+    module: str,
+    extra_args: list[str],
+    nproc: int,
+    accum_steps: int,
+) -> None:
+    """Launch a training module with DDP via subprocess + file:// rendezvous.
+
+    Avoids ``torchrun --standalone`` which segfaults on this cluster due to a
+    bug in ``c10d_rendezvous_backend._call_store``.  Instead we manually spawn
+    one subprocess per rank, set RANK / LOCAL_RANK / WORLD_SIZE, and use a
+    temporary file as the rendezvous store.
+    """
+    import os, tempfile, time as _time
+    init_file = os.path.join(tempfile.gettempdir(),
+                             f"ddp_init_{int(_time.time())}.store")
+    env_base = os.environ.copy()
+    env_base["WORLD_SIZE"] = str(nproc)
+    env_base["MASTER_ADDR"] = "localhost"
+    env_base["MASTER_PORT"] = "29400"
+    env_base["DDP_INIT_METHOD"] = f"file://{init_file}"
+    env_base["NCCL_P2P_DISABLE"] = "1"   # required on this cluster
+
+    cmd_suffix = [
+        sys.executable, "-m", module,
+        *extra_args,
+        "--gradient-accumulation-steps", str(accum_steps),
+    ]
+    print(f"  [ddp-spawn] {nproc}× {' '.join(cmd_suffix)}")
+    procs = []
+    for rank in range(nproc):
+        env = env_base.copy()
+        env["RANK"] = str(rank)
+        env["LOCAL_RANK"] = str(rank)
+        procs.append(subprocess.Popen(cmd_suffix, env=env))
+
+    failed = False
+    for rank, proc in enumerate(procs):
+        code = proc.wait()
+        if code != 0:
+            print(f"  [ddp-spawn] rank {rank} exited with code {code}")
+            failed = True
+
+    # Clean up rendezvous file
+    try:
+        os.remove(init_file)
+    except FileNotFoundError:
+        pass
+
+    if failed:
+        raise subprocess.CalledProcessError(1, cmd_suffix)
 
 
 # ── Training helper ───────────────────────────────────────────────────────────
 
 def train_ml_model(
     model_type: str,
-    clusters_df: pl.DataFrame,
     checkpoint_dir: Path,
     device: str = "mps",
     n_epochs: int = 50,
     force: bool = False,
     embedder_checkpoint: str | None = None,
-    balanced_sampling: bool = False,
-    neg_pos_ratio: int = 100,
+    ddp_nproc: int = 1,
+    accum_steps: int = 1,
 ) -> str:
-    """Build edges, train model, and save checkpoint.  Returns checkpoint path."""
+    """Train model on pre-built edges and save checkpoint.  Returns checkpoint path."""
     ckpt_path = checkpoint_dir / "best_model.pt"
     if ckpt_path.exists() and not force:
         print(f"  checkpoint exists → skipping training: {ckpt_path}")
         return str(ckpt_path)
 
-    print(f"  Building labeled edges from {clusters_df['event_id'].n_unique():,} events "
-          f"({len(clusters_df):,} clusters)...")
-    edges_df = build_labeled_edges_from_sim(clusters_df)
-    print(f"  Built {len(edges_df):,} candidate edges")
-
-    cfg = TrainConfig(
-        model_type          = model_type,
-        n_epochs            = n_epochs,
-        hidden              = 64,
-        n_mp                = 2,
-        lr                  = 3e-4,
-        device              = device,
-        checkpoint_dir      = str(checkpoint_dir),
-        embedder_checkpoint = embedder_checkpoint,
-        balanced_sampling   = balanced_sampling,
-        neg_pos_ratio       = neg_pos_ratio,
-    )
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    train(edges_df, cfg)
+
+    # EDGES_TRAIN must already exist (validated in main before entering the ML loop).
+    if not EDGES_TRAIN.exists():
+        raise FileNotFoundError(f"Edge cache missing: {EDGES_TRAIN}")
+    edges_file = EDGES_TRAIN
+
+    extra_args = [
+        "--task", "edge",
+        "--edges", str(edges_file),
+        "--model", model_type,
+        "--epochs", str(n_epochs),
+        "--device", "auto" if ddp_nproc > 1 else device,
+        "--checkpoint", str(checkpoint_dir),
+    ]
+    if embedder_checkpoint:
+        extra_args += ["--embedder-checkpoint", embedder_checkpoint]
+
+    if ddp_nproc > 1:
+        _run_ddp_spawn("src.train", extra_args, nproc=ddp_nproc, accum_steps=accum_steps)
+    else:
+        cmd = [sys.executable, "-m", "src.train", *extra_args]
+        print(f"  [spawn] {' '.join(cmd)}")
+        result = subprocess.run(cmd)
+        if result.returncode != 0:
+            raise subprocess.CalledProcessError(result.returncode, cmd)
     return str(ckpt_path)
 
 
@@ -100,6 +161,8 @@ def main(
     force_retrain: bool = False,
     epochs: int = 200,
     workers: int = 1,
+    ddp_nproc: int = 1,
+    accum_steps: int = 1,
 ) -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -115,9 +178,13 @@ def main(
           f"({clusters_test['event_id'].n_unique():,} events)")
     print(f"  Test  tracks   : {len(tracks_test):,}")
     print(f"  workers        : {workers}")
+    if ddp_nproc > 1:
+        print(f"  DDP nproc      : {ddp_nproc}  accum_steps={accum_steps}")
 
     baseline_cfg = BaselineConfig(n_workers=workers)
     hough_cfg    = HoughConfig(n_workers=workers)
+
+    n_test_events = clusters_test["event_id"].n_unique()
 
     reco_paths: dict[str, str] = {}
 
@@ -133,10 +200,11 @@ def main(
         t0 = time.perf_counter()
         result = fn()
         dt = time.perf_counter() - t0
+        per_evt_ms = dt / n_test_events * 1e3
         out = OUT_DIR / f"{name.lower()}_test.parquet"
         result.write_parquet(out)
         reco_paths[name] = str(out)
-        print(f"  → {out}  ({dt:.1f}s)")
+        print(f"  → {out}  ({dt:.1f}s total  {per_evt_ms:.2f} ms/event)")
 
     # ── Stage 0: Shared metric-learning embedder (hinge loss) ────────────────
     print("\n" + "=" * 65)
@@ -147,15 +215,56 @@ def main(
     t0 = time.perf_counter()
     if embedder_ckpt.exists() and not force_retrain:
         print(f"  checkpoint exists → skipping: {embedder_ckpt}")
-    else:
-        emb_cfg = EmbedderTrainConfig(
-            emb_dim        = 8,
-            n_epochs       = epochs,
-            device         = device,
-            checkpoint_dir = str(embedder_dir),
+    elif ddp_nproc > 1:
+        _run_ddp_spawn(
+            "src.train",
+            ["--task", "embedder",
+             "--clusters", str(TRAIN_CLUSTERS),
+             "--epochs", str(epochs),
+             "--device", "auto",
+             "--checkpoint", str(embedder_dir)],
+            nproc=ddp_nproc,
+            accum_steps=accum_steps,
         )
-        train_embedder(clusters_train, emb_cfg)
+    else:
+        # Run in subprocess so GPU memory is fully released when embedder exits,
+        # avoiding CUDA fragmentation that would affect subsequent ML model training.
+        cmd = [
+            sys.executable, "-m", "src.train",
+            "--task", "embedder",
+            "--clusters", str(TRAIN_CLUSTERS),
+            "--epochs", str(epochs),
+            "--device", device,
+            "--checkpoint", str(embedder_dir),
+        ]
+        print(f"  [spawn] {' '.join(cmd)}")
+        emb_result = subprocess.run(cmd)
+        if emb_result.returncode != 0:
+            raise subprocess.CalledProcessError(emb_result.returncode, cmd)
     print(f"  embedder → {embedder_ckpt}  ({time.perf_counter() - t0:.0f}s)")
+
+    # ── Shared edge table (built once, reused by all ML models) ──────────────
+    print("\n" + "=" * 65)
+    print("Building/loading edge table for ML training...")
+    _REQUIRED_EDGE_COLS = {"edge_label", "event_id", "is_signal_edge"}
+    if EDGES_TRAIN.exists():
+        _cached_cols = set(pl.read_parquet_schema(EDGES_TRAIN).names())
+        if not _REQUIRED_EDGE_COLS.issubset(_cached_cols):
+            print(f"  Stale edge cache (missing {_REQUIRED_EDGE_COLS - _cached_cols}), deleting and rebuilding...")
+            EDGES_TRAIN.unlink()
+        else:
+            print(f"  Edge cache valid → {EDGES_TRAIN}  (each training subprocess reads it directly)")
+    if not EDGES_TRAIN.exists():
+        print(f"  Building labeled edges from "
+              f"{clusters_train['event_id'].n_unique():,} events ...")
+        t0 = time.perf_counter()
+        edges_train = build_labeled_edges_from_sim(clusters_train)
+        dt = time.perf_counter() - t0
+        print(f"  Built {len(edges_train):,} candidate edges  ({dt:.1f}s)")
+        print(f"  Writing to {EDGES_TRAIN} ...")
+        edges_train.write_parquet(EDGES_TRAIN)
+        del edges_train  # free ~14 GB before ML training subprocesses start
+        print(f"  Done  ({time.perf_counter() - t0:.1f}s total)")
 
     # ── ML algorithms ─────────────────────────────────────────────────────────
     print("\n" + "=" * 65)
@@ -208,6 +317,17 @@ def main(
             try:
                 if Path(hf_ckpt_path).exists() and not force_retrain:
                     print(f"  [Stage 1] hit filter checkpoint exists → skipping: {hf_ckpt_path}")
+                elif ddp_nproc > 1:
+                    print("  [Stage 1] Training hit filter (DDP)...")
+                    _run_ddp_spawn(
+                        "src.train_hit_filter",
+                        ["--clusters", str(TRAIN_CLUSTERS),
+                         "--epochs", str(epochs),
+                         "--device", "auto",
+                         "--checkpoint", str(ckpt_dir)],
+                        nproc=ddp_nproc,
+                        accum_steps=accum_steps,
+                    )
                 else:
                     print("  [Stage 1] Training hit filter...")
                     hf_cfg = HitFilterConfig(
@@ -226,6 +346,19 @@ def main(
             try:
                 if Path(tf_ckpt_path).exists() and not force_retrain:
                     print(f"  [Stage 2] trackformer checkpoint exists → skipping: {tf_ckpt_path}")
+                elif ddp_nproc > 1:
+                    print("  [Stage 2] Training MaskFormer on filtered hits (DDP)...")
+                    _run_ddp_spawn(
+                        "src.train_trackformer",
+                        ["--clusters", str(TRAIN_CLUSTERS),
+                         "--epochs", str(epochs),
+                         "--device", "auto",
+                         "--checkpoint", str(ckpt_dir),
+                         "--hit-filter-checkpoint", hf_ckpt_path,
+                         "--hit-filter-threshold", "0.1"],
+                        nproc=ddp_nproc,
+                        accum_steps=accum_steps,
+                    )
                 else:
                     print("  [Stage 2] Training MaskFormer on filtered hits...")
                     tf_cfg = TrackFormerConfig(
@@ -258,38 +391,51 @@ def main(
             out = OUT_DIR / f"{model_type}_test.parquet"
             result.write_parquet(out)
             reco_paths[model_type.upper()] = str(out)
-            print(f"  → {out}  (hf_train {hf_train_dt:.0f}s  tf_train {tf_train_dt:.0f}s  infer {infer_dt:.1f}s)")
+            per_evt_ms = infer_dt / n_test_events * 1e3
+            print(f"  → {out}  (hf_train {hf_train_dt:.0f}s  tf_train {tf_train_dt:.0f}s  infer {infer_dt:.1f}s  {per_evt_ms:.2f} ms/event)")
             continue
 
         # ── Edge-classification models ─────────────────────────────────────
         t0 = time.perf_counter()
         try:
             ckpt_path = train_ml_model(
-                model_type, clusters_train, ckpt_dir,
+                model_type, ckpt_dir,
                 device=device, n_epochs=epochs, force=force_retrain,
                 embedder_checkpoint=str(embedder_ckpt),
+                ddp_nproc=ddp_nproc, accum_steps=accum_steps,
             )
         except Exception as e:
             print(f"  [ERROR] training failed: {e}")
             continue
         train_dt = time.perf_counter() - t0
 
-        # Inference
+        # Inference — run in subprocess to fully release GPU memory between models.
+        # This prevents CUDA fragmentation/segfaults in the main process that
+        # accumulate across 5+ models when running in-process.
+        out = OUT_DIR / f"{model_type}_test.parquet"
         t0 = time.perf_counter()
         try:
-            result = run_edge_classifier_reco(
-                clusters_test, tracks_test, ckpt_path,
-                threshold=0.1, device=device,
-            )
+            infer_cmd = [
+                sys.executable, "-m", "scripts.run_model",
+                "--mode", "edge",
+                "--clusters", str(TEST_CLUSTERS),
+                "--tracks", str(TEST_TRACKS),
+                "--edge-checkpoint", ckpt_path,
+                "--device", device,
+                "--output", str(out),
+            ]
+            print(f"  [spawn] {' '.join(infer_cmd)}")
+            infer_result = subprocess.run(infer_cmd)
+            if infer_result.returncode != 0:
+                raise subprocess.CalledProcessError(infer_result.returncode, infer_cmd)
         except Exception as e:
             print(f"  [ERROR] inference failed: {e}")
             continue
         infer_dt = time.perf_counter() - t0
 
-        out = OUT_DIR / f"{model_type}_test.parquet"
-        result.write_parquet(out)
         reco_paths[model_type.upper()] = str(out)
-        print(f"  → {out}  (train {train_dt:.0f}s  infer {infer_dt:.1f}s)")
+        per_evt_ms = infer_dt / n_test_events * 1e3
+        print(f"  → {out}  (train {train_dt:.0f}s  infer {infer_dt:.1f}s  {per_evt_ms:.2f} ms/event)")
 
     # ── Comparison table ──────────────────────────────────────────────────────
     print("\n" + "=" * 65)
@@ -299,16 +445,22 @@ def main(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Benchmark E320 tracking algorithms")
-    parser.add_argument("--device",           default="mps", choices=["cpu", "cuda", "mps"])
+    parser.add_argument("--device",           default="mps", choices=["cpu", "cuda", "mps", "auto"])
     parser.add_argument("--epochs",           type=int, default=200)
-    parser.add_argument("--workers",       type=int, default=1,
+    parser.add_argument("--workers",          type=int, default=1,
                         help="Parallel workers for non-ML algorithms (default 1 to limit memory)")
-    parser.add_argument("--force-retrain", action="store_true",
+    parser.add_argument("--force-retrain",    action="store_true",
                         help="Re-train even if checkpoint already exists")
+    parser.add_argument("--ddp-nproc",        type=int, default=1,
+                        help="Number of GPUs for DDP training (1 = single-GPU, no DDP)")
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1,
+                        help="Gradient accumulation steps for DDP training")
     args = parser.parse_args()
     main(
-        device=args.device,
-        force_retrain=args.force_retrain,
-        epochs=args.epochs,
-        workers=args.workers,
+        device       = args.device,
+        force_retrain= args.force_retrain,
+        epochs       = args.epochs,
+        workers      = args.workers,
+        ddp_nproc    = args.ddp_nproc,
+        accum_steps  = args.gradient_accumulation_steps,
     )

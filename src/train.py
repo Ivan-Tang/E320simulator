@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -32,6 +33,8 @@ from src.models import (
     ResGNN, EggNet, HierarchicalGNN,
 )
 from src.losses import FocalLoss, HingeLoss
+import torch.distributed as dist
+import src.ddp as ddp
 from src.train_embedder import EmbedderTrainConfig, train_embedder
 from src.utils import (
     EDGE_DIM,
@@ -108,6 +111,7 @@ class TrainConfig:
 
     # hardware
     device: str = "auto"                 # "auto" | "cpu" | "mps" | "cuda"
+    gradient_accumulation_steps: int = 1  # accumulate gradients over N events before optimizer step
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -257,30 +261,28 @@ def _normalise(
 
 def _evaluate(
     model: nn.Module,
+    df: pl.DataFrame,
     device: torch.device,
     node_mean: torch.Tensor,
     node_std: torch.Tensor,
     edge_mean: torch.Tensor,
     edge_std: torch.Tensor,
     embedder_info: dict | None = None,
-    df: pl.DataFrame | None = None,
-    edge_source: ParquetEdgeSource | None = None,
-    event_ids: list[int] | None = None,
 ) -> dict[str, float]:
     """Evaluate edge classifier.  Accepts either an in-memory DataFrame or a
     ParquetEdgeSource (with an optional list of event IDs to evaluate)."""
     model.eval()
     all_scores, all_labels = [], []
-
-    if df is not None:
-        event_iter = ((eid, ev_df) for eid, ev_df in df.group_by("event_id"))
-    elif edge_source is not None:
-        event_iter = edge_source.iter_events(event_ids)
-    else:
-        raise ValueError("Either df or edge_source must be provided to _evaluate()")
-
+    # Use sort-based slicing instead of group_by to avoid Polars Rust thread panic.
+    _df = df.sort("event_id").rechunk()
+    _eids = _df["event_id"].to_numpy()
+    _u_eids, _bdry = np.unique(_eids, return_index=True)
+    _n = len(_df)
     with torch.no_grad():
-        for _, ev_df in event_iter:
+        for i, eid in enumerate(_u_eids):
+            start = int(_bdry[i])
+            end = int(_bdry[i + 1]) if i + 1 < len(_u_eids) else _n
+            ev_df = _df[start:end]
             nf, ei, ef, lab, _ = event_to_tensors(ev_df)
             if embedder_info is not None:
                 nf = _augment_with_embedder(nf, embedder_info)
@@ -348,11 +350,9 @@ def train(
     if cfg is None:
         cfg = TrainConfig()
 
-    device = _resolve_device(cfg)
-    torch.manual_seed(cfg.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(cfg.seed)
-    print(f"[train] device={device}  model={cfg.model_type}  epochs={cfg.n_epochs}  seed={cfg.seed}")
+    rank, world_size, is_ddp = ddp.setup_ddp()
+    device = ddp.resolve_device(cfg.device)
+    ddp.ddp_print(f"[train] device={device}  model={cfg.model_type}  epochs={cfg.n_epochs}")
 
     # ── train / val split ────────────────────────────────────────────────────
     if use_parquet:
@@ -365,24 +365,19 @@ def train(
     train_eids = set(all_events[:n_train].tolist())
     val_eids   = set(all_events[n_train:].tolist())
 
-    if use_parquet:
-        stats = edge_source.compute_edge_label_stats(train_eids | val_eids)
-        train_df = None
-        val_df   = None
-    else:
-        train_df = edges_df.filter(pl.col("event_id").is_in(list(train_eids)))
-        val_df   = edges_df.filter(pl.col("event_id").is_in(list(val_eids)))
-        stats = edge_label_stats(edges_df)
+    train_df = edges_df.filter(pl.col("event_id").is_in(list(train_eids))).rechunk()
+    val_df   = edges_df.filter(pl.col("event_id").is_in(list(val_eids))).rechunk()
 
-    print(f"[train] total edges={stats['n_total']:,}  "
-          f"pos={stats['n_positive']}  "
-          f"pos_frac={stats['positive_fraction']:.5f}")
-    print(f"[train] train events={len(train_eids)}  val events={len(val_eids)}")
+    stats = edge_label_stats(edges_df)
+    ddp.ddp_print(f"[train] total edges={stats['n_total']:,}  "
+                  f"pos={stats['n_positive']}  "
+                  f"pos_frac={stats['positive_fraction']:.5f}")
+    ddp.ddp_print(f"[train] train events={len(train_eids)}  val events={len(val_eids)}")
 
-    if not use_parquet:
-        n_pos_train = int(train_df.filter(pl.col("edge_label") == 1).height)
-        n_pos_val   = int(val_df.filter(pl.col("edge_label") == 1).height)
-        print(f"[train] pos_train={n_pos_train}  pos_val={n_pos_val}")
+    # per-split positive counts
+    n_pos_train = int(train_df.filter(pl.col("edge_label") == 1).height)
+    n_pos_val = int(val_df.filter(pl.col("edge_label") == 1).height)
+    ddp.ddp_print(f"[train] pos_train={n_pos_train}  pos_val={n_pos_val}")
 
     # ── normalisation ────────────────────────────────────────────────────────
     if use_parquet:
@@ -398,41 +393,29 @@ def train(
     node_dim_eff = NODE_DIM
     if embedder_info is not None:
         node_dim_eff = embedder_info["_emb_dim"]
-        print(f"[train] embedder pipeline: node_dim {NODE_DIM} → {node_dim_eff} (embedder replaces raw features)")
+        ddp.ddp_print(f"[train] embedder pipeline: node_dim {NODE_DIM} → {node_dim_eff} (embedder replaces raw features)")
 
     # ── model / optimiser ────────────────────────────────────────────────────
-    model     = _build_model(cfg, node_dim=node_dim_eff).to(device)
-    # For balanced sampling, reset Transformer classifier bias to neutral (0.0)
-    # so sigmoid output ~0.5 at init; BCELoss on balanced data will calibrate it.
-    if cfg.balanced_sampling and cfg.model_type == "transformer":
-        model.classifier[-1].bias.data.fill_(0.0)
-    if cfg.balanced_sampling:
-        criterion = None   # computed per-batch with pos_weight (see training loop)
-    else:
-        criterion = FocalLoss(alpha=cfg.focal_alpha, gamma=cfg.focal_gamma)
+    # HGNN may have unused parameters (last_embeddings is conditional)
+    _find_unused = cfg.model_type == "hgnn"
+    model, raw_model = ddp.maybe_wrap_ddp(
+        _build_model(cfg, node_dim=node_dim_eff), device,
+        find_unused_parameters=_find_unused,
+    )
+    criterion = FocalLoss(alpha=cfg.focal_alpha, gamma=cfg.focal_gamma)
     emb_criterion = HingeLoss(margin=1.0) if cfg.model_type == "hgnn" and cfg.hgnn_emb_loss_weight > 0 else None
-    optimizer = optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-    cosine_sched = optim.lr_scheduler.CosineAnnealingLR(
+    optimizer = optim.Adam(raw_model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=cfg.n_epochs, eta_min=cfg.lr_eta_min
     )
-    if cfg.warmup_epochs > 0:
-        warmup_sched = optim.lr_scheduler.LinearLR(
-            optimizer, start_factor=0.01, end_factor=1.0, total_iters=cfg.warmup_epochs
-        )
-        scheduler = optim.lr_scheduler.SequentialLR(
-            optimizer, schedulers=[warmup_sched, cosine_sched], milestones=[cfg.warmup_epochs]
-        )
-    else:
-        scheduler = cosine_sched
-    n_params = sum(p.numel() for p in model.parameters())
-    print(f"[train] params={n_params:,}")
+    n_params = sum(p.numel() for p in raw_model.parameters())
+    ddp.ddp_print(f"[train] params={n_params:,}")
 
-    # ── checkpoint dir ───────────────────────────────────────────────────────
+    # ── checkpoint dir (rank-0 only) ─────────────────────────────────────────
     ckpt_dir: Path | None = None
-    if cfg.checkpoint_dir:
+    if cfg.checkpoint_dir and ddp.is_main_process():
         ckpt_dir = Path(cfg.checkpoint_dir)
         ckpt_dir.mkdir(parents=True, exist_ok=True)
-        # save config alongside weights
         cfg_path = ckpt_dir / "config.json"
         cfg_path.write_text(json.dumps(dataclasses.asdict(cfg), indent=2))
 
@@ -442,24 +425,34 @@ def train(
     best_path: Path | None = None
     t0 = time.time()
 
-    # Pre-compute shuffled train event list for epoch-level randomness (parquet path)
-    train_eids_list = sorted(train_eids)
-    val_eids_list   = sorted(val_eids)
+    # Pre-build training event list using sort-based slicing.
+    # DO NOT use train_df.group_by("event_id") here: on large DataFrames (>100M rows)
+    # Polars dispatches group_by to background Rust threads (polars-N) which hit an
+    # internal assertion failure (frame/mod.rs assertion `left == right`) due to a
+    # length inconsistency in rechunked Arrow buffers.  That Rust thread panic causes
+    # a SIGSEGV in the subprocess with no Python traceback, making it appear as a
+    # mysterious "Segmentation fault" in the PBS job log.  Sort + searchsorted avoids
+    # the parallel group_by entirely.
+    train_df = train_df.sort("event_id").rechunk()
+    _eids_np = train_df["event_id"].to_numpy()
+    _unique_eids, _boundaries = np.unique(_eids_np, return_index=True)
+    _n_rows = len(train_df)
+    all_train_events = [
+        (int(eid), train_df[int(_boundaries[i]) : (int(_boundaries[i + 1]) if i + 1 < len(_unique_eids) else _n_rows)])
+        for i, eid in enumerate(_unique_eids)
+    ]
+    local_train_events = ddp.shard_event_list(all_train_events, rank, world_size)
+    accum_steps = max(1, cfg.gradient_accumulation_steps)
 
     for epoch in range(1, cfg.n_epochs + 1):
         model.train()
         epoch_loss = 0.0
         n_batches  = 0
 
-        # Shuffle training event order each epoch for SGD diversity
-        rng.shuffle(train_eids_list)
+        optimizer.zero_grad()
+        accum_count = 0  # events processed since last optimizer step
 
-        if use_parquet:
-            epoch_event_iter = edge_source.iter_events(train_eids_list)
-        else:
-            epoch_event_iter = ((eid, ev_df) for eid, ev_df in train_df.group_by("event_id"))
-
-        for _, ev_df in epoch_event_iter:
+        for i, (_, ev_df) in enumerate(local_train_events):
             nf, ei, ef, lab, _ = event_to_tensors(ev_df)
             if cfg.skip_zero_pos_events and lab.sum() == 0:
                 continue
@@ -484,7 +477,6 @@ def train(
             ef  = ef.to(device)
             lab = lab.to(device)
 
-            optimizer.zero_grad()
             pred = model(nf, ei, ef)
             if cfg.balanced_sampling:
                 # Give each positive edge neg_pos_ratio× more weight to counteract
@@ -500,15 +492,29 @@ def train(
             else:
                 loss = criterion(pred, lab)
             # Optional embedding loss for HGNN (two-stage training from Liu et al. 2023)
-            if emb_criterion is not None and hasattr(model, "last_embeddings") and model.last_embeddings is not None:
-                emb = model.last_embeddings          # (N, emb_dim), L2-normalised
+            _inner_model = raw_model  # unwrapped reference for attribute access
+            if emb_criterion is not None and hasattr(_inner_model, "last_embeddings") and _inner_model.last_embeddings is not None:
+                emb = _inner_model.last_embeddings   # (N, emb_dim), L2-normalised
                 e_src = emb[ei[0]]                   # (E, emb_dim)
                 e_dst = emb[ei[1]]                   # (E, emb_dim)
-                dist = (e_src - e_dst).norm(dim=-1)  # (E,)
-                loss = loss + cfg.hgnn_emb_loss_weight * emb_criterion(dist, lab)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-            optimizer.step()
+                dist_ = (e_src - e_dst).norm(dim=-1) # (E,)
+                loss = loss + cfg.hgnn_emb_loss_weight * emb_criterion(dist_, lab)
+            # Release last_embeddings immediately after use (or non-use) to avoid
+            # accumulation of stale CUDA tensors across events, which can fragment
+            # GPU memory and trigger a segfault in later epochs.
+            if hasattr(_inner_model, "last_embeddings"):
+                _inner_model.last_embeddings = None
+
+            # Scale loss for gradient accumulation
+            (loss / accum_steps).backward()
+            accum_count += 1
+
+            is_last_event = (i + 1) == len(local_train_events)
+            if accum_count >= accum_steps or is_last_event:
+                torch.nn.utils.clip_grad_norm_(raw_model.parameters(), cfg.grad_clip)
+                optimizer.step()
+                optimizer.zero_grad()
+                accum_count = 0
 
             epoch_loss += loss.item()
             n_batches  += 1
@@ -518,52 +524,54 @@ def train(
 
         row: dict = {"epoch": epoch, "train_loss": avg_loss}
 
-        # ── validation ───────────────────────────────────────────────────────
+        # ── validation (rank-0 only) ──────────────────────────────────────────
         if epoch % cfg.log_every == 0 or epoch == 1 or epoch == cfg.n_epochs:
-            metrics = _evaluate(
-                model, device,
-                node_mean, node_std, edge_mean, edge_std,
-                embedder_info=embedder_info,
-                df=val_df if not use_parquet else None,
-                edge_source=edge_source if use_parquet else None,
-                event_ids=val_eids_list if use_parquet else None,
-            )
-            row.update(metrics)
-            elapsed = time.time() - t0
-            print(
-                f"Epoch {epoch:>3}/{cfg.n_epochs} | "
-                f"loss={avg_loss:.6f} | "
-                f"AUC={metrics['auc']:.4f} | "
-                f"AP={metrics['ap']:.4f} | "
-                f"t={elapsed:.0f}s"
-            )
+            if ddp.is_main_process():
+                metrics = _evaluate(
+                    raw_model, val_df, device,
+                    node_mean, node_std, edge_mean, edge_std,
+                    embedder_info=embedder_info,
+                )
+                row.update(metrics)
+                elapsed = time.time() - t0
+                ddp.ddp_print(
+                    f"Epoch {epoch:>3}/{cfg.n_epochs} | "
+                    f"loss={avg_loss:.6f} | "
+                    f"AUC={metrics['auc']:.4f} | "
+                    f"AP={metrics['ap']:.4f} | "
+                    f"t={elapsed:.0f}s"
+                )
 
-            # ── save best checkpoint ──────────────────────────────────────────
-            if metrics["ap"] > best_ap:
-                best_ap = metrics["ap"]
-                if ckpt_dir is not None:
-                    best_path = ckpt_dir / "best_model.pt"
-                    torch.save(
-                        {
-                            "epoch":      epoch,
-                            "model_state": model.state_dict(),
-                            "optimizer_state": optimizer.state_dict(),
-                            "best_ap":    best_ap,
-                            "node_mean":  node_mean,
-                            "node_std":   node_std,
-                            "edge_mean":  edge_mean,
-                            "edge_std":   edge_std,
-                            "node_dim":   node_dim_eff,
-                        },
-                        best_path,
-                    )
+                # ── save best checkpoint ──────────────────────────────────────
+                if metrics["ap"] > best_ap:
+                    best_ap = metrics["ap"]
+                    if ckpt_dir is not None:
+                        best_path = ckpt_dir / "best_model.pt"
+                        torch.save(
+                            {
+                                "epoch":           epoch,
+                                "model_state":     raw_model.state_dict(),
+                                "optimizer_state": optimizer.state_dict(),
+                                "best_ap":         best_ap,
+                                "node_mean":       node_mean,
+                                "node_std":        node_std,
+                                "edge_mean":       edge_mean,
+                                "edge_std":        edge_std,
+                                "node_dim":        node_dim_eff,
+                            },
+                            best_path,
+                        )
+            # Sync all ranks after validation
+            if dist.is_initialized():
+                dist.barrier()
 
         history.append(row)
 
-    print(f"[train] done  best_AP={best_ap:.4f}  checkpoint={best_path}")
+    ddp.ddp_print(f"[train] done  best_AP={best_ap:.4f}  checkpoint={best_path}")
+    ddp.cleanup_ddp()
 
     return {
-        "model":      model.cpu(),
+        "model":      raw_model.cpu(),
         "history":    history,
         "node_mean":  node_mean,
         "node_std":   node_std,
@@ -670,8 +678,10 @@ def train_model(
 
 def _cli() -> None:
     parser = argparse.ArgumentParser(description="Unified trainer for edge models and embedder")
-    parser.add_argument("--clusters", default=None,
-                        help="Path to sim_clusters.parquet (required unless --edges-dir is given)")
+    parser.add_argument("--clusters", default=None, help="Path to sim_clusters.parquet")
+    parser.add_argument("--edges", default=None,
+                        help="Path to pre-built edges.parquet (skips cluster loading and "
+                             "build_labeled_edges_from_sim; required when --clusters is omitted)")
     parser.add_argument("--task", default="edge", choices=["edge", "embedder"],
                         help="Training task: edge classifier or hit embedder")
 
@@ -720,81 +730,65 @@ def _cli() -> None:
     parser.add_argument("--checkpoint", default=None, help="Directory to save checkpoints")
     parser.add_argument("--embedder-checkpoint", default=None,
                         help="Path to pretrained embedder .pt for node feature augmentation")
-    parser.add_argument("--max-events", type=int, default=0,
-                        help="Limit training to N events (0=use all). Use to avoid OOM on large datasets.")
-    parser.add_argument("--balanced-sampling", action="store_true",
-                        help="Sample balanced pos/neg mini-batches per event (fixes extreme class imbalance)")
-    parser.add_argument("--neg-pos-ratio", type=int, default=100,
-                        help="Negatives per positive in balanced mini-batch (default=100)")
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1,
+                        help="Accumulate gradients over N events before optimizer step (DDP / memory)")
     args = parser.parse_args()
 
-    cfg = TrainConfig(
-        model_type       = args.model,
-        n_epochs         = args.epochs,
-        hidden           = args.hidden,
-        n_mp             = args.n_mp,
-        n_gnns_per_iter  = args.n_gnns_per_iter,
-        recurrent        = not args.no_recurrent,
-        d_model          = args.d_model,
-        n_heads          = args.n_heads,
-        n_encoder_layers = args.n_encoder_layers,
-        dim_feedforward  = args.dim_feedforward,
-        dropout          = args.dropout,
-        warmup_epochs    = args.warmup_epochs,
-        focal_alpha      = args.focal_alpha,
-        focal_gamma      = args.focal_gamma,
-        grad_clip        = args.grad_clip,
-        weight_decay     = args.weight_decay,
-        lr               = args.lr,
-        val_fraction     = args.val_fraction,
-        device           = args.device,
-        checkpoint_dir   = args.checkpoint,
-        embedder_checkpoint = args.embedder_checkpoint,
-        balanced_sampling    = args.balanced_sampling,
-        neg_pos_ratio        = args.neg_pos_ratio,
-    )
+    if args.edges is None and args.clusters is None:
+        parser.error("one of --clusters or --edges is required")
 
-    if args.max_events > 0:
-        event_ids = clusters_df["event_id"].unique().sort().head(args.max_events)
-        clusters_df = clusters_df.filter(pl.col("event_id").is_in(event_ids))
-        print(f"[cli] limited to {len(clusters_df):,} clusters ({args.max_events} events)")
+    # In DDP mode: rank 0 builds the edge table and writes a temp parquet;
+    # other ranks wait at a barrier then read the pre-built file.
+    # This avoids concurrent Lustre reads + Polars group_by triggering an
+    # internal assertion failure, and cuts edge-building work to 1× instead of N×.
+    rank, world_size, is_ddp = ddp.setup_ddp()
 
     if args.task == "edge":
-        # ── Path A: use pre-built parquet edges directory ─────────────────────
-        if args.edges_dir:
-            print(f"[cli] loading edges from parquet dir: {args.edges_dir}")
-            train(cfg=cfg, edges_dir=args.edges_dir)
-            return
-
-        # ── Path B: build edges to disk then train from parquet ───────────────
-        if args.build_edges_to:
-            if not args.clusters:
-                parser.error("--clusters is required when using --build-edges-to")
+        if args.edges is not None:
+            # Pre-built edge table supplied directly — all ranks load it.
+            edges_df = pl.read_parquet(args.edges)
+            print(f"[cli] rank {rank}: loaded {len(edges_df):,} edges from {args.edges}", flush=True)
+            _edge_cache = None
+        else:
             clusters_df = pl.read_parquet(args.clusters)
-            print(f"[cli] loaded {len(clusters_df):,} clusters")
-            if args.max_events > 0:
-                eids = clusters_df["event_id"].unique().sort().head(args.max_events)
-                clusters_df = clusters_df.filter(pl.col("event_id").is_in(eids))
-                print(f"[cli] limited to {len(clusters_df):,} clusters ({args.max_events} events)")
-            build_edges_to_parquet(clusters_df, args.build_edges_to,
-                                   chunk_size=args.chunk_size)
-            train(cfg=cfg, edges_dir=args.build_edges_to)
-            return
+            print(f"[cli] rank {rank}: loaded {len(clusters_df):,} clusters", flush=True)
+            _edge_cache = os.environ.get("DDP_INIT_METHOD", "").replace("file://", "") + "_edges.parquet"
+            if is_ddp:
+                if rank == 0:
+                    edges_df = build_labeled_edges_from_sim(clusters_df)
+                    print(f"[cli] rank 0: built {len(edges_df):,} edges → {_edge_cache}", flush=True)
+                    edges_df.write_parquet(_edge_cache)
+                dist.barrier()  # all ranks wait for rank 0 to finish writing
+                if rank != 0:
+                    edges_df = pl.read_parquet(_edge_cache)
+                    print(f"[cli] rank {rank}: loaded {len(edges_df):,} edges from cache", flush=True)
+            else:
+                edges_df = build_labeled_edges_from_sim(clusters_df)
+                print(f"[cli] built {len(edges_df):,} candidate edges", flush=True)
 
-        # ── Path C: classic in-memory build + train ───────────────────────────
-        if not args.clusters:
-            parser.error("--clusters is required (or use --edges-dir / --build-edges-to)")
-        clusters_df = pl.read_parquet(args.clusters)
-        print(f"[cli] loaded {len(clusters_df):,} clusters")
-        if args.max_events > 0:
-            eids = clusters_df["event_id"].unique().sort().head(args.max_events)
-            clusters_df = clusters_df.filter(pl.col("event_id").is_in(eids))
-            print(f"[cli] limited to {len(clusters_df):,} clusters ({args.max_events} events)")
-        edges_df = build_labeled_edges_from_sim(clusters_df)
-        print(f"[cli] built {len(edges_df):,} candidate edges")
+        cfg = TrainConfig(
+            model_type       = args.model,
+            n_epochs         = args.epochs,
+            hidden           = args.hidden,
+            n_mp             = args.n_mp,
+            n_gnns_per_iter  = args.n_gnns_per_iter,
+            recurrent        = not args.no_recurrent,
+            lr               = args.lr,
+            val_fraction     = args.val_fraction,
+            device           = args.device,
+            checkpoint_dir   = args.checkpoint,
+            embedder_checkpoint = args.embedder_checkpoint,
+            gradient_accumulation_steps = args.gradient_accumulation_steps,
+        )
         train(edges_df, cfg)
+        if is_ddp and rank == 0 and _edge_cache and os.path.exists(_edge_cache):
+            os.remove(_edge_cache)
         return
 
+    if args.clusters is None:
+        parser.error("--clusters is required for --task=embedder")
+    clusters_df = pl.read_parquet(args.clusters)
+    print(f"[cli] rank {rank}: loaded {len(clusters_df):,} clusters", flush=True)
     embed_cfg = EmbedderTrainConfig(
         n_epochs=args.epochs,
         batch_size=4096,

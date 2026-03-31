@@ -26,6 +26,7 @@ from sklearn.neighbors import KDTree
 from src.models import Embedder
 from src.losses import HingeLoss
 from src.utils import build_pairs
+import src.ddp as ddp
 
 
 DEFAULT_HIT_FEAT_COLS = [
@@ -70,6 +71,7 @@ class EmbedderTrainConfig:
 
     # hardware
     device: str = "auto"  # auto/cpu/mps/cuda
+    gradient_accumulation_steps: int = 1  # accumulate gradients over N batches before optimizer step
 
 
 class PairDataset(torch.utils.data.Dataset):
@@ -217,11 +219,9 @@ def train_embedder(
     if cfg is None:
         cfg = EmbedderTrainConfig()
 
-    device = _resolve_device(cfg)
-    torch.manual_seed(cfg.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(cfg.seed)
-    print(f"[embed-train] device={device}  epochs={cfg.n_epochs}  seed={cfg.seed}")
+    rank, world_size, is_ddp = ddp.setup_ddp()
+    device = ddp.resolve_device(cfg.device)
+    ddp.ddp_print(f"[embed-train] device={device}  epochs={cfg.n_epochs}")
 
     hits_a, hits_b, target = build_pair_dataset_from_clusters(clusters_df, cfg)
     if len(target) == 0:
@@ -229,7 +229,7 @@ def train_embedder(
 
     n_pos = int(target.sum())
     n_total = len(target)
-    print(f"[embed-train] pairs={n_total:,}  pos={n_pos:,}  pos_frac={n_pos/max(n_total,1):.4f}")
+    ddp.ddp_print(f"[embed-train] pairs={n_total:,}  pos={n_pos:,}  pos_frac={n_pos/max(n_total,1):.4f}")
 
     rng = np.random.default_rng(cfg.seed)
     idx = np.arange(n_total)
@@ -249,10 +249,15 @@ def train_embedder(
     train_ds = PairDataset(x_a_tr, x_b_tr, y_tr)
     val_ds = PairDataset(x_a_va, x_b_va, y_va)
 
+    from torch.utils.data.distributed import DistributedSampler
+    import torch.distributed as dist_mod
+
+    train_sampler = DistributedSampler(train_ds, shuffle=True) if is_ddp else None
     train_loader = torch.utils.data.DataLoader(
         train_ds,
         batch_size=cfg.batch_size,
-        shuffle=True,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         drop_last=False,
     )
     val_loader = torch.utils.data.DataLoader(
@@ -262,18 +267,21 @@ def train_embedder(
         drop_last=False,
     )
 
-    model = Embedder(
-        in_dim=len(cfg.hit_feature_cols),
-        out_dim=cfg.emb_dim,
-        hidden_dim=cfg.hidden_dim,
-        n_layers=cfg.n_layers,
-    ).to(device)
+    model, raw_model = ddp.maybe_wrap_ddp(
+        Embedder(
+            in_dim=len(cfg.hit_feature_cols),
+            out_dim=cfg.emb_dim,
+            hidden_dim=cfg.hidden_dim,
+            n_layers=cfg.n_layers,
+        ),
+        device,
+    )
 
     criterion = HingeLoss(margin=cfg.hinge_margin)
-    optimizer = optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    optimizer = optim.Adam(raw_model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
     ckpt_dir: Path | None = None
-    if cfg.checkpoint_dir:
+    if cfg.checkpoint_dir and ddp.is_main_process():
         ckpt_dir = Path(cfg.checkpoint_dir)
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         (ckpt_dir / "config.json").write_text(json.dumps(dataclasses.asdict(cfg), indent=2))
@@ -283,12 +291,18 @@ def train_embedder(
     best_path: Path | None = None
     t0 = time.time()
 
+    accum_steps = max(1, cfg.gradient_accumulation_steps)
+
     for epoch in range(1, cfg.n_epochs + 1):
         model.train()
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+
         batch_losses: list[float] = []
         batch_accs: list[float] = []
 
-        for h_a, h_b, tgt in train_loader:
+        optimizer.zero_grad()
+        for i, (h_a, h_b, tgt) in enumerate(train_loader):
             h_a = h_a.to(device)
             h_b = h_b.to(device)
             tgt = tgt.to(device)
@@ -296,15 +310,18 @@ def train_embedder(
             h_a = (h_a - mean_t) / std_t
             h_b = (h_b - mean_t) / std_t
 
-            optimizer.zero_grad()
             emb_a = model(h_a)
             emb_b = model(h_b)
             pred_dist = nn.functional.pairwise_distance(emb_a, emb_b)
 
             loss = criterion(pred_dist, tgt)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-            optimizer.step()
+            (loss / accum_steps).backward()
+
+            is_last_batch = (i + 1) == len(train_loader)
+            if (i + 1) % accum_steps == 0 or is_last_batch:
+                torch.nn.utils.clip_grad_norm_(raw_model.parameters(), cfg.grad_clip)
+                optimizer.step()
+                optimizer.zero_grad()
 
             batch_losses.append(float(loss.item()))
             batch_accs.append(_accuracy_from_distance(pred_dist.detach(), tgt, cfg.distance_threshold))
@@ -315,50 +332,54 @@ def train_embedder(
         row = {"epoch": epoch, "train_loss": tr_loss, "train_acc": tr_acc}
 
         if epoch % cfg.log_every == 0 or epoch == 1 or epoch == cfg.n_epochs:
-            val_metrics = _evaluate(
-                model=model,
-                loader=val_loader,
-                criterion=criterion,
-                device=device,
-                mean_t=mean_t,
-                std_t=std_t,
-                distance_threshold=cfg.distance_threshold,
-            )
-            row["val_loss"] = val_metrics["loss"]
-            row["val_acc"] = val_metrics["acc"]
+            if ddp.is_main_process():
+                val_metrics = _evaluate(
+                    model=raw_model,
+                    loader=val_loader,
+                    criterion=criterion,
+                    device=device,
+                    mean_t=mean_t,
+                    std_t=std_t,
+                    distance_threshold=cfg.distance_threshold,
+                )
+                row["val_loss"] = val_metrics["loss"]
+                row["val_acc"] = val_metrics["acc"]
 
-            elapsed = time.time() - t0
-            print(
-                f"Epoch {epoch:>3}/{cfg.n_epochs} | "
-                f"tr_loss={tr_loss:.5f} tr_acc={tr_acc:.4f} | "
-                f"va_loss={val_metrics['loss']:.5f} va_acc={val_metrics['acc']:.4f} | "
-                f"t={elapsed:.0f}s"
-            )
+                elapsed = time.time() - t0
+                ddp.ddp_print(
+                    f"Epoch {epoch:>3}/{cfg.n_epochs} | "
+                    f"tr_loss={tr_loss:.5f} tr_acc={tr_acc:.4f} | "
+                    f"va_loss={val_metrics['loss']:.5f} va_acc={val_metrics['acc']:.4f} | "
+                    f"t={elapsed:.0f}s"
+                )
 
-            if val_metrics["loss"] < best_val_loss:
-                best_val_loss = val_metrics["loss"]
-                if ckpt_dir is not None:
-                    best_path = ckpt_dir / "best_embedder.pt"
-                    torch.save(
-                        {
-                            "epoch": epoch,
-                            "model_state": model.state_dict(),
-                            "best_val_loss": best_val_loss,
-                            "feature_cols": cfg.hit_feature_cols,
-                            "mean": mean,
-                            "std": std,
-                            "emb_dim": cfg.emb_dim,
-                            "hidden_dim": cfg.hidden_dim,
-                            "n_layers": cfg.n_layers,
-                        },
-                        best_path,
-                    )
+                if val_metrics["loss"] < best_val_loss:
+                    best_val_loss = val_metrics["loss"]
+                    if ckpt_dir is not None:
+                        best_path = ckpt_dir / "best_embedder.pt"
+                        torch.save(
+                            {
+                                "epoch":        epoch,
+                                "model_state":  raw_model.state_dict(),
+                                "best_val_loss": best_val_loss,
+                                "feature_cols": cfg.hit_feature_cols,
+                                "mean":         mean,
+                                "std":          std,
+                                "emb_dim":      cfg.emb_dim,
+                                "hidden_dim":   cfg.hidden_dim,
+                                "n_layers":     cfg.n_layers,
+                            },
+                            best_path,
+                        )
+            if dist_mod.is_initialized():
+                dist_mod.barrier()
 
         history.append(row)
 
-    print(f"[embed-train] done  best_val_loss={best_val_loss:.5f}  checkpoint={best_path}")
+    ddp.ddp_print(f"[embed-train] done  best_val_loss={best_val_loss:.5f}  checkpoint={best_path}")
+    ddp.cleanup_ddp()
     return {
-        "model": model.cpu(),
+        "model": raw_model.cpu(),
         "history": history,
         "best_val_loss": best_val_loss,
         "checkpoint": str(best_path) if best_path else None,

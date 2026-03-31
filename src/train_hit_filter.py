@@ -21,6 +21,7 @@ Usage
 """
 from __future__ import annotations
 
+import argparse
 import dataclasses
 import json
 import time
@@ -36,6 +37,8 @@ import torch.optim as optim
 from src.models import E320HitFilter
 from src.losses import FocalLoss
 from src.utils import NODE_DIM
+import torch.distributed as dist
+import src.ddp as ddp
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -80,6 +83,7 @@ class HitFilterConfig:
 
     # hardware
     device: str = "auto"
+    gradient_accumulation_steps: int = 1  # accumulate gradients over N events before optimizer step
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -181,18 +185,16 @@ def train_hit_filter(
     if cfg is None:
         cfg = HitFilterConfig()
 
-    device = _resolve_device(cfg)
-    torch.manual_seed(cfg.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(cfg.seed)
-    print(f"[train_hit_filter] device={device}  epochs={cfg.n_epochs}  "
-          f"d_model={cfg.d_model}  window={cfg.window_size}  seed={cfg.seed}")
+    rank, world_size, is_ddp = ddp.setup_ddp()
+    device = ddp.resolve_device(cfg.device)
+    ddp.ddp_print(f"[train_hit_filter] device={device}  epochs={cfg.n_epochs}  "
+                  f"d_model={cfg.d_model}  window={cfg.window_size}")
 
     # ── Class balance stats ───────────────────────────────────────────────────
     n_total  = len(clusters_df)
     n_signal = int((clusters_df["track_id"] >= 0).sum())
-    print(f"[train_hit_filter] total hits={n_total:,}  signal={n_signal:,}  "
-          f"purity={n_signal/n_total*100:.4f}%")
+    ddp.ddp_print(f"[train_hit_filter] total hits={n_total:,}  signal={n_signal:,}  "
+                  f"purity={n_signal/n_total*100:.4f}%")
 
     # ── Train / val split ────────────────────────────────────────────────────
     all_events = np.array(clusters_df["event_id"].unique().sort().to_numpy(), copy=True)
@@ -201,40 +203,44 @@ def train_hit_filter(
     n_train   = int(len(all_events) * (1 - cfg.val_fraction))
     train_df  = clusters_df.filter(pl.col("event_id").is_in(all_events[:n_train].tolist()))
     val_df    = clusters_df.filter(pl.col("event_id").is_in(all_events[n_train:].tolist()))
-    print(f"[train_hit_filter] train events={n_train}  val events={len(all_events)-n_train}")
+    ddp.ddp_print(f"[train_hit_filter] train events={n_train}  val events={len(all_events)-n_train}")
 
     # ── Normalisation ────────────────────────────────────────────────────────
     node_mean, node_std = _compute_normalisation(train_df)
 
     # ── Pre-build tensors ────────────────────────────────────────────────────
-    print("[train_hit_filter] preprocessing events...")
-    train_events = _preprocess_events(train_df)
+    ddp.ddp_print("[train_hit_filter] preprocessing events...")
+    all_train_events = _preprocess_events(train_df)
+    local_train_events = ddp.shard_event_list(all_train_events, rank, world_size)
     val_events   = _preprocess_events(val_df)
 
     # ── Model ────────────────────────────────────────────────────────────────
-    model = E320HitFilter(
-        node_dim        = NODE_DIM,
-        d_model         = cfg.d_model,
-        n_heads         = cfg.n_heads,
-        n_layers        = cfg.n_layers,
-        dim_feedforward = cfg.dim_feedforward,
-        window_size     = cfg.window_size,
-        dropout         = cfg.dropout,
-    ).to(device)
+    model, raw_model = ddp.maybe_wrap_ddp(
+        E320HitFilter(
+            node_dim        = NODE_DIM,
+            d_model         = cfg.d_model,
+            n_heads         = cfg.n_heads,
+            n_layers        = cfg.n_layers,
+            dim_feedforward = cfg.dim_feedforward,
+            window_size     = cfg.window_size,
+            dropout         = cfg.dropout,
+        ),
+        device,
+    )
 
-    n_params = sum(p.numel() for p in model.parameters())
-    print(f"[train_hit_filter] params={n_params:,}")
+    n_params = sum(p.numel() for p in raw_model.parameters())
+    ddp.ddp_print(f"[train_hit_filter] params={n_params:,}")
 
     criterion = FocalLoss(alpha=cfg.focal_alpha, gamma=cfg.focal_gamma)
-    optimizer = optim.AdamW(model.parameters(), lr=cfg.lr,
+    optimizer = optim.AdamW(raw_model.parameters(), lr=cfg.lr,
                             weight_decay=cfg.weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=cfg.n_epochs, eta_min=cfg.lr_eta_min
     )
 
-    # ── Checkpoint dir ───────────────────────────────────────────────────────
+    # ── Checkpoint dir (rank-0 only) ──────────────────────────────────────────
     ckpt_dir: Path | None = None
-    if cfg.checkpoint_dir:
+    if cfg.checkpoint_dir and ddp.is_main_process():
         ckpt_dir = Path(cfg.checkpoint_dir)
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         (ckpt_dir / "hit_filter_config.json").write_text(
@@ -247,6 +253,7 @@ def train_hit_filter(
     best_path: Path | None = None
     node_mean_cpu = node_mean
     node_std_cpu  = node_std
+    accum_steps = max(1, cfg.gradient_accumulation_steps)
     t0 = time.time()
 
     for epoch in range(1, cfg.n_epochs + 1):
@@ -254,17 +261,25 @@ def train_hit_filter(
         epoch_loss = 0.0
         n_batches  = 0
 
-        rng.shuffle(train_events)
-        for nf_raw, labels in train_events:
+        rng.shuffle(local_train_events)
+        optimizer.zero_grad()
+        accum_count = 0
+
+        for i, (nf_raw, labels) in enumerate(local_train_events):
             nf  = ((nf_raw - node_mean_cpu) / node_std_cpu).to(device)
             lbl = labels.to(device)
 
-            optimizer.zero_grad()
             logits = model(nf)
             loss   = criterion(logits.sigmoid(), lbl)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-            optimizer.step()
+            (loss / accum_steps).backward()
+            accum_count += 1
+
+            is_last = (i + 1) == len(local_train_events)
+            if accum_count >= accum_steps or is_last:
+                torch.nn.utils.clip_grad_norm_(raw_model.parameters(), cfg.grad_clip)
+                optimizer.step()
+                optimizer.zero_grad()
+                accum_count = 0
 
             epoch_loss += loss.item()
             n_batches  += 1
@@ -273,39 +288,43 @@ def train_hit_filter(
         avg_loss = epoch_loss / max(n_batches, 1)
         row: dict = {"epoch": epoch, "train_loss": avg_loss}
 
-        # ── Validation ───────────────────────────────────────────────────────
+        # ── Validation (rank-0 only) ──────────────────────────────────────────
         if epoch % cfg.log_every == 0 or epoch == 1 or epoch == cfg.n_epochs:
-            metrics = _eval_filter(model, val_events, device,
-                                   node_mean_cpu, node_std_cpu,
-                                   cfg.filter_threshold)
-            row.update(metrics)
-            elapsed = time.time() - t0
-            print(
-                f"Epoch {epoch:>3}/{cfg.n_epochs} | loss={avg_loss:.6f} | "
-                f"eff={metrics['efficiency']:.4f} | "
-                f"purity={metrics['purity']:.4f} | "
-                f"reduction={metrics['hit_reduction']:.4f} | "
-                f"t={elapsed:.0f}s"
-            )
+            if ddp.is_main_process():
+                metrics = _eval_filter(raw_model, val_events, device,
+                                       node_mean_cpu, node_std_cpu,
+                                       cfg.filter_threshold)
+                row.update(metrics)
+                elapsed = time.time() - t0
+                ddp.ddp_print(
+                    f"Epoch {epoch:>3}/{cfg.n_epochs} | loss={avg_loss:.6f} | "
+                    f"eff={metrics['efficiency']:.4f} | "
+                    f"purity={metrics['purity']:.4f} | "
+                    f"reduction={metrics['hit_reduction']:.4f} | "
+                    f"t={elapsed:.0f}s"
+                )
 
-            if metrics["efficiency"] > best_eff:
-                best_eff = metrics["efficiency"]
-                if ckpt_dir is not None:
-                    best_path = ckpt_dir / cfg.checkpoint_name
-                    torch.save({
-                        "epoch":       epoch,
-                        "model_state": model.state_dict(),
-                        "best_eff":    best_eff,
-                        "node_mean":   node_mean,
-                        "node_std":    node_std,
-                        "config":      dataclasses.asdict(cfg),
-                    }, best_path)
+                if metrics["efficiency"] > best_eff:
+                    best_eff = metrics["efficiency"]
+                    if ckpt_dir is not None:
+                        best_path = ckpt_dir / cfg.checkpoint_name
+                        torch.save({
+                            "epoch":       epoch,
+                            "model_state": raw_model.state_dict(),
+                            "best_eff":    best_eff,
+                            "node_mean":   node_mean,
+                            "node_std":    node_std,
+                            "config":      dataclasses.asdict(cfg),
+                        }, best_path)
+            if dist.is_initialized():
+                dist.barrier()
 
         history.append(row)
 
-    print(f"[train_hit_filter] done  best_eff={best_eff:.4f}  checkpoint={best_path}")
+    ddp.ddp_print(f"[train_hit_filter] done  best_eff={best_eff:.4f}  checkpoint={best_path}")
+    ddp.cleanup_ddp()
     return {
-        "model":      model.cpu(),
+        "model":      raw_model.cpu(),
         "history":    history,
         "node_mean":  node_mean,
         "node_std":   node_std,
@@ -351,3 +370,31 @@ def load_hit_filter_checkpoint(
         "epoch":     ckpt.get("epoch"),
         "best_eff":  ckpt.get("best_eff"),
     }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CLI entry-point
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _cli() -> None:
+    parser = argparse.ArgumentParser(description="Train E320HitFilter")
+    parser.add_argument("--clusters",    required=True, help="Path to sim_clusters.parquet")
+    parser.add_argument("--epochs",      type=int,   default=50)
+    parser.add_argument("--device",      default="auto")
+    parser.add_argument("--checkpoint",  default=None, help="Directory to save checkpoint")
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
+    args = parser.parse_args()
+
+    import polars as pl
+    clusters_df = pl.read_parquet(args.clusters)
+    cfg = HitFilterConfig(
+        n_epochs                    = args.epochs,
+        device                      = args.device,
+        checkpoint_dir              = args.checkpoint,
+        gradient_accumulation_steps = args.gradient_accumulation_steps,
+    )
+    train_hit_filter(clusters_df, cfg)
+
+
+if __name__ == "__main__":
+    _cli()
