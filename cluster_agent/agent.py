@@ -239,7 +239,7 @@ def run_claude_async(message: str, say, channel: str = ""):
             if CLAUDE_EFFORT:
                 labels.append(f"effort={CLAUDE_EFFORT}")
             label_str = f" [{', '.join(labels)}]" if labels else ""
-            say(f"⏳ Claude{label_str} 处理中，请稍候…")
+
             prompt = _build_prompt_from_slack(channel, message) if channel else message
             cmd = ["claude", "--print", "--dangerously-skip-permissions"]
             if CLAUDE_MODEL:
@@ -247,20 +247,75 @@ def run_claude_async(message: str, say, channel: str = ""):
             if CLAUDE_EFFORT:
                 cmd += ["--effort", CLAUDE_EFFORT]
             cmd.append(prompt)
+
+            # 发初始消息，捕获 ts 以便后续原地更新
+            init_result = say(f"⏳ Claude{label_str} 处理中…")
+            msg_ts = None
+            msg_channel = None
+            if isinstance(init_result, dict) and init_result.get("ok"):
+                msg_ts = init_result.get("ts")
+                msg_channel = init_result.get("channel")
+
+            response = "(Claude 返回空输出)"
             try:
-                result = subprocess.run(
-                    cmd, capture_output=True, text=True,
-                    cwd=str(PROJ_DIR), timeout=CLAUDE_TIMEOUT,
+                proc = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, cwd=str(PROJ_DIR),
                 )
-                response = (result.stdout + result.stderr).strip()
-                if not response:
-                    response = "(Claude 返回空输出)"
+
+                start_time = time.time()
+                progress = {"lines": 0, "last": ""}
+                output_parts: list[str] = []
+                done = threading.Event()
+
+                def _reader():
+                    for line in proc.stdout:
+                        output_parts.append(line)
+                        stripped = line.strip()
+                        if stripped:
+                            progress["lines"] += 1
+                            progress["last"] = stripped
+                    done.set()
+
+                def _progress_updater():
+                    """每 20 秒原地编辑初始消息，显示进度。"""
+                    while not done.wait(timeout=20):
+                        elapsed = int(time.time() - start_time)
+                        m, s = divmod(elapsed, 60)
+                        n = progress["lines"]
+                        last = progress["last"]
+                        # 截取最后一行，去掉可能的 ANSI 控制符，最多 120 字符
+                        last_clean = re.sub(r"\x1b\[[0-9;]*m", "", last)[:120]
+
+                        text = f"⏳ Claude{label_str} 处理中… `{m:02d}:{s:02d}`"
+                        if n > 0:
+                            text += f"  已输出 {n} 行"
+                        if last_clean:
+                            text += f"\n> _{last_clean}_"
+
+                        if msg_ts and msg_channel:
+                            try:
+                                app.client.chat_update(
+                                    channel=msg_channel, ts=msg_ts, text=text,
+                                )
+                            except Exception:
+                                pass
+
+                threading.Thread(target=_reader, daemon=True).start()
+                threading.Thread(target=_progress_updater, daemon=True).start()
+
+                proc.wait(timeout=CLAUDE_TIMEOUT)
+                done.wait(timeout=5)
+                response = "".join(output_parts).strip() or "(Claude 返回空输出)"
+
             except subprocess.TimeoutExpired:
+                proc.kill()
                 response = f"⚠️ Claude 超时（{CLAUDE_TIMEOUT}s）"
             except FileNotFoundError:
-                response = "❌ 找不到 `claude` 命令"
+                response = "❌ 找不到 `claude` 命令，请确认 Claude CLI 已安装并在 PATH 中"
             except Exception as e:
                 response = f"❌ 执行异常: {e}"
+
             say_long(say, response)
         finally:
             _claude_lock.release()
