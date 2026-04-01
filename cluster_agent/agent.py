@@ -230,8 +230,8 @@ _claude_lock = threading.Lock()
 def run_claude_async(message: str, say, channel: str = ""):
     def _worker():
         if not _claude_lock.acquire(blocking=False):
-            say("⚠️ Claude 正在处理另一条消息，请稍候再试")
-            return
+            say("⏳ 已排队，等待当前处理完成…")
+            _claude_lock.acquire(blocking=True)
         try:
             labels = []
             if CLAUDE_MODEL:
