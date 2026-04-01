@@ -240,16 +240,33 @@ Scripts auto-detect the best available device: CUDA > CPU. GPU nodes have NVIDIA
 | `status.md` | `autonomous_watcher.sh` |
 | `~/subs/auto_loop*.sh`（生成） | `~/subs/auto_eval_template.sh`（模板）|
 
+### 架构说明（Worktree 模式）
+
+```
+/srv01/agrp/yiwen/E320simulator/      ← 主仓库（永远在 master，不做研究改动）
+/srv01/agrp/yiwen/research/
+    <slug-1>/                          ← session 1 worktree (branch: auto-research-<slug-1>)
+        experiment_state.json          ← 该 session 的循环状态
+        research_log.md
+        status.md
+        src/ ...                       ← 代码改动在此 worktree
+    <slug-2>/                          ← session 2 worktree（可同时运行）
+        ...
+```
+
+多个 session 可并发运行，互不干扰。
+
 ### Git 分支规则
 
-- 所有 autonomous mode 的代码改动必须在 `auto-research-*` 分支
-- **不得直接 commit 到 master**（`settings.json` 的 deny 规则会阻止）
-- 每次循环至少一次 `git push`（在 qsub 之前）
+- 所有 autonomous mode 的代码改动在对应 session 的 worktree（`auto-research-*` 分支）
+- **主仓库 master 不做改动**（worktree 与主仓库完全分离）
+- 每次循环至少一次 `git push`（在 qsub 之前，从 worktree 目录执行）
 - 用户决定何时 merge 到 master
 
 ### 测试门槛
 
 ```bash
+# 在 worktree 目录中运行
 conda run -n e320root pytest test/ -v
 ```
 
@@ -258,59 +275,70 @@ pytest 必须通过才能 commit 代码。测试失败 → 修复代码 → 重�
 
 ### 关键文件说明
 
-| 文件 | 角色 | 由谁维护 |
-|------|------|---------|
-| `research_goal.md` | 研究目标和约束 | **用户**（每 session 更新）|
-| `research_log.md` | 假设+变更+结果的研究日志 | **Claude**（每轮追加）|
-| `experiment_state.json` | 循环控制状态 | **Claude**（每轮更新）|
-| `status.md` | 实时监控 | **Claude**（每轮覆盖）|
-| `autonomous_loop_prompt.md` | Claude 的执行指令 | **用户**（修改循环行为）|
+| 文件 | 位置 | 角色 | 由谁维护 |
+|------|------|------|---------|
+| `research_goal.md` | 主仓库（模板）/ worktree（各 session）| 研究目标和约束 | **用户** |
+| `research_log.md` | 各 session worktree | 假设+变更+结果日志 | **Claude**（每轮追加）|
+| `experiment_state.json` | 各 session worktree | 循环控制状态 | **Claude**（每轮更新）|
+| `status.md` | 各 session worktree | 实时监控 | **Claude**（每轮覆盖）|
+| `autonomous_loop_prompt.md` | 各 session worktree | Claude 的执行指令 | **用户** |
+| `cluster_agent/session_watcher.sh` | 主仓库 | Per-session watcher | **用户** |
 
 ### 启动新研究 Session
 
 ```bash
-# 1. 填写研究目标
+# 1. 填写研究目标（主仓库模板，会被复制到新 session）
 vim ~/E320simulator/research_goal.md
 
-# 2. 一键启动（自动建分支、初始化状态、启动 watcher、触发第一次循环）
+# 2. 一键启动（建 worktree + 初始化状态 + 启动 watcher + 触发首次循环）
 cd ~/E320simulator
 bash start_research.sh "目标描述"           # 默认最大 15 轮
 bash start_research.sh "目标描述" 20        # 指定最大循环次数
+
+# 3. 通过 Slack 启动（更便捷）
+# !start "目标描述" [N]
+```
+
+### 查看所有 Session 状态
+
+```bash
+# 列出所有 session
+ls ~/research/
+
+# 查看某个 session
+cat ~/research/<slug>/status.md
+tail -50 ~/logs/watcher_<slug>.log
+
+# 通过 Slack
+# !sessions              列出所有
+# !status <slug>         查看 status.md
+# !wlog <slug>           查看 watcher 日志
+# !result <slug>         查看 eval 数字
 ```
 
 ### 停止与恢复
 
-**查看状态**: `cat ~/E320simulator/status.md`
-**查看日志**: `tail -50 ~/logs/watcher.log`
-
-**优雅停止**（等当前作业完成后停止）：
+**优雅停止**（等当前 PBS 作业完成后停止）：
 ```bash
-python3 -c "
-import json
-with open('~/E320simulator/experiment_state.json') as f: s = json.load(f)
-s['stop_requested'] = True
-with open('~/E320simulator/experiment_state.json', 'w') as f: json.dump(s, f, indent=2)
-"
-touch ~/E320simulator/.stop_watcher
+bash ~/E320simulator/stop_research.sh <session-slug> grace
+# 或 Slack: !stop <slug>
 ```
 
-**紧急停止**：
+**紧急停止**（立即终止）：
 ```bash
-touch ~/E320simulator/.stop_watcher
-kill $(cat ~/E320simulator/.watcher.pid 2>/dev/null) 2>/dev/null
-qdel $(python3 -c "import json; print(json.load(open('experiment_state.json')).get('current_pbs_job_id',''))")
+bash ~/E320simulator/stop_research.sh <session-slug>
+# 或 Slack: !kill <slug>
 ```
 
 **恢复**（清除错误后重启）：
 ```bash
-python3 -c "
-import json
-with open('experiment_state.json') as f: s = json.load(f)
-s['error_state'] = None; s['stop_requested'] = False; s['loop_status'] = 'idle'
-with open('experiment_state.json', 'w') as f: json.dump(s, f, indent=2)
-"
-rm -f ~/E320simulator/.stop_watcher
-nohup bash ~/subs/autonomous_watcher.sh > ~/logs/watcher.log 2>&1 &
+# 直接重启（start_research.sh 会复用已有 worktree）
+bash ~/E320simulator/start_research.sh "<同一目标描述>"
+```
+
+**清理 worktree**（彻底删除某个 session 的本地副本）：
+```bash
+cd ~/E320simulator && git worktree remove ~/research/<slug> --force
 ```
 
 ---

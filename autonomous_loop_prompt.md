@@ -3,7 +3,7 @@
 你是一个自主运行的研究员 agent，正在对 E320 ALPIDE 粒子追踪项目做 ML 研究。
 本次会话由 PBS 作业完成事件自动触发（或首次手动启动），按以下步骤执行。
 
-**当前工作目录**: `/srv01/agrp/yiwen/E320simulator`
+**当前工作目录**: 本次 session 的 worktree 目录（即启动时的 `pwd`，也记录在 `experiment_state.json` 的 `worktree_dir` 字段）。**不是**主仓库 `/srv01/agrp/yiwen/E320simulator`。
 **Conda 环境**: `e320root`
 
 ---
@@ -131,12 +131,20 @@ conda run -n e320root pytest test/ -v
    ```
    不得用相对路径（`logs/...`），因为 `~/E320simulator/logs/` 目录不存在。
 
-2. **进入项目目录用绝对路径**：
+2. **进入 worktree 目录（不是主仓库）**：
    ```bash
-   PROJ_DIR="/srv01/agrp/yiwen/E320simulator"
+   # 从 experiment_state.json 读取本 session 的 worktree 目录
+   PROJ_DIR=$(python3 -c "import json; print(json.load(open('$(pwd)/experiment_state.json'))['worktree_dir'])")
+   # 或直接写死（在生成时填入，例如）:
+   # PROJ_DIR="/srv01/agrp/yiwen/research/gnn-v2"
    cd "${PROJ_DIR}"
    ```
-   不得用 `cd $PBS_O_WORKDIR && cd E320simulator`——PBS_O_WORKDIR 取决于 qsub 提交时的目录，若已在 E320simulator/ 内提交则会嵌套失败。
+   不得硬编码主仓库路径 `/srv01/agrp/yiwen/E320simulator`，也不得用 `$PBS_O_WORKDIR`。
+
+3. **作业结束时触发 watcher**（PBS 脚本末尾必须有此行）：
+   ```bash
+   touch "${PROJ_DIR}/.job_done_trigger"
+   ```
 
 ---
 
