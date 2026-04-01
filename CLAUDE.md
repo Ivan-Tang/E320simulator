@@ -312,3 +312,42 @@ with open('experiment_state.json', 'w') as f: json.dump(s, f, indent=2)
 rm -f ~/E320simulator/.stop_watcher
 nohup bash ~/subs/autonomous_watcher.sh > ~/logs/watcher.log 2>&1 &
 ```
+
+---
+
+## 下一步研究方向（2026-04-01 更新）
+
+> **当前最优**：TransformerEdgeClassifier 82.01% / 11.66%，目标 ≥95% / ≤5%
+>
+> **任务类型说明**：失效诊断和 DDP 修复适合 session 内直接做，**不适合套 auto-research loop**。
+> auto-research 以「提交 PBS 训练 job → 等结果 → 改模型」为循环单位，调试/分析类任务不匹配。
+
+### 🔴 高优先级（session 内直接做，非 auto-research）
+
+1. **【前置必做】失效案例诊断脚本**
+   - 将 18% 效率损失拆解为三类：
+     - ① 真实边不在图里（kNN 覆盖率不足）→ 根因：图构建
+     - ② 真实边在图里但模型打分低 → 根因：模型
+     - ③ 边打分正确但后处理丢失 → 根因：chi2/NMS
+   - 写 `scripts/diagnose_failures.py`，提交单个 PBS job，读输出后再决定优化方向
+   - **所有后续优化方向都依赖此结论**
+
+2. **DDP 多卡训练修复**
+   - 修改 `src/train.py` 支持 `DistributedDataParallel`
+   - 先在两卡小规模验证，再提交完整训练 job
+
+### 🟡 中优先级（依赖诊断结果，可用 auto-research）
+
+3. **改进图构建**（若诊断①占主导）
+   - 增大 kNN k；或改用层间优先的 physics-informed 图构建
+
+4. **TransformerEdgeClassifier 深度优化**（若诊断②占主导）
+   - Hard negative mining、更多物理特征（击中密度、曲率估计）、更大模型
+
+5. **后处理改进**（若诊断③占主导）
+   - 用小 MLP 学习径迹质量分数替代硬截断 chi2；加入 NMS 消歧
+
+### 🟢 低优先级（长期探索）
+
+6. **重新训练 EggNet**：当前效率仅 1.4%，需重训或放弃
+7. **TrackFormer-Seed 端到端**：跳过边分类，直接从击中点输出径迹（DETR 风格）；作为并行探索分支
