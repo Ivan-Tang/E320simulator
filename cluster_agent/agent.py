@@ -662,17 +662,18 @@ def handle_command(text: str, say, channel: str = ""):
     # ── !update ────────────────────────────────────────────────────────────
     elif text == "!update":
         say("🔄 正在后台拉取最新代码，约 10 秒后重启…")
+        log_file = str(LOGS_DIR / "agent_update.log")
         script = (
+            f"exec >{log_file} 2>&1; set -x; "   # 脚本内重定向，不依赖继承的 fd
             f"sleep 3 && "
             f"cd {PROJ_DIR} && git pull && "
-            f"pkill -f 'python.*agent.py' || true && sleep 2 && "
+            f"bash {PROJ_DIR}/cluster_agent/stop_agent.sh ; "  # ; 而非 &&，确保即使 stop 失败也继续
+            f"sleep 1 && "
             f"bash {PROJ_DIR}/cluster_agent/start_agent.sh"
         )
         subprocess.Popen(
             ["bash", "-c", script],
             start_new_session=True,
-            stdout=open(LOGS_DIR / "agent_update.log", "w"),
-            stderr=subprocess.STDOUT,
         )
 
     # ── 自然语言 → Claude ──────────────────────────────────────────────────
