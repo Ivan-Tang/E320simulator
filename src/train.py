@@ -373,6 +373,7 @@ def train(
                   f"pos={stats['n_positive']}  "
                   f"pos_frac={stats['positive_fraction']:.5f}")
     ddp.ddp_print(f"[train] train events={len(train_eids)}  val events={len(val_eids)}")
+    del edges_df  # free original DataFrame; train_df/val_df are independent rechunked copies
 
     # per-split positive counts
     n_pos_train = int(train_df.filter(pl.col("edge_label") == 1).height)
