@@ -1,0 +1,150 @@
+{
+  "schema_version": "1.0",
+  "description": "结构化实验记录。由 Claude 每轮 append，用于快速检索已尝试配置，避免重复实验。",
+  "baseline": {
+    "InteractionNet": {
+      "track_efficiency": 0.706,
+      "fake_rate": 0.143,
+      "mean_rms": 0.00409,
+      "note": "当前基线，边分类 + 链式成链"
+    },
+    "TransformerEdgeClassifier_v0": {
+      "track_efficiency": 0.022,
+      "fake_rate": 0.997,
+      "note": "原始 Benchmark checkpoint 完全失效，根因：大模型(d_model=256,6层)在少量数据上不收敛 + 无 warmup"
+    }
+  },
+  "sessions": [
+    {
+      "session_id": "transformer-convergence",
+      "branch": "auto-research-transformer-convergence",
+      "goal": "让 TransformerEdgeClassifier 从完全失效恢复到可用水平（eff≥60%，fake_rate≤20%）",
+      "final_result": "goal_achieved",
+      "experiments": [
+        {
+          "loop_id": "loop1_layer_attn",
+          "timestamp": "2026-03-21T22:00",
+          "hypothesis": "层内分组注意力（5组）替代全局 O(N²) attention，efficiency >40%",
+          "key_config": {
+            "model_type": "transformer",
+            "architecture": "layer_grouped_attention",
+            "d_model": 64, "n_heads": 4, "n_encoder_layers": 2, "dim_feedforward": 256,
+            "loss": "FocalLoss", "focal_alpha": 0.95,
+            "max_events": null, "epochs": 100, "lr": 0.001
+          },
+          "result": {
+            "track_efficiency": null, "fake_rate": null, "mean_rms": null,
+            "status": "oom_killed"
+          },
+          "failure_reason": "build_labeled_edges_from_sim 全量 10k 事件 OOM",
+          "conclusion": "架构代码正确，需 --max-events 限制训练集大小"
+        },
+        {
+          "loop_id": "loop2_fix_oom",
+          "timestamp": "2026-03-22T01:05",
+          "hypothesis": "--max-events 2000 解决 OOM，efficiency >30%",
+          "key_config": {
+            "model_type": "transformer",
+            "architecture": "layer_grouped_attention",
+            "d_model": 64, "n_heads": 4, "n_encoder_layers": 2,
+            "loss": "FocalLoss", "focal_alpha": 0.95,
+            "max_events": 2000, "epochs": 100, "lr": 0.001
+          },
+          "result": {
+            "track_efficiency": 0.0, "fake_rate": 0.0, "mean_rms": null,
+            "n_kept": 0, "auc": 0.976, "ap": 0.0006,
+            "status": "trained_but_zero_kept"
+          },
+          "failure_reason": "FocalLoss 在 1:50000 极端不平衡下所有得分趋近 0（AUC=0.97 但 n_kept=0）",
+          "conclusion": "FocalLoss 不适用，需改用 balanced sampling + BCELoss"
+        },
+        {
+          "loop_id": "loop3_balanced_sampling",
+          "timestamp": "2026-03-22T03:00",
+          "hypothesis": "BCELoss + balanced_sampling(1:100) 强迫正边得分 >0.5",
+          "key_config": {
+            "model_type": "transformer",
+            "loss": "BCELoss", "balanced_sampling": true, "neg_pos_ratio": 100,
+            "max_events": 2000, "epochs": 200, "lr": 0.001
+          },
+          "result": {
+            "track_efficiency": null, "fake_rate": null,
+            "status": "pbs_script_bug_never_trained"
+          },
+          "failure_reason": "PBS 脚本 3 处 bug：缺 --clusters、错误 --checkpoint 参数名、eval 路径问题",
+          "conclusion": "代码本身正确，PBS 脚本问题"
+        },
+        {
+          "loop_id": "loop4_fix_clusters",
+          "timestamp": "2026-03-22T07:30",
+          "hypothesis": "修复 PBS 脚本后，BCELoss + balanced_sampling(1:100) 使 efficiency >30%",
+          "key_config": {
+            "model_type": "transformer",
+            "loss": "BCELoss", "balanced_sampling": true, "neg_pos_ratio": 100,
+            "max_events": 2000, "epochs": 200, "lr": 0.001
+          },
+          "result": {
+            "track_efficiency": 0.0, "fake_rate": 0.0, "mean_rms": null,
+            "n_kept": 0, "auc": 0.977, "ap": 0.0005,
+            "status": "trained_but_zero_kept"
+          },
+          "failure_reason": "BCELoss 在 1:100 balanced batch 中梯度均衡点 p_pos≈0.24（数学），低于 threshold=0.5",
+          "conclusion": "需 pos_weight=neg_pos_ratio(100) 修正梯度均衡点"
+        },
+        {
+          "loop_id": "loop5_pos_weight_fix",
+          "timestamp": "2026-03-22T08:30",
+          "hypothesis": "pos_weight=100 修正 BCELoss 均衡点，首次 efficiency >0%",
+          "key_config": {
+            "model_type": "transformer",
+            "loss": "BCELoss", "balanced_sampling": true, "neg_pos_ratio": 100, "pos_weight": 100,
+            "max_events": 2000, "epochs": 200, "lr": 0.001, "warmup_epochs": 10,
+            "edge_threshold": 0.1
+          },
+          "result": {
+            "track_efficiency": 0.8295, "fake_rate": 0.3714, "mean_rms": 7.2e-6,
+            "n_kept": 1548, "n_matched": 973, "auc": 0.91,
+            "status": "success",
+            "checkpoint": "/storage/agrp/yiwen/runs/loop5_pos_weight_fix/best_model.pt"
+          },
+          "conclusion": "首次成功！eff=82.95% 但 fake_rate=37.14%。发现 chi2 可区分真假轨迹（7× 差异），需后处理筛选"
+        },
+        {
+          "loop_id": "loop6_chi2_quality_cut",
+          "timestamp": "2026-03-22T10:00",
+          "hypothesis": "chi2 < 7e-5 筛选 loop5 模型输出，fake_rate 从 37% → ~12%",
+          "key_config": {
+            "use_checkpoint": "loop5_pos_weight_fix",
+            "edge_threshold": 0.1, "chi2_cut": 7e-5,
+            "no_training": true
+          },
+          "result": {
+            "track_efficiency": null, "fake_rate": null,
+            "status": "pbs_script_bug_inference_failed"
+          },
+          "failure_reason": "PBS 脚本用 --output-dir（不存在参数），应为 --output <file_path>",
+          "local_verification": {
+            "track_efficiency": 0.8201, "fake_rate": 0.1166, "note": "本地手动验证，满足研究目标"
+          },
+          "conclusion": "本地已验证达标，PBS 脚本 bug 需修复"
+        },
+        {
+          "loop_id": "loop7_fix_output_arg",
+          "timestamp": "2026-03-22T11:00",
+          "hypothesis": "修复 --output 参数后，正式记录 eff=82.01%, fake_rate=11.66%",
+          "key_config": {
+            "use_checkpoint": "loop5_pos_weight_fix",
+            "edge_threshold": 0.1, "chi2_cut": 7e-5,
+            "no_training": true
+          },
+          "result": {
+            "track_efficiency": 0.8201, "fake_rate": 0.1166, "mean_rms": 0.004634,
+            "n_kept": 1089, "n_matched": 962,
+            "status": "goal_achieved"
+          },
+          "conclusion": "研究目标正式达成：eff=82.01% ≥ 60%，fake_rate=11.66% ≤ 20%"
+        }
+      ]
+    }
+  ]
+}

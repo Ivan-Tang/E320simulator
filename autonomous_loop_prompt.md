@@ -24,12 +24,17 @@
 按顺序读取以下文件（**全部读完再继续**）：
 
 1. `research_goal.md` — 当前研究目标、允许改动范围、成功标准
-2. `research_log.md` — 全部历史条目（理解已经尝试了什么、哪些方向有效）
-3. `progress.md` — 项目整体进度和已知问题
-4. `src/models.py` — 现有模型实现
-5. `src/layers.py` — 基础模块
-6. `src/train.py` — 训练循环
-7. `src/losses.py` — Loss 函数
+2. `memory/experiments_db.json` — **结构化实验数据库**（所有已尝试配置及结果，避免重复实验）
+3. `memory/insights.md` — **压缩洞见**（历史规律、已证实/证伪的假设，替代读全部日志）
+4. `research_log.md` 最后 100 行 — 最近 1-2 轮的详细记录（用 `tail -100 research_log.md`）
+5. `progress.md` — 项目整体进度和已知问题
+6. `src/models.py` — 现有模型实现
+7. `src/layers.py` — 基础模块
+8. `src/train.py` — 训练循环
+9. `src/losses.py` — Loss 函数
+
+> **提示**：在步骤 4 形成假设时，先查 `memory/experiments_db.json` 中的 `experiments` 数组，
+> 确认所提出的配置（model_type + key_config 的组合）没有被完全测试过。
 
 ---
 
@@ -150,6 +155,35 @@ conda run -n e320root pytest test/ -v
 
 ## 步骤 8：更新所有文档
 
+**memory/experiments_db.json**（在对应 session 的 `experiments` 数组末尾追加一条，JSON 格式）：
+```json
+{
+  "loop_id": "loop{N+1}_{desc}",
+  "timestamp": "{当前时间}",
+  "hypothesis": "{假设一句话}",
+  "key_config": {
+    "model_type": "...",
+    "d_model": ...,
+    "loss": "...",
+    "epochs": ...
+  },
+  "architecture_change": "{改动描述，无则写 '无'}",
+  "result": {
+    "track_efficiency": {值或 null},
+    "fake_rate": {值或 null},
+    "mean_rms": {值或 null},
+    "status": "submitted"
+  },
+  "conclusion": "（下轮填入）"
+}
+```
+若 `sessions` 数组中没有当前 session，先创建对应的 session 对象（session_id = branch slug）。
+
+**memory/insights.md**（仅当发现新的规律性知识时才更新）：
+- 如果本轮发现了可归纳为普遍规律的知识（如某类损失函数失效、某 PBS 参数名称等），
+  在对应章节追加一条。格式：`- **结论**：{内容}（Loop {N+1}）`
+- 若无新洞见，**不修改**此文件。
+
 **research_log.md**（追加，不修改已有内容）：
 ```markdown
 ## Loop {N+1} — {当前日期时间}
@@ -202,6 +236,7 @@ git branch --show-current
 # 提交所有改动
 git add src/models.py src/layers.py src/train.py src/losses.py
 git add experiment_state.json research_log.md status.md
+git add memory/experiments_db.json memory/insights.md
 git add ~/subs/auto_loop*.sh
 git commit -m "auto loop{N+1}: {假设的一句话描述}"
 git push origin {research_branch}

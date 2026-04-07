@@ -94,6 +94,30 @@ fi
 # 同步 research_goal.md（主仓库 → worktree，不修改 master 的 git 状态）
 cp "${PROJ_DIR}/research_goal.md" "${WORKTREE_DIR}/research_goal.md"
 
+# 同步 memory/（主仓库累积洞见 → worktree；experiments_db.json 重置为新 session）
+mkdir -p "${WORKTREE_DIR}/memory"
+# insights.md 直接复制（跨 session 积累的规律知识）
+cp "${PROJ_DIR}/memory/insights.md" "${WORKTREE_DIR}/memory/insights.md"
+# experiments_db.json：复制主仓库模板，但将 sessions 数组清空，保留 baseline
+python3 - <<PYEOF
+import json
+src = "${PROJ_DIR}/memory/experiments_db.json"
+dst = "${WORKTREE_DIR}/memory/experiments_db.json"
+with open(src) as f:
+    db = json.load(f)
+# 新 session 从空 experiments 开始，但保留 baseline 参考
+db["sessions"] = [{
+    "session_id": "${BRANCH_SLUG}",
+    "branch": "${BRANCH_NAME}",
+    "goal": open("${WORKTREE_DIR}/research_goal.md").read().strip()[:200],
+    "final_result": None,
+    "experiments": []
+}]
+with open(dst, "w") as f:
+    json.dump(db, f, indent=2)
+print("  memory/ 已初始化（insights.md 继承，experiments_db.json 重置为新 session）")
+PYEOF
+
 # ── [2/5] 初始化 experiment_state.json（在 worktree 中）──
 echo ""
 echo "[2/5] 初始化状态文件..."
@@ -144,6 +168,7 @@ git add experiment_state.json research_goal.md
 for f in research_log.md status.md autonomous_loop_prompt.md; do
     [ -f "${f}" ] && git add "${f}" || true
 done
+[ -d "memory" ] && git add memory/ || true
 git diff --cached --quiet || \
     git commit -m "auto: start research session '${GOAL_SLUG}' at ${NOW}"
 git push origin "${BRANCH_NAME}"
