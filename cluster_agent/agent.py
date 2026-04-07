@@ -54,6 +54,7 @@ ALLOWED_USER_IDS: set[str] = {uid.strip() for uid in _raw_ids.split(",") if uid.
 
 MAX_CHUNK = 3800
 MONITOR_INTERVAL = 60   # 状态轮询间隔（秒）
+AGENT_MEMORY_FILE = PROJ_DIR / "cluster_agent" / "agent_memory.md"
 CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "3600"))
 MAX_HISTORY_TURNS = 10
 PBS_POLL_INTERVAL = 60
@@ -182,6 +183,58 @@ def _read_session_state(sess_dir: Path) -> dict:
         return {}
 
 
+# ── Agent 记忆 ───────────────────────────────────────────────────────────────
+
+def _read_memory() -> str:
+    try:
+        return AGENT_MEMORY_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _append_memory(fact: str):
+    """在 agent_memory.md 末尾追加一条有时间戳的记忆。"""
+    from datetime import datetime
+    ts = datetime.now().strftime("%Y-%m-%d")
+    line = f"- [{ts}] {fact.strip()}"
+    try:
+        existing = AGENT_MEMORY_FILE.read_text(encoding="utf-8") if AGENT_MEMORY_FILE.exists() else ""
+        AGENT_MEMORY_FILE.write_text(existing.rstrip() + f"\n{line}\n", encoding="utf-8")
+    except OSError as e:
+        print(f"[agent] 写记忆失败: {e}", file=sys.stderr)
+
+
+def _forget_memory(keyword: str) -> tuple[int, list[str]]:
+    """删除 agent_memory.md 中包含 keyword 的行，返回 (删除行数, 删除的行列表)。"""
+    if not AGENT_MEMORY_FILE.exists():
+        return 0, []
+    lines = AGENT_MEMORY_FILE.read_text(encoding="utf-8").splitlines(keepends=True)
+    removed, kept = [], []
+    for line in lines:
+        if keyword.lower() in line.lower() and line.strip().startswith("-"):
+            removed.append(line.rstrip())
+        else:
+            kept.append(line)
+    if removed:
+        AGENT_MEMORY_FILE.write_text("".join(kept), encoding="utf-8")
+    return len(removed), removed
+
+
+def _extract_save_tags(response: str) -> tuple[str, list[str]]:
+    """
+    从 Claude 输出中提取 [SAVE]: <fact> 行。
+    返回 (去掉标签后的输出, 提取到的 facts 列表)。
+    """
+    facts, clean_lines = [], []
+    for line in response.splitlines():
+        m = re.match(r"^\[SAVE\]:\s*(.+)$", line.strip())
+        if m:
+            facts.append(m.group(1).strip())
+        else:
+            clean_lines.append(line)
+    return "\n".join(clean_lines).strip(), facts
+
+
 # ── Slack 历史 / Claude 调用 ─────────────────────────────────────────────────
 
 def _fetch_channel_history(channel: str) -> list[dict]:
@@ -197,8 +250,6 @@ def _fetch_channel_history(channel: str) -> list[dict]:
 
 def _build_prompt_from_slack(channel: str, current_text: str) -> str:
     msgs = _fetch_channel_history(channel)
-    if not msgs:
-        return current_text
 
     history_lines = []
     for msg in msgs:
@@ -215,12 +266,25 @@ def _build_prompt_from_slack(channel: str, current_text: str) -> str:
     if history_lines and history_lines[-1] == f"用户: {current_text}":
         history_lines = history_lines[:-1]
 
-    if not history_lines:
-        return current_text
+    parts: list[str] = []
 
-    lines = ["以下是我们最近的对话历史：", ""] + history_lines + \
-            ["", "请基于以上上下文回复用户最新消息：", current_text]
-    return "\n".join(lines)
+    # 注入长期记忆
+    memory = _read_memory()
+    if memory:
+        parts += [
+            "[长期记忆 — 跨会话持久，请优先参考]",
+            memory,
+            "",
+            "如果本次对话中发现了值得长期记住的事实、用户偏好或重要决定，",
+            "请在回复末尾另起一行输出：[SAVE]: <一句话描述>（可多行）",
+            "",
+        ]
+
+    if history_lines:
+        parts += ["以下是我们最近的对话历史：", ""] + history_lines + [""]
+
+    parts += ["请基于以上上下文回复用户最新消息：", current_text]
+    return "\n".join(parts)
 
 
 # 并发保护：同一时刻只允许一个 Claude 调用
@@ -316,6 +380,12 @@ def run_claude_async(message: str, say, channel: str = ""):
             except Exception as e:
                 response = f"❌ 执行异常: {e}"
 
+            # 解析 [SAVE]: 标签并写入长期记忆
+            response, facts = _extract_save_tags(response)
+            for fact in facts:
+                _append_memory(fact)
+                print(f"[agent] 已保存记忆: {fact}", file=sys.stderr)
+
             say_long(say, response)
         finally:
             _claude_lock.release()
@@ -347,6 +417,11 @@ HELP_TEXT = """*E320 Research Agent — 命令列表*
 `!start "目标" [N]`          在新 worktree 启动 autoresearch（最大 N 轮，默认 15）
 `!stop [session]`            优雅停止（当前作业完成后停止）
 `!kill [session]`            紧急停止（立即终止 watcher + 取消 PBS 作业）
+
+*Agent 记忆*（跨重启持久）
+`!memories`                  查看所有长期记忆
+`!remember "内容"`           手动添加一条记忆
+`!forget "关键词"`           删除包含关键词的记忆条目
 
 *系统管理*
 `!shell "cmd"`               直接执行 shell 命令（谨慎使用）
@@ -658,6 +733,36 @@ def handle_command(text: str, say, channel: str = ""):
             resolved = MODEL_ALIASES.get(arg.lower(), arg)
             CLAUDE_MODEL = resolved
             say(f"✅ 模型已切换为 `{resolved}`")
+
+    # ── !memories ──────────────────────────────────────────────────────────────
+    elif text == "!memories":
+        mem = _read_memory()
+        if mem:
+            say_long(say, f"*Agent 长期记忆*\n```\n{mem}\n```")
+        else:
+            say("记忆为空。用 `!remember \"内容\"` 手动添加，或直接和 Claude 对话让它自动记录。")
+
+    # ── !remember ──────────────────────────────────────────────────────────────
+    elif text.startswith("!remember"):
+        content = text[9:].strip().strip('"\'\u201c\u201d\u2018\u2019')
+        if not content:
+            say("用法：`!remember \"要记住的内容\"`")
+        else:
+            _append_memory(content)
+            say(f"✅ 已记住：_{content}_")
+
+    # ── !forget ────────────────────────────────────────────────────────────────
+    elif text.startswith("!forget"):
+        keyword = text[7:].strip().strip('"\'\u201c\u201d\u2018\u2019')
+        if not keyword:
+            say("用法：`!forget \"关键词\"` — 删除记忆中包含该关键词的条目")
+        else:
+            n, removed = _forget_memory(keyword)
+            if n == 0:
+                say(f"没有找到包含 `{keyword}` 的记忆条目。")
+            else:
+                removed_str = "\n".join(f"  {r}" for r in removed)
+                say(f"🗑 已删除 {n} 条记忆：\n```\n{removed_str}\n```")
 
     # ── !update ────────────────────────────────────────────────────────────
     elif text == "!update":
