@@ -31,6 +31,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -47,6 +48,10 @@ SLACK_APP_TOKEN = os.environ["SLACK_APP_TOKEN"]
 SLACK_CHANNEL_ID = os.environ.get("SLACK_CHANNEL_ID", "")
 NOTIFY_EMAIL = os.environ.get("NOTIFY_EMAIL", "")
 LOGS_DIR = Path("/srv01/agrp/yiwen/logs")
+
+# Claude session 文件目录（由 cwd 决定，cwd=PROJ_DIR）
+_proj_hash = str(PROJ_DIR).replace("/", "-")
+CLAUDE_SESSIONS_DIR = Path.home() / ".claude" / "projects" / _proj_hash
 
 # 用户白名单（留空则不限制）
 _raw_ids = os.environ.get("ALLOWED_USER_IDS", "").strip()
@@ -183,6 +188,16 @@ def _read_session_state(sess_dir: Path) -> dict:
         return {}
 
 
+def _thread_session_id(thread_ts: str) -> str:
+    """从 Slack thread_ts 派生确定性 UUID，用于 claude --session-id / --resume。"""
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"slack-thread-{thread_ts}"))
+
+
+def _session_exists(session_id: str) -> bool:
+    """检查对应的 Claude session 文件是否已存在。"""
+    return (CLAUDE_SESSIONS_DIR / f"{session_id}.jsonl").exists()
+
+
 # ── Agent 记忆 ───────────────────────────────────────────────────────────────
 
 def _read_memory() -> str:
@@ -291,7 +306,7 @@ def _build_prompt_from_slack(channel: str, current_text: str) -> str:
 _claude_lock = threading.Lock()
 
 
-def run_claude_async(message: str, say, channel: str = ""):
+def run_claude_async(message: str, say, thread_ts: str = "", channel: str = ""):
     def _worker():
         if not _claude_lock.acquire(blocking=False):
             say("⏳ 已排队，等待当前处理完成…")
@@ -304,12 +319,30 @@ def run_claude_async(message: str, say, channel: str = ""):
                 labels.append(f"effort={CLAUDE_EFFORT}")
             label_str = f" [{', '.join(labels)}]" if labels else ""
 
-            prompt = _build_prompt_from_slack(channel, message) if channel else message
             cmd = ["claude", "--print", "--dangerously-skip-permissions"]
             if CLAUDE_MODEL:
                 cmd += ["--model", CLAUDE_MODEL]
             if CLAUDE_EFFORT:
                 cmd += ["--effort", CLAUDE_EFFORT]
+
+            # Session 管理：同一 Slack thread 复用同一个 Claude session
+            if thread_ts:
+                session_id = _thread_session_id(thread_ts)
+                if _session_exists(session_id):
+                    cmd += ["--resume", session_id]
+                else:
+                    cmd += ["--session-id", session_id]
+
+            # 构建 prompt：注入长期记忆（resume 时 Claude 已有对话上下文，只补充记忆）
+            memory = _read_memory()
+            if memory:
+                prompt = (
+                    f"[长期记忆 — 跨会话持久，请优先参考]\n{memory}\n\n"
+                    f"如果本次对话发现值得长期记住的事实，请在回复末尾输出：[SAVE]: <一句话描述>\n\n"
+                    f"{message}"
+                )
+            else:
+                prompt = message
             cmd.append(prompt)
 
             # 发初始消息，捕获 ts 以便后续原地更新
@@ -465,7 +498,7 @@ def _extract_content(s: str) -> str:
         return s.strip('"\'\u201c\u201d\u2018\u2019')
 
 
-def handle_command(text: str, say, channel: str = ""):
+def handle_command(text: str, say, channel: str = "", thread_ts: str = ""):
     text = text.strip()
     if not text:
         return
@@ -783,7 +816,7 @@ def handle_command(text: str, say, channel: str = ""):
 
     # ── 自然语言 → Claude ──────────────────────────────────────────────────
     else:
-        run_claude_async(text, say, channel=channel)
+        run_claude_async(text, say, thread_ts=thread_ts)
 
 
 # ── Slack 事件处理 ────────────────────────────────────────────────────────────
@@ -813,7 +846,7 @@ def handle_message(message, say):
         return
     channel = message.get("channel", "")
     thread_ts = message.get("thread_ts") or message.get("ts", "")
-    handle_command(text, _threaded_say(say, thread_ts), channel=channel)
+    handle_command(text, _threaded_say(say, thread_ts), channel=channel, thread_ts=thread_ts)
 
 
 @app.event("app_mention")
@@ -825,7 +858,7 @@ def handle_mention(event, say):
     text = re.sub(r"<@[A-Z0-9]+>", "", event.get("text", "")).strip()
     channel = event.get("channel", "")
     thread_ts = event.get("thread_ts") or event.get("ts", "")
-    handle_command(text, _threaded_say(say, thread_ts), channel=channel)
+    handle_command(text, _threaded_say(say, thread_ts), channel=channel, thread_ts=thread_ts)
 
 
 # ── PBS 作业监控 ──────────────────────────────────────────────────────────────
