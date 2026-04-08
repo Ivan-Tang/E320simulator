@@ -197,11 +197,15 @@ def main(
         ("Hough",    lambda: evaluate_hough_on_sim(clusters_test, tracks_test, hough_cfg)),
     ]:
         print(f"\n[{name}]")
+        out = OUT_DIR / f"{name.lower()}_test.parquet"
+        if out.exists() and not force_retrain:
+            print(f"  cached result exists → skipping: {out}")
+            reco_paths[name] = str(out)
+            continue
         t0 = time.perf_counter()
         result = fn()
         dt = time.perf_counter() - t0
         per_evt_ms = dt / n_test_events * 1e3
-        out = OUT_DIR / f"{name.lower()}_test.parquet"
         result.write_parquet(out)
         reco_paths[name] = str(out)
         print(f"  → {out}  ({dt:.1f}s total  {per_evt_ms:.2f} ms/event)")

@@ -90,9 +90,9 @@ def compute_metrics(reco: pl.DataFrame, tracks: pl.DataFrame) -> dict:
         "efficiency_%": round(efficiency, 2),
         "fake_rate_%":  round(fake_rate,  2),
         "f1_score_%":   round(f1_score,   2),
-        # fit quality
-        "chi2_mean":   float(np.mean(kept["chi2"].to_numpy())),
-        "rms_mean_um": float(np.mean(kept["rms"].to_numpy()) * 1e3),
+        # fit quality (guard against empty kept → np.mean([]) = nan)
+        "chi2_mean":   float(np.mean(kept["chi2"].to_numpy())) if n_kept > 0 else 0.0,
+        "rms_mean_um": float(np.mean(kept["rms"].to_numpy()) * 1e3) if n_kept > 0 else 0.0,
     }
 
 
