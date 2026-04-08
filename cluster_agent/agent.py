@@ -829,7 +829,7 @@ def is_allowed(user_id: str) -> bool:
 
 def _threaded_say(say, thread_ts: str):
     def _say(text, **kwargs):
-        say(text, thread_ts=thread_ts, **kwargs)
+        return say(text, thread_ts=thread_ts, **kwargs)
     return _say
 
 
