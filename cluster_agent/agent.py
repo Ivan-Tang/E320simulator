@@ -920,6 +920,18 @@ def monitor_pbs_jobs():
                 known = current
                 first_run = False
             else:
+                # Guard: if qstat returned empty but we had known jobs, treat as
+                # a transient qstat failure and skip this cycle to avoid false
+                # "job finished" notifications.
+                if not current and known:
+                    print(
+                        f"[pbs-monitor] qstat 返回空结果但已知 {len(known)} 个作业，"
+                        "疑似瞬态故障，跳过本轮",
+                        file=sys.stderr,
+                    )
+                    time.sleep(PBS_POLL_INTERVAL)
+                    continue
+
                 for jid, info in current.items():
                     prev = known.get(jid)
                     sess = _job_to_session(jid)
