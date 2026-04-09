@@ -148,7 +148,12 @@ def train_ml_model(
     else:
         cmd = [sys.executable, "-m", "src.train", *extra_args]
         print(f"  [spawn] {' '.join(cmd)}")
-        result = subprocess.run(cmd)
+        # POLARS_MAX_THREADS=1: prevent multi-threaded rechunk() on 280M-row DataFrames
+        # from triggering a Polars Rust thread race condition (SIGSEGV in PBS).
+        import os as _os
+        _env = _os.environ.copy()
+        _env["POLARS_MAX_THREADS"] = "1"
+        result = subprocess.run(cmd, env=_env)
         if result.returncode != 0:
             raise subprocess.CalledProcessError(result.returncode, cmd)
     return str(ckpt_path)
