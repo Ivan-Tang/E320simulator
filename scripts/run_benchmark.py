@@ -168,6 +168,8 @@ def main(
     workers: int = 1,
     ddp_nproc: int = 1,
     accum_steps: int = 1,
+    only_models: list[str] | None = None,
+    skip_nonml: bool = False,
 ) -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -200,7 +202,7 @@ def main(
     for name, fn in [
         ("Baseline", lambda: evaluate_baseline_on_sim(clusters_test, tracks_test, baseline_cfg)),
         ("Hough",    lambda: evaluate_hough_on_sim(clusters_test, tracks_test, hough_cfg)),
-    ]:
+    ] if not skip_nonml else []:
         print(f"\n[{name}]")
         out = OUT_DIR / f"{name.lower()}_test.parquet"
         if out.exists() and not force_retrain:
@@ -277,9 +279,10 @@ def main(
 
     # ── ML algorithms ─────────────────────────────────────────────────────────
     print("\n" + "=" * 65)
-    print(f"ML algorithms  (train={epochs} epochs on {device}, then test)")
+    active_models = only_models if only_models else ML_MODELS
+    print(f"ML algorithms  (train={epochs} epochs on {device}, then test)  models={active_models}")
 
-    for model_type in ML_MODELS:
+    for model_type in active_models:
         print(f"\n[{model_type.upper()}]")
         ckpt_dir  = RUNS_DIR / model_type
         ckpt_path = str(ckpt_dir / "best_model.pt")
@@ -464,6 +467,11 @@ if __name__ == "__main__":
                         help="Number of GPUs for DDP training (1 = single-GPU, no DDP)")
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1,
                         help="Gradient accumulation steps for DDP training")
+    parser.add_argument("--only-models", nargs="+", default=None,
+                        metavar="MODEL",
+                        help=f"Run only these ML models (choices: {ML_MODELS + ['transformer_edge', 'trackformer']})")
+    parser.add_argument("--skip-nonml", action="store_true",
+                        help="Skip non-ML algorithms (Baseline, Hough) and go straight to ML training")
     args = parser.parse_args()
     main(
         device       = args.device,
@@ -472,4 +480,6 @@ if __name__ == "__main__":
         workers      = args.workers,
         ddp_nproc    = args.ddp_nproc,
         accum_steps  = args.gradient_accumulation_steps,
+        only_models  = args.only_models,
+        skip_nonml   = args.skip_nonml,
     )
