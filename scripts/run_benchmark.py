@@ -294,9 +294,10 @@ def main(
             t0 = time.perf_counter()
             try:
                 ckpt_path = train_ml_model(
-                    "transformer", clusters_train, ckpt_dir,
+                    "transformer", ckpt_dir,
                     device=device, n_epochs=epochs, force=force_retrain,
-                    balanced_sampling=True, neg_pos_ratio=100,
+                    embedder_checkpoint=str(embedder_ckpt),
+                    ddp_nproc=ddp_nproc, accum_steps=accum_steps,
                 )
             except Exception as e:
                 print(f"  [ERROR] training failed: {e}")
