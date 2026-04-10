@@ -491,7 +491,20 @@ def _cli() -> None:
     parser.add_argument("--max-pairs", type=int, default=500000)
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "mps", "cuda"])
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Global random seed for reproducibility (default 42)")
     args = parser.parse_args()
+
+    import random as _random
+    import numpy as _np
+    import torch as _torch
+    _random.seed(args.seed)
+    _np.random.seed(args.seed)
+    _torch.manual_seed(args.seed)
+    _torch.cuda.manual_seed_all(args.seed)
+    _torch.backends.cudnn.deterministic = True
+    _torch.backends.cudnn.benchmark = False
+    print(f"[seed] global seed set to {args.seed}", flush=True)
 
     from src.config import SIM_DIR, RUNS_DIR
     clusters_path = args.clusters or str(SIM_DIR / "sim_clusters_train.parquet")

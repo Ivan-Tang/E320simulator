@@ -164,6 +164,7 @@ def train_ml_model(
 def main(
     device: str = "mps",
     force_retrain: bool = False,
+    force_retrain_embedder: bool = False,
     epochs: int = 200,
     workers: int = 1,
     ddp_nproc: int = 1,
@@ -224,7 +225,7 @@ def main(
     embedder_ckpt = embedder_dir / "best_embedder.pt"
     embedder_dir.mkdir(parents=True, exist_ok=True)
     t0 = time.perf_counter()
-    if embedder_ckpt.exists() and not force_retrain:
+    if embedder_ckpt.exists() and not force_retrain_embedder:
         print(f"  checkpoint exists → skipping: {embedder_ckpt}")
     elif ddp_nproc > 1:
         _run_ddp_spawn(
@@ -462,7 +463,9 @@ if __name__ == "__main__":
     parser.add_argument("--workers",          type=int, default=1,
                         help="Parallel workers for non-ML algorithms (default 1 to limit memory)")
     parser.add_argument("--force-retrain",    action="store_true",
-                        help="Re-train even if checkpoint already exists")
+                        help="Re-train edge classifiers even if checkpoints exist (embedder is NOT affected)")
+    parser.add_argument("--force-retrain-embedder", action="store_true",
+                        help="Re-train the shared embedder from scratch (use with care: affects all ML models)")
     parser.add_argument("--ddp-nproc",        type=int, default=1,
                         help="Number of GPUs for DDP training (1 = single-GPU, no DDP)")
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1,
@@ -474,12 +477,13 @@ if __name__ == "__main__":
                         help="Skip non-ML algorithms (Baseline, Hough) and go straight to ML training")
     args = parser.parse_args()
     main(
-        device       = args.device,
-        force_retrain= args.force_retrain,
-        epochs       = args.epochs,
-        workers      = args.workers,
-        ddp_nproc    = args.ddp_nproc,
-        accum_steps  = args.gradient_accumulation_steps,
-        only_models  = args.only_models,
-        skip_nonml   = args.skip_nonml,
+        device                 = args.device,
+        force_retrain          = args.force_retrain,
+        force_retrain_embedder = args.force_retrain_embedder,
+        epochs                 = args.epochs,
+        workers                = args.workers,
+        ddp_nproc              = args.ddp_nproc,
+        accum_steps            = args.gradient_accumulation_steps,
+        only_models            = args.only_models,
+        skip_nonml             = args.skip_nonml,
     )
