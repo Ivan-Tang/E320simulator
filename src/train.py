@@ -352,6 +352,7 @@ def train(
 
     rank, world_size, is_ddp = ddp.setup_ddp()
     device = ddp.resolve_device(cfg.device)
+    print(f"[diag] phase=train_entry  model={cfg.model_type}  device={device}", flush=True)
     ddp.ddp_print(f"[train] device={device}  model={cfg.model_type}  epochs={cfg.n_epochs}")
 
     # ── train / val split ────────────────────────────────────────────────────
@@ -365,8 +366,11 @@ def train(
     train_eids = set(all_events[:n_train].tolist())
     val_eids   = set(all_events[n_train:].tolist())
 
+    print(f"[diag] phase=filter_rechunk  n_train_events={len(train_eids)}", flush=True)
     train_df = edges_df.filter(pl.col("event_id").is_in(list(train_eids))).rechunk()
+    print(f"[diag] phase=filter_rechunk  train_done  n_rows={len(train_df)}", flush=True)
     val_df   = edges_df.filter(pl.col("event_id").is_in(list(val_eids))).rechunk()
+    print(f"[diag] phase=filter_rechunk  val_done  n_rows={len(val_df)}", flush=True)
 
     stats = edge_label_stats(edges_df)
     ddp.ddp_print(f"[train] total edges={stats['n_total']:,}  "
@@ -399,10 +403,12 @@ def train(
     # ── model / optimiser ────────────────────────────────────────────────────
     # HGNN may have unused parameters (last_embeddings is conditional)
     _find_unused = cfg.model_type == "hgnn"
+    print(f"[diag] phase=build_model  model_type={cfg.model_type}", flush=True)
     model, raw_model = ddp.maybe_wrap_ddp(
         _build_model(cfg, node_dim=node_dim_eff), device,
         find_unused_parameters=_find_unused,
     )
+    print(f"[diag] phase=model_on_device  device={device}", flush=True)
     criterion = FocalLoss(alpha=cfg.focal_alpha, gamma=cfg.focal_gamma)
     emb_criterion = HingeLoss(margin=1.0) if cfg.model_type == "hgnn" and cfg.hgnn_emb_loss_weight > 0 else None
     optimizer = optim.Adam(raw_model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
@@ -445,6 +451,7 @@ def train(
     local_train_events = ddp.shard_event_list(all_train_events, rank, world_size)
     accum_steps = max(1, cfg.gradient_accumulation_steps)
 
+    print(f"[diag] phase=training_loop_start  n_train_events={len(local_train_events)}", flush=True)
     for epoch in range(1, cfg.n_epochs + 1):
         model.train()
         epoch_loss = 0.0
@@ -454,7 +461,11 @@ def train(
         accum_count = 0  # events processed since last optimizer step
 
         for i, (_, ev_df) in enumerate(local_train_events):
+            if epoch == 1 and i == 0:
+                print(f"[diag] phase=first_forward_pass  event_0_edges={len(ev_df)}", flush=True)
             nf, ei, ef, lab, _ = event_to_tensors(ev_df)
+            if epoch == 1 and i == 0:
+                print(f"[diag] phase=first_forward_pass  tensors_built  nf={nf.shape}  ei={ei.shape}", flush=True)
             if cfg.skip_zero_pos_events and lab.sum() == 0:
                 continue
 
@@ -740,10 +751,13 @@ def _cli() -> None:
     import random as _random
     import numpy as _np
     import torch as _torch
+    print(f"[diag] phase=seed_setup  model={args.model if hasattr(args,'model') else '?'}  pid={os.getpid()}", flush=True)
     _random.seed(args.seed)
     _np.random.seed(args.seed)
     _torch.manual_seed(args.seed)
+    print(f"[diag] phase=cuda_seed_all", flush=True)
     _torch.cuda.manual_seed_all(args.seed)
+    print(f"[diag] phase=cudnn_flags", flush=True)
     _torch.backends.cudnn.deterministic = True
     _torch.backends.cudnn.benchmark = False
     print(f"[seed] global seed set to {args.seed}", flush=True)
@@ -755,11 +769,13 @@ def _cli() -> None:
     # other ranks wait at a barrier then read the pre-built file.
     # This avoids concurrent Lustre reads + Polars group_by triggering an
     # internal assertion failure, and cuts edge-building work to 1× instead of N×.
+    print(f"[diag] phase=ddp_setup", flush=True)
     rank, world_size, is_ddp = ddp.setup_ddp()
 
     if args.task == "edge":
         if args.edges is not None:
             # Pre-built edge table supplied directly — all ranks load it.
+            print(f"[diag] phase=read_parquet  path={args.edges}", flush=True)
             edges_df = pl.read_parquet(args.edges)
             print(f"[cli] rank {rank}: loaded {len(edges_df):,} edges from {args.edges}", flush=True)
             _edge_cache = None
