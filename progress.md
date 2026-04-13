@@ -1,5 +1,20 @@
 # 实验进度记录
 
+## 最近变更（新会话速览）
+
+| 日期 | 做了什么 | 结果 | 关键文件 |
+|------|---------|------|---------|
+| 03-31 | 合并 feature/ddp → master | 7 文件冲突解决，86 测试通过，DDP 支持就绪 | `src/train.py`, `src/ddp.py` |
+| 03-22 | Auto-research Loop 7 完成 | TransformerEdgeClassifier **82.01% / 11.66%**，超越 InteractionNet 70.6% / 14.3% | checkpoint: `runs/loop5_pos_weight_fix/best_model.pt` |
+| 03-20 | Benchmark + Scaling 分析 | 10k 事件全方法对比；背景/信号密度扫描完成 | `scripts/run_benchmark.py` |
+| 03-19 | OOM 根因修复 | 分批边图构建脚本，解决 35M clusters OOM | `scripts/build_edges.py` |
+
+**当前最优模型**：TransformerEdgeClassifier（82.01% eff / 11.66% fake）
+**目标**：≥95% eff / ≤5% fake
+**下一步**：① 失效案例诊断脚本 ② DDP 多卡训练 ③ 图构建/模型/后处理改进（依赖诊断结果）
+
+---
+
 ## 当前阶段
 
 **阶段**：TransformerEdgeClassifier 自主研究完成，目标达成
