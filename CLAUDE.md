@@ -9,7 +9,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 2. `progress.md` — 了解当前进度和下一步计划
 
 每次会话结束时，必须按顺序执行：
-1. 更新 `progress.md` — 记录本次完成的工作、实验结果、遇到的问题、下一步计划
+1. 更新 `progress.md` — 记录本次完成的工作、实验结果、遇到的问题、下一步计划；同时更新顶部的"最近变更"表格
 2. **Git commit + push** — 将本次所有修改提交并推送到远端（worker 节点从 git 拉取代码，不推送则批处理作业看不到更改）：
    ```bash
    cd ~/E320simulator
@@ -17,6 +17,39 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
    git commit -m "描述本次修改"
    git push
    ```
+
+## PBS Job 跟进规则
+
+提交 PBS job 后，**必须**设置跟进，禁止"提交即忘"：
+
+1. **提交时**：用 `CronCreate` 设置跟进时间（预估 walltime + 30 分钟缓冲）
+2. **跟进内容**：读 job 输出日志（`~/logs/`），解析关键指标（efficiency / fake_rate / loss），汇报给用户
+3. **Job 仍在运行**：延长跟进时间，再次检查
+4. **Job 失败**：分析 stderr 日志，诊断根因，向用户汇报
+5. **禁止**：提交 job 后不设置跟进，或只说"我稍后检查"却不实际设置
+
+跟进示例：
+```
+CronCreate: "30 15 13 4 *" (one-shot, 约 walltime 后)
+Prompt: "检查 PBS job <ID> 是否完成：读 ~/logs/ 对应日志，解析最终 metrics，
+与上次最优结果（82.01% / 11.66%）对比，汇报结论。"
+```
+
+## 计划 vs 直接执行
+
+以下场景**必须先规划**（使用 `EnterPlanMode`）：
+- 修改 `src/models.py` 中的模型架构
+- 修改训练流程（`src/train.py`、`src/train_embedder.py`、`src/train_trackformer.py`）
+- 涉及 3 个以上源文件的改动
+- 存在多种可行方案需要你做选择的场景（如"用哪种图构建策略"）
+- 修改后处理流程（chi2 过滤、NMS）
+
+以下场景**直接执行**，不需要规划：
+- 修 bug、加 log / debug 输出
+- 写新脚本（`scripts/` 目录）
+- 修改测试文件
+- 改配置参数、环境变量
+- 文档更新（`progress.md`、`research_log.md`）
 
 ## Cluster Environment
 
