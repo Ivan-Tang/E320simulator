@@ -105,8 +105,12 @@ class TrainConfig:
     # pretrained embedder for feature augmentation (two-stage pipeline)
     embedder_checkpoint: str | None = None  # path to best_embedder.pt; raw features are augmented with embedder output
 
-    # balanced mini-batch sampling (reduces extreme class imbalance for transformer)
-    balanced_sampling: bool = False
+    # balanced mini-batch sampling to counter extreme class imbalance (pos_frac≈0.00002).
+    # Enabled by default: each event batch keeps all positives + neg_pos_ratio×n_pos negatives,
+    # preventing gradient collapse where the model outputs near-zero for all edges.
+    # Focal-loss defaults (alpha=0.995) were tuned for pos_frac≈0.0002; with the actual
+    # pos_frac=0.00002 (10× worse), balanced sampling is required for reliable convergence.
+    balanced_sampling: bool = True
     neg_pos_ratio: int = 100        # negatives per positive in balanced batch
 
     # hardware
