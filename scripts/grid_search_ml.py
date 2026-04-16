@@ -126,8 +126,10 @@ def run_inference(
     node_mean, node_std, edge_mean, edge_std,
     baseline_cfg: BaselineConfig,
     device: str,
+    embedder_info=None,
 ) -> list[dict]:
     """Return a list of per-event dicts with pre-computed edge scores."""
+    from src.train import _augment_with_embedder
     device_t   = torch.device(device)
     node_mean  = node_mean.to(device_t)
     node_std   = node_std .to(device_t)
@@ -151,7 +153,10 @@ def run_inference(
             e_src, e_dst, e_sl, e_sx, e_sy,
             nid_to_local,
         )
-        nf = ((nf.to(device_t) - node_mean) / node_std)
+        nf = nf.to(device_t)
+        if embedder_info is not None:
+            nf = _augment_with_embedder(nf, embedder_info)
+        nf = (nf - node_mean) / node_std
         ef = ((ef.to(device_t) - edge_mean) / edge_std)
 
         with torch.no_grad():
@@ -423,6 +428,11 @@ def main(checkpoint_path: str, device: str, sim_dir: str, model_name: str | None
 
     baseline_cfg = BaselineConfig()
 
+    # ── two-stage embedder (optional) ─────────────────────────────────────────
+    embedder_info = ckpt.get("embedder_info", None)
+    if embedder_info is not None:
+        print(f"  Embedder detected: node_dim 7 → {embedder_info.get('embedding_dim', '?')}")
+
     # ── inference pass (once) ─────────────────────────────────────────────────
     print(f"\nRunning {model_name} inference on all events (once) …")
     t0 = time.perf_counter()
@@ -431,6 +441,7 @@ def main(checkpoint_path: str, device: str, sim_dir: str, model_name: str | None
         ckpt["model"], ckpt["node_mean"], ckpt["node_std"],
         ckpt["edge_mean"], ckpt["edge_std"],
         baseline_cfg, device,
+        embedder_info=embedder_info,
     )
     print(f"  Done in {time.perf_counter()-t0:.1f}s  ({len(cache)} events with edges)")
 
