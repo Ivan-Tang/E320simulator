@@ -33,8 +33,8 @@ def load_env():
             os.environ.setdefault(k.strip(), v.strip())
 
 
-def send_slack(message: str) -> bool:
-    """通过 Slack API 发送消息，返回是否成功。"""
+def send_slack(message: str, files: list[str] | None = None) -> bool:
+    """通过 Slack API 发送消息，可选附带文件，返回是否成功。"""
     import requests
 
     token = os.environ.get("SLACK_BOT_TOKEN")
@@ -54,6 +54,48 @@ def send_slack(message: str) -> bool:
         if not data.get("ok"):
             print(f"[notifier] Slack 发送失败: {data.get('error', data)}", file=sys.stderr)
             return False
+
+        # 上传文件
+        if files:
+            for fp in files:
+                if not Path(fp).exists():
+                    print(f"[notifier] 文件不存在: {fp}", file=sys.stderr)
+                    continue
+                try:
+                    with open(fp, "rb") as f:
+                        upload_resp = requests.post(
+                            "https://slack.com/api/files.getUploadURLExternal",
+                            params={"filename": Path(fp).name, "length": str(Path(fp).stat().st_size)},
+                            headers={"Authorization": f"Bearer {token}"},
+                            timeout=15,
+                        )
+                        upload_data = upload_resp.json()
+                        if not upload_data.get("ok"):
+                            print(f"[notifier] 获取上传 URL 失败: {upload_data.get('error')}", file=sys.stderr)
+                            continue
+                        upload_url = upload_data["upload_url"]
+                        file_id = upload_data["file_id"]
+                        # 上传文件内容
+                        post_resp = requests.post(upload_url, files={"file": f}, timeout=60)
+                        if post_resp.status_code != 200:
+                            print(f"[notifier] 上传文件失败: {post_resp.status_code}", file=sys.stderr)
+                            continue
+                        # 完成上传并关联到 channel
+                        complete_resp = requests.post(
+                            "https://slack.com/api/files.completeUploadExternal",
+                            json={
+                                "files": [{"id": file_id, "title": Path(fp).name}],
+                                "channel_id": channel,
+                            },
+                            headers={"Authorization": f"Bearer {token}"},
+                            timeout=15,
+                        )
+                        comp_data = complete_resp.json()
+                        if not comp_data.get("ok"):
+                            print(f"[notifier] 完成上传失败: {comp_data.get('error')}", file=sys.stderr)
+                except Exception as e:
+                    print(f"[notifier] 上传文件异常: {e}", file=sys.stderr)
+
         return True
     except Exception as e:
         print(f"[notifier] Slack 请求异常: {e}", file=sys.stderr)
@@ -91,15 +133,16 @@ def main():
     parser.add_argument("--slack", help="Slack 消息内容")
     parser.add_argument("--email", help="邮件主题")
     parser.add_argument("--body", default="", help="邮件正文（默认与主题相同）")
+    parser.add_argument("--image", action="append", default=[], help="附带图片文件路径（可多次使用）")
     args = parser.parse_args()
 
     if args.message:
         # 简单用法：positional arg 同时发两个
-        send_slack(args.message)
+        send_slack(args.message, files=args.image or None)
         send_email(args.message, args.body or args.message)
     else:
         if args.slack:
-            send_slack(args.slack)
+            send_slack(args.slack, files=args.image or None)
         if args.email:
             send_email(args.email, args.body or args.email)
         if not args.slack and not args.email:

@@ -92,7 +92,33 @@ def say_long(say, text: str):
         say(chunk)
 
 
-def post_to_channel(text: str):
+def _upload_file(file_path: str, channel: str, title: str = "",
+                  initial_comment: str = "", thread_ts: str = "") -> bool:
+    """上传文件到 Slack channel，返回是否成功。"""
+    if not Path(file_path).exists():
+        print(f"[agent] 文件不存在: {file_path}", file=sys.stderr)
+        return False
+    try:
+        kwargs: dict = {
+            "channel": channel,
+            "file": file_path,
+            "title": title or Path(file_path).name,
+        }
+        if initial_comment:
+            kwargs["initial_comment"] = initial_comment
+        if thread_ts:
+            kwargs["thread_ts"] = thread_ts
+        result = app.client.files_upload_v2(**kwargs)
+        if not result.get("ok"):
+            print(f"[agent] 文件上传失败: {result.get('error')}", file=sys.stderr)
+            return False
+        return True
+    except Exception as e:
+        print(f"[agent] 文件上传异常: {e}", file=sys.stderr)
+        return False
+
+
+def post_to_channel(text: str, files: list[str] | None = None):
     if not SLACK_CHANNEL_ID:
         return
     for chunk in chunk_text(text):
@@ -100,6 +126,9 @@ def post_to_channel(text: str):
             app.client.chat_postMessage(channel=SLACK_CHANNEL_ID, text=chunk)
         except Exception as e:
             print(f"[agent] post_to_channel error: {e}", file=sys.stderr)
+    if files:
+        for fp in files:
+            _upload_file(fp, SLACK_CHANNEL_ID)
 
 
 def run_shell(cmd: str, cwd=None, timeout=30) -> str:
