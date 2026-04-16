@@ -401,8 +401,11 @@ def train(
         ddp.ddp_print(f"[train] embedder pipeline: node_dim {NODE_DIM} → {node_dim_eff} (embedder replaces raw features)")
 
     # ── model / optimiser ────────────────────────────────────────────────────
-    # HGNN may have unused parameters (last_embeddings is conditional)
-    _find_unused = cfg.model_type == "hgnn"
+    # In DDP mode always enable find_unused_parameters: several models (e.g.
+    # InteractionNet) compute emb_output in forward() but only HGNN uses it in
+    # the loss.  Those parameters produce no gradient, which causes DDP to raise
+    # "Expected to have finished reduction in prior iteration" without this flag.
+    _find_unused = is_ddp or cfg.model_type == "hgnn"
     model, raw_model = ddp.maybe_wrap_ddp(
         _build_model(cfg, node_dim=node_dim_eff), device,
         find_unused_parameters=_find_unused,
