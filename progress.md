@@ -4,14 +4,15 @@
 
 | 日期 | 做了什么 | 结果 | 关键文件 |
 |------|---------|------|---------|
+| 04-16 | 单卡 benchmark 完成（Job 4040917） | GNN **92.84%/79.48%**；MLP 79.45%/31.72%；EggNet 67.95%（从1.4%恢复）；InteractionNet 52%（↓，待排查） | `logs/benchmark_run.log` |
+| 04-13 | balanced_sampling 默认 True | 修复 GNN/EggNet 梯度崩溃根因（pos_frac激进10倍）；A6000节点全部禁止 | `src/train.py`, `subs/benchmark.sh` |
 | 03-31 | 合并 feature/ddp → master | 7 文件冲突解决，86 测试通过，DDP 支持就绪 | `src/train.py`, `src/ddp.py` |
 | 03-22 | Auto-research Loop 7 完成 | TransformerEdgeClassifier **82.01% / 11.66%**，超越 InteractionNet 70.6% / 14.3% | checkpoint: `runs/loop5_pos_weight_fix/best_model.pt` |
-| 03-20 | Benchmark + Scaling 分析 | 10k 事件全方法对比；背景/信号密度扫描完成 | `scripts/run_benchmark.py` |
-| 03-19 | OOM 根因修复 | 分批边图构建脚本，解决 35M clusters OOM | `scripts/build_edges.py` |
 
-**当前最优模型**：TransformerEdgeClassifier（82.01% eff / 11.66% fake）
+**当前最优模型**：TransformerEdgeClassifier（82.01% eff / 11.66% fake，auto-research Loop 7）
+**balanced_sampling 修复后新星**：GNN ResGNN（92.84% eff，但 fake_rate 79.48%，需后处理优化）
 **目标**：≥95% eff / ≤5% fake
-**下一步**：① 失效案例诊断脚本 ② DDP 多卡训练 ③ 图构建/模型/后处理改进（依赖诊断结果）
+**下一步**：① 运行 `scripts/diagnose_failures.py` 诊断效率损失三类根因 ② 调优 GNN 阈值/后处理（潜在最优候选） ③ 排查 InteractionNet 回退原因
 
 ---
 
@@ -63,7 +64,20 @@
 
 ## 关键实验结果
 
-### Benchmark（10k 测试事件，1173 真实径迹，信号占比 0.02%）
+### Benchmark v2（Job 4040917，2026-04-14~16，gwn244 A5000，10k 测试事件，1173 真实径迹，200 epochs + balanced_sampling）
+
+| 方法 | 径迹效率 | 误判率 | F1 | Mean RMS | 推理时间 | vs 上次 |
+|------|----------|--------|-----|----------|----------|---------|
+| MLP | 79.45% | 31.72% | 73.44% | 6.76 µm | ~117 ms/evt | ↑ 74.3%→79.5% |
+| **GNN (ResGNN)** | **92.84%** | **79.48%** | 33.61% | 10.49 µm | ~281 ms/evt | ↑↑ 51.4%→92.8%（fake 率过高）|
+| InteractionNet | 52.00% | 20.68% | 62.82% | 6.07 µm | ~115 ms/evt | ↓ 70.6%→52%（待排查）|
+| EggNet | 67.95% | 46.97% | 59.57% | 8.05 µm | ~153 ms/evt | ↑↑ 1.4%→68%（完全恢复）|
+| HGNN | 46.04% | 22.86% | 57.66% | 6.44 µm | ~123 ms/evt | ↑ 14.2%→46%（改善）|
+
+*Baseline/Hough 未在此次 benchmark 中运行（脚本配置跳过）*
+**注**：GNN 效率接近目标 95%，但 fake_rate 79% 需要大幅降低；balanced_sampling 修复使 EggNet 完全复活。F1 最优为 MLP（73.44%）。
+
+### Benchmark v1（Job 3914621，2026-03-20，10k 测试事件，1173 真实径迹）
 
 | 方法 | 径迹效率 | 误判率 | Mean RMS | 推理时间 | 备注 |
 |------|----------|--------|----------|----------|------|
@@ -72,12 +86,11 @@
 | MLP | 74.3% | 40.4% | 4.67 µm | 2447 s | 与 Baseline 相当 |
 | GNN (ResGNN) | 51.4% | 43.5% | 4.78 µm | 2270 s | 低于 Baseline |
 | **InteractionNet** | **70.6%** | **14.3%** | **4.09 µm** | **767 s** | ★ 最优 ML：误判率最低，RMS最佳 |
-| EggNet | 1.4% | 10.5% | 4.95 µm | 713 s | 基本失效，checkpoint 需重训 |
+| EggNet | 1.4% | 10.5% | 4.95 µm | 713 s | 基本失效（balanced_sampling 关闭所致）|
 | HGNN | 14.2% | 10.2% | 4.14 µm | 712 s | 效率低但误判率好 |
 | Transformer | 2.2% | 99.7% | 4726 µm | 151 s | 完全失效，需从头重训 |
 
 *目标：径迹效率 ≥95%，误判率 ≤5%，推理时间 ≤10 ms/event*
-**注**：所有方法效率均远低于 95% 目标；InteractionNet 在误判率上接近目标（14.3% vs 5% 目标），是下一步重点优化方向。
 
 ### Scaling Sweep 1：背景强度扫描（mean_n_signal=0.5，1000 events）
 
@@ -162,12 +175,12 @@ DDP 参数 `--ddp-nproc` 默认为 1（单卡），无需特殊配置。
 
 ---
 
-## 下一步计划
+## 下一步计划（2026-04-16 更新）
 
-1. **分析 InteractionNet 失效案例**：当前 70.6% 效率 vs 95% 目标，差距主要来自哪类事件/径迹？（低动量？特殊几何？）
-2. **重新训练 Transformer（TrackFormer-Seed）**：现有 checkpoint 完全失效（99.7% fake），从头设计针对 E320 低信噪比的训练流程
-3. **重新训练 EggNet**：当前 1.4% 效率，checkpoint 基本无效，需重训或放弃
-4. **若需重训 ML 模型**：使用 `scripts/build_edges.py` 单独提交边图构建 job，再提交训练 job（OOM 问题已解决）
+1. **【优先】运行 `scripts/diagnose_failures.py`**：拆解效率损失三类根因（图构建覆盖率不足 / 模型打分低 / 后处理丢失），再决定后续优化方向
+2. **GNN 阈值/后处理调优**：GNN 效率已达 92.84%，但 fake_rate 79.48% 过高；尝试降低 edge-threshold 或加强 chi2 后处理，寻找效率-纯度最优工作点
+3. **排查 InteractionNet 回退**：70.6%→52% 可能是本次训练质量差或 balanced_sampling 副作用，单独重训一次验证
+4. **重新训练 Transformer（TrackFormer-Seed）**：现有 checkpoint 完全失效（99.7% fake），需从头设计针对 E320 低信噪比的训练流程
 
 ---
 
