@@ -4,15 +4,18 @@
 
 | 日期 | 做了什么 | 结果 | 关键文件 |
 |------|---------|------|---------|
+| 04-16 | 失效诊断分析完成 | ①图覆盖率100%；②model_miss=100%失效根因；GNN@0.1 in-graph TPR=97.1%，效率96.2%（超95%目标） | `scripts/analyze_diagnosis.py` |
 | 04-16 | 单卡 benchmark 完成（Job 4040917） | GNN **92.84%/79.48%**；MLP 79.45%/31.72%；EggNet 67.95%（从1.4%恢复）；InteractionNet 52%（↓，待排查） | `logs/benchmark_run.log` |
 | 04-13 | balanced_sampling 默认 True | 修复 GNN/EggNet 梯度崩溃根因（pos_frac激进10倍）；A6000节点全部禁止 | `src/train.py`, `subs/benchmark.sh` |
 | 03-31 | 合并 feature/ddp → master | 7 文件冲突解决，86 测试通过，DDP 支持就绪 | `src/train.py`, `src/ddp.py` |
 | 03-22 | Auto-research Loop 7 完成 | TransformerEdgeClassifier **82.01% / 11.66%**，超越 InteractionNet 70.6% / 14.3% | checkpoint: `runs/loop5_pos_weight_fix/best_model.pt` |
 
-**当前最优模型**：TransformerEdgeClassifier（82.01% eff / 11.66% fake，auto-research Loop 7）
-**balanced_sampling 修复后新星**：GNN ResGNN（92.84% eff，但 fake_rate 79.48%，需后处理优化）
-**目标**：≥95% eff / ≤5% fake
-**下一步**：① 运行 `scripts/diagnose_failures.py` 诊断效率损失三类根因 ② 调优 GNN 阈值/后处理（潜在最优候选） ③ 排查 InteractionNet 回退原因
+**当前最优模型（F1）**：TransformerEdgeClassifier（82.01% eff / 11.66% fake，F1≈73%）
+**效率最高**：GNN@0.1（**96.2% eff**，超 95% 目标，但 fake_rate 高，需专门训练降低假正率）
+**诊断结论**：① 图覆盖率 100%（图构建不是瓶颈）；② 100% 失效来自 model_miss；③ postproc 贡献为 0
+**核心矛盾**：GNN 高召回（in-graph TPR 97%）但低精度；TransformerEdge 高精度但低召回（79.8%）→ 需要结合两者优势
+**目标**：≥95% eff / ≤5% fake（F1≥80%）
+**下一步**：① 训练 hard-negative GNN（高召回 + 提升精度）② 或两阶段：GNN召回 + TransformerEdge精筛 ③ 等待 Job 4066296 全量诊断确认
 
 ---
 
