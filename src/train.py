@@ -370,8 +370,8 @@ def train(
     train_eids = set(all_events[:n_train].tolist())
     val_eids   = set(all_events[n_train:].tolist())
 
-    train_df = edges_df.filter(pl.col("event_id").is_in(list(train_eids))).rechunk()
-    val_df   = edges_df.filter(pl.col("event_id").is_in(list(val_eids))).rechunk()
+    train_df = edges_df.filter(pl.col("event_id").is_in(list(train_eids)))
+    val_df   = edges_df.filter(pl.col("event_id").is_in(list(val_eids)))
 
     stats = edge_label_stats(edges_df)
     ddp.ddp_print(f"[train] total edges={stats['n_total']:,}  "
@@ -768,7 +768,11 @@ def _cli() -> None:
     if args.task == "edge":
         if args.edges is not None:
             # Pre-built edge table supplied directly — all ranks load it.
-            edges_df = pl.read_parquet(args.edges)
+            # rechunk() immediately: on Lustre two concurrent readers can produce
+            # parquet chunks with misaligned boundaries, causing a Polars
+            # ShapeError ("filter's length differs from series") during train/val
+            # split.  A single rechunk consolidates all chunks before any filter.
+            edges_df = pl.read_parquet(args.edges).rechunk()
             print(f"[cli] rank {rank}: loaded {len(edges_df):,} edges from {args.edges}", flush=True)
             _edge_cache = None
         else:
