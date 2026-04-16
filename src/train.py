@@ -156,9 +156,10 @@ def _augment_with_embedder(
     Returns shape ``(N, emb_dim)`` — the embedding REPLACES the raw features;
     it is not concatenated to them.
     """
-    model = embedder_info["model"].eval()
-    emb_mean = embedder_info["_emb_mean"]
-    emb_std = embedder_info["_emb_std"]
+    dev = raw_nf.device
+    model = embedder_info["model"].eval().to(dev)
+    emb_mean = embedder_info["_emb_mean"].to(dev)
+    emb_std = embedder_info["_emb_std"].to(dev)
     with torch.no_grad():
         nf_norm = (raw_nf - emb_mean) / emb_std
         return model(nf_norm)  # (N, emb_dim)
