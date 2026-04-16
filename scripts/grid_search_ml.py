@@ -156,7 +156,8 @@ def run_inference(
         nf = nf.to(device_t)
         if embedder_info is not None:
             nf = _augment_with_embedder(nf, embedder_info)
-        nf = (nf - node_mean) / node_std
+        if nf.shape[1] == node_mean.shape[0]:   # skip when embedder changes dim
+            nf = (nf - node_mean) / node_std
         ef = ((ef.to(device_t) - edge_mean) / edge_std)
 
         with torch.no_grad():
