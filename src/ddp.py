@@ -54,11 +54,11 @@ def setup_ddp() -> tuple[int, int, bool]:
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
     init_method = os.environ.get("DDP_INIT_METHOD", "env://")
-    # Large timeout: rank-0 may spend 1-2h building edges before the first
-    # barrier is reached, so the default 30-min timeout is too short.
+    # Timeout: 10 min is enough since we use pre-built edges (no long setup).
+    # Keep short so rank failures surface quickly instead of waiting 3 hours.
     dist.init_process_group(backend="nccl", init_method=init_method,
                             rank=rank, world_size=world_size,
-                            timeout=datetime.timedelta(hours=3))
+                            timeout=datetime.timedelta(minutes=10))
     return rank, world_size, True
 
 

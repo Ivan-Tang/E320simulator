@@ -75,8 +75,10 @@ def _run_ddp_spawn(
     env_base["MASTER_ADDR"] = "localhost"
     env_base["MASTER_PORT"] = "29400"
     env_base["DDP_INIT_METHOD"] = f"file://{init_file}"
-    env_base["NCCL_P2P_DISABLE"] = "1"   # required on this cluster
-    env_base["POLARS_MAX_THREADS"] = "1"  # prevent Polars Rust race condition on rechunk()
+    env_base["NCCL_P2P_DISABLE"] = "1"        # required on this cluster
+    env_base["POLARS_MAX_THREADS"] = "1"       # prevent Polars Rust race condition on rechunk()
+    env_base["PYTHONUNBUFFERED"] = "1"         # flush stdout immediately so crash output isn't lost
+    env_base["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "1"  # propagate rank failures immediately
 
     cmd_suffix = [
         sys.executable, "-m", module,
