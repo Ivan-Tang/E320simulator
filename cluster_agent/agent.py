@@ -48,6 +48,7 @@ SLACK_APP_TOKEN = os.environ["SLACK_APP_TOKEN"]
 SLACK_CHANNEL_ID = os.environ.get("SLACK_CHANNEL_ID", "")
 NOTIFY_EMAIL = os.environ.get("NOTIFY_EMAIL", "")
 LOGS_DIR = Path("/srv01/agrp/yiwen/logs")
+FOLLOWUP_FILE = LOGS_DIR / "pbs_followups.json"
 
 # Claude session 文件目录（由 cwd 决定，cwd=PROJ_DIR）
 _proj_hash = str(PROJ_DIR).replace("/", "-")
@@ -129,6 +130,21 @@ def post_to_channel(text: str, files: list[str] | None = None):
     if files:
         for fp in files:
             _upload_file(fp, SLACK_CHANNEL_ID)
+
+
+def post_to_thread(thread_ts: str, text: str):
+    """发消息到指定 Slack thread（用于 PBS 跟进回复）。"""
+    if not SLACK_CHANNEL_ID:
+        return
+    for chunk in chunk_text(text):
+        try:
+            app.client.chat_postMessage(
+                channel=SLACK_CHANNEL_ID,
+                thread_ts=thread_ts,
+                text=chunk,
+            )
+        except Exception as e:
+            print(f"[agent] post_to_thread error: {e}", file=sys.stderr)
 
 
 def run_shell(cmd: str, cwd=None, timeout=30) -> str:
@@ -279,6 +295,68 @@ def _extract_save_tags(response: str) -> tuple[str, list[str]]:
     return "\n".join(clean_lines).strip(), facts
 
 
+def _extract_followup_tags(response: str) -> tuple[str, list[dict]]:
+    """
+    从 Claude 输出中提取 [PBS_FOLLOWUP]: {...} 行。
+    返回 (去掉标签后的输出, 解析后的 followup dict 列表)。
+    """
+    followups, clean_lines = [], []
+    for line in response.splitlines():
+        m = re.match(r"^\[PBS_FOLLOWUP\]:\s*(.+)$", line.strip())
+        if m:
+            try:
+                followups.append(json.loads(m.group(1).strip()))
+            except json.JSONDecodeError:
+                print(f"[agent] 无效的 PBS_FOLLOWUP JSON: {m.group(1)}", file=sys.stderr)
+        else:
+            clean_lines.append(line)
+    return "\n".join(clean_lines).strip(), followups
+
+
+# ── PBS 跟进注册表 ───────────────────────────────────────────────────────────
+
+def _register_followup(job_id: str, thread_ts: str, prompt: str):
+    """注册 PBS 作业跟进：作业完成时自动触发 Claude 分析结果。"""
+    session_id = _thread_session_id(thread_ts)
+    followups = {}
+    if FOLLOWUP_FILE.exists():
+        try:
+            followups = json.loads(FOLLOWUP_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            followups = {}
+    followups[job_id] = {
+        "thread_ts": thread_ts,
+        "session_id": session_id,
+        "prompt": prompt,
+        "registered_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+    }
+    FOLLOWUP_FILE.write_text(json.dumps(followups, indent=2, ensure_ascii=False))
+    print(f"[agent] 已注册 PBS 跟进: job={job_id} thread={thread_ts}", file=sys.stderr)
+
+
+def _lookup_followup(job_id: str) -> dict | None:
+    """按 PBS job ID 查找跟进条目。"""
+    if not FOLLOWUP_FILE.exists():
+        return None
+    try:
+        followups = json.loads(FOLLOWUP_FILE.read_text())
+        return followups.get(job_id)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _remove_followup(job_id: str):
+    """跟进触发后删除注册条目。"""
+    if not FOLLOWUP_FILE.exists():
+        return
+    try:
+        followups = json.loads(FOLLOWUP_FILE.read_text())
+        followups.pop(job_id, None)
+        FOLLOWUP_FILE.write_text(json.dumps(followups, indent=2, ensure_ascii=False))
+    except (json.JSONDecodeError, OSError):
+        pass
+
+
 # ── Slack 历史 / Claude 调用 ─────────────────────────────────────────────────
 
 def _fetch_channel_history(channel: str) -> list[dict]:
@@ -362,16 +440,17 @@ def run_claude_async(message: str, say, thread_ts: str = "", channel: str = ""):
                 else:
                     cmd += ["--session-id", session_id]
 
-            # 构建 prompt：注入长期记忆（resume 时 Claude 已有对话上下文，只补充记忆）
+            # 构建 prompt：注入长期记忆 + 指令标签说明
             memory = _read_memory()
+            hints = ""
             if memory:
-                prompt = (
-                    f"[长期记忆 — 跨会话持久，请优先参考]\n{memory}\n\n"
-                    f"如果本次对话发现值得长期记住的事实，请在回复末尾输出：[SAVE]: <一句话描述>\n\n"
-                    f"{message}"
-                )
-            else:
-                prompt = message
+                hints += f"[长期记忆 — 跨会话持久，请优先参考]\n{memory}\n\n"
+            hints += (
+                "指令标签（仅在需要时使用，正常回复不需要）：\n"
+                "- 记忆：[SAVE]: <一句话描述>\n"
+                "- PBS 作业跟进：[PBS_FOLLOWUP]: {\"job_id\": \"<id>\", \"prompt\": \"<跟进时 Claude 应执行的指令>\"}\n\n"
+            )
+            prompt = hints + message
             cmd.append(prompt)
 
             # 发初始消息，捕获 ts 以便后续原地更新
@@ -447,6 +526,14 @@ def run_claude_async(message: str, say, thread_ts: str = "", channel: str = ""):
             for fact in facts:
                 _append_memory(fact)
                 print(f"[agent] 已保存记忆: {fact}", file=sys.stderr)
+
+            # 解析 [PBS_FOLLOWUP]: 标签并注册跟进
+            response, followups = _extract_followup_tags(response)
+            for fu in followups:
+                job_id = fu.get("job_id")
+                fu_prompt = fu.get("prompt", "PBS 作业已完成，请读取输出日志，解析关键指标并汇报。")
+                if job_id and thread_ts:
+                    _register_followup(job_id, thread_ts, fu_prompt)
 
             say_long(say, response)
         finally:
@@ -890,6 +977,72 @@ def handle_mention(event, say):
     handle_command(text, _threaded_say(say, thread_ts), channel=channel, thread_ts=thread_ts)
 
 
+# ── PBS 跟进触发 ──────────────────────────────────────────────────────────────
+
+def _trigger_followup(followup: dict):
+    """PBS 作业完成时，恢复原始 Claude session 分析结果并回复到 Slack thread。"""
+    session_id = followup["session_id"]
+    thread_ts = followup["thread_ts"]
+    prompt = followup["prompt"]
+
+    def _worker():
+        if not _claude_lock.acquire(blocking=False):
+            post_to_thread(thread_ts, "⏳ 等待当前 Claude 任务完成，稍后自动分析 PBS 结果…")
+            _claude_lock.acquire(blocking=True)
+        try:
+            post_to_thread(thread_ts, "⏳ PBS 作业完成，Claude 正在分析结果…")
+
+            cmd = ["claude", "--print", "--dangerously-skip-permissions", "--resume", session_id]
+            if CLAUDE_MODEL:
+                cmd += ["--model", CLAUDE_MODEL]
+            if CLAUDE_EFFORT:
+                cmd += ["--effort", CLAUDE_EFFORT]
+
+            # 注入记忆和标签说明（支持链式跟进）
+            memory = _read_memory()
+            hints = ""
+            if memory:
+                hints += f"[长期记忆 — 跨会话持久，请优先参考]\n{memory}\n\n"
+            hints += (
+                "指令标签（仅在需要时使用）：\n"
+                "- 记忆：[SAVE]: <一句话描述>\n"
+                "- PBS 作业跟进：[PBS_FOLLOWUP]: {\"job_id\": \"<id>\", \"prompt\": \"<跟进指令>\"}\n\n"
+            )
+            cmd.append(hints + prompt)
+
+            try:
+                proc = subprocess.run(
+                    cmd, capture_output=True, text=True,
+                    cwd=str(PROJ_DIR), timeout=CLAUDE_TIMEOUT,
+                )
+                response = proc.stdout.strip() or "(Claude 返回空输出)"
+            except subprocess.TimeoutExpired:
+                response = f"⚠️ Claude 分析超时（{CLAUDE_TIMEOUT}s）"
+            except FileNotFoundError:
+                response = "❌ 找不到 `claude` 命令"
+            except Exception as e:
+                response = f"❌ 分析异常: {e}"
+
+            # 解析 SAVE 标签
+            response, facts = _extract_save_tags(response)
+            for fact in facts:
+                _append_memory(fact)
+
+            # 解析 PBS_FOLLOWUP 标签（支持链式跟进）
+            response, fu_list = _extract_followup_tags(response)
+            for fu in fu_list:
+                job_id = fu.get("job_id")
+                fu_prompt = fu.get("prompt", "PBS 作业已完成，请读取输出日志，解析关键指标并汇报。")
+                if job_id:
+                    _register_followup(job_id, thread_ts, fu_prompt)
+
+            post_to_thread(thread_ts, response)
+        finally:
+            _claude_lock.release()
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
 # ── PBS 作业监控 ──────────────────────────────────────────────────────────────
 
 def _parse_qstat(output: str) -> dict[str, dict]:
@@ -987,6 +1140,12 @@ def monitor_pbs_jobs():
                         if tail:
                             msg += f"\n```\n{tail[-600:]}\n```"
                         post_to_channel(msg)
+
+                        # 检查是否有注册的跟进，有则触发 Claude 分析
+                        followup = _lookup_followup(jid)
+                        if followup:
+                            _remove_followup(jid)
+                            _trigger_followup(followup)
 
                 known = current
 
