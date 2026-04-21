@@ -463,7 +463,9 @@ def train(
 
         for i, (_, ev_df) in enumerate(local_train_events):
             nf, ei, ef, lab, _ = event_to_tensors(ev_df)
-            if cfg.skip_zero_pos_events and lab.sum() == 0:
+            # In DDP mode, skipping must be disabled: different ranks would skip
+            # different events → unequal backward() counts → NCCL AllReduce deadlock.
+            if cfg.skip_zero_pos_events and lab.sum() == 0 and not is_ddp:
                 continue
 
             # Balanced mini-batch: sample all positives + neg_pos_ratio×n_pos negatives
