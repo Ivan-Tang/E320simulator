@@ -147,6 +147,9 @@ def train_ml_model(
         extra_args += ["--embedder-checkpoint", embedder_checkpoint]
 
     if ddp_nproc > 1:
+        # Reduce validation barrier frequency in DDP to avoid rank 1 blocking
+        # every epoch while rank 0 runs validation (log_every=1 default).
+        extra_args += ["--log-every", "10"]
         _run_ddp_spawn("src.train", extra_args, nproc=ddp_nproc, accum_steps=accum_steps)
     else:
         cmd = [sys.executable, "-m", "src.train", *extra_args]

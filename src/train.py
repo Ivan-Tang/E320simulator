@@ -13,6 +13,7 @@ Usage (script)
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import json
 import os
@@ -516,12 +517,20 @@ def train(
             if hasattr(_inner_model, "last_embeddings"):
                 _inner_model.last_embeddings = None
 
-            # Scale loss for gradient accumulation
-            (loss / accum_steps).backward()
+            is_last_event = (i + 1) == len(local_train_events)
+            will_step = (accum_count + 1 >= accum_steps) or is_last_event
+
+            # In DDP, suppress AllReduce for intermediate accumulation steps.
+            # Without no_sync(), every backward() triggers NCCL AllReduce even
+            # when we haven't reached the accumulation boundary — causing O(n_events)
+            # syncs per epoch (e.g. 4000) instead of O(n_events/accum_steps) (e.g. 40).
+            backward_ctx = (model.no_sync() if is_ddp and not will_step
+                            else contextlib.nullcontext())
+            with backward_ctx:
+                (loss / accum_steps).backward()
             accum_count += 1
 
-            is_last_event = (i + 1) == len(local_train_events)
-            if accum_count >= accum_steps or is_last_event:
+            if will_step:
                 torch.nn.utils.clip_grad_norm_(raw_model.parameters(), cfg.grad_clip)
                 optimizer.step()
                 optimizer.zero_grad()
@@ -741,6 +750,8 @@ def _cli() -> None:
     parser.add_argument("--checkpoint", default=None, help="Directory to save checkpoints")
     parser.add_argument("--embedder-checkpoint", default=None,
                         help="Path to pretrained embedder .pt for node feature augmentation")
+    parser.add_argument("--log-every", type=int, default=1,
+                        help="Run validation and print metrics every N epochs (use >1 in DDP to reduce barrier overhead)")
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1,
                         help="Accumulate gradients over N events before optimizer step (DDP / memory)")
     parser.add_argument("--seed", type=int, default=42,
@@ -807,6 +818,7 @@ def _cli() -> None:
             checkpoint_dir   = args.checkpoint,
             embedder_checkpoint = args.embedder_checkpoint,
             gradient_accumulation_steps = args.gradient_accumulation_steps,
+            log_every                   = args.log_every,
         )
         train(edges_df, cfg)
         if is_ddp and rank == 0 and _edge_cache and os.path.exists(_edge_cache):
