@@ -767,6 +767,12 @@ def _cli() -> None:
     _torch.cuda.manual_seed_all(args.seed)
     _torch.backends.cudnn.deterministic = True
     _torch.backends.cudnn.benchmark = False
+    # Make index_add_ / scatter_add on CUDA deterministic (PyTorch 2.1+).
+    # Without this, GNN message aggregation (index_add_) uses non-deterministic
+    # atomic adds on GPU, causing large run-to-run variance even with a fixed seed.
+    # warn_only=True avoids hard errors if any op lacks a deterministic fallback.
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    _torch.use_deterministic_algorithms(True, warn_only=True)
     print(f"[seed] global seed set to {args.seed}", flush=True)
 
     if args.edges is None and args.clusters is None:
