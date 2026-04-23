@@ -4,18 +4,20 @@
 
 | 日期 | 做了什么 | 结果 | 关键文件 |
 |------|---------|------|---------|
+| 04-23 | Benchmark v3 完成（Job 4123847） | MLP 完全一致（GPU seed 未控制！）；HGNN **96.68%/35.86%** F1=77%（本轮最高）；GNN 99.23%/87.88%；InteractionNet 34.78%（三轮下跌，放弃） | `logs/benchmark_run.log` |
+| 04-22 | DDP no_sync() 修复提交 | AllReduce 次数 4000→40/epoch；加 --log-every CLI；提交修复验证 job 4135811 | `src/train.py`, `scripts/run_benchmark.py` |
+| 04-21 | DDP 2-GPU smoke test 通过 | gwn243 A5000×2，10 epochs，无 NCCL deadlock | `subs/ddp_test_2gpu.sh` |
 | 04-16 | 失效诊断分析完成 | ①图覆盖率100%；②model_miss=100%失效根因；GNN@0.1 in-graph TPR=97.1%，效率96.2%（超95%目标） | `scripts/analyze_diagnosis.py` |
 | 04-16 | 单卡 benchmark 完成（Job 4040917） | GNN **92.84%/79.48%**；MLP 79.45%/31.72%；EggNet 67.95%（从1.4%恢复）；InteractionNet 52%（↓，待排查） | `logs/benchmark_run.log` |
 | 04-13 | balanced_sampling 默认 True | 修复 GNN/EggNet 梯度崩溃根因（pos_frac激进10倍）；A6000节点全部禁止 | `src/train.py`, `subs/benchmark.sh` |
 | 03-31 | 合并 feature/ddp → master | 7 文件冲突解决，86 测试通过，DDP 支持就绪 | `src/train.py`, `src/ddp.py` |
 | 03-22 | Auto-research Loop 7 完成 | TransformerEdgeClassifier **82.01% / 11.66%**，超越 InteractionNet 70.6% / 14.3% | checkpoint: `runs/loop5_pos_weight_fix/best_model.pt` |
 
-**当前最优模型（F1）**：TransformerEdgeClassifier（82.01% eff / 11.66% fake，F1≈73%）
-**效率最高**：GNN@0.1（**96.2% eff**，超 95% 目标，但 fake_rate 高，需专门训练降低假正率）
-**诊断结论**：① 图覆盖率 100%（图构建不是瓶颈）；② 100% 失效来自 model_miss；③ postproc 贡献为 0
-**核心矛盾**：GNN 高召回（in-graph TPR 97%）但低精度；TransformerEdge 高精度但低召回（79.8%）→ 需要结合两者优势
+**当前最优模型（F1）**：HGNN v3（96.68% eff / 35.86% fake，F1=77.12%，但 GPU seed 未控制，需重现确认）
+**历史最优 F1（受控）**：TransformerEdgeClassifier（82.01% / 11.66%，F1≈73%）
+**可重复性结论**：存在未控制 GPU 随机性（`torch.cuda.manual_seed_all` + `cudnn.deterministic` 未设置）；MLP 完全可重现，GNN/HGNN/EggNet 方差大
 **目标**：≥95% eff / ≤5% fake（F1≥80%）
-**下一步**：① 训练 hard-negative GNN（高召回 + 提升精度）② 或两阶段：GNN召回 + TransformerEdge精筛 ③ 等待 Job 4066296 全量诊断确认
+**下一步**：① 修复 GPU seed（`torch.cuda.manual_seed_all` + `cudnn.deterministic`），重跑 HGNN 确认 96.68% 是否稳定 ② 对 HGNN 做阈值扫描降低 fake_rate（35.86% → <20%）
 
 ---
 
@@ -66,6 +68,22 @@
 ---
 
 ## 关键实验结果
+
+### Benchmark v3（Job 4123847，2026-04-21~23，gwn244 A5000，10k 测试事件，1173 真实径迹，200 epochs + balanced_sampling）
+
+**目的**：重复 v2 检验可重复性，发现 GPU 端随机变量未被控制。
+
+| 方法 | 径迹效率 | 误判率 | F1 | Mean RMS | 训练时间 | vs v2 |
+|------|----------|--------|-----|----------|----------|-------|
+| MLP | 79.45% | 31.72% | 73.44% | 6.76 µm | ~32190s | **完全一致**（CPU seed 有效）|
+| GNN | 99.23% | 87.88% | 21.60% | 11.11 µm | ~34020s | eff ↑+6.4%，fake ↑+8.4% |
+| InteractionNet | 34.78% | 19.53% | 48.57% | 6.10 µm | ~33379s | eff ↓-17%（三轮连续下跌，放弃）|
+| EggNet | 54.90% | 32.49% | 60.55% | 6.95 µm | ~35578s | eff ↓-13% |
+| **HGNN** | **96.68%** | **35.86%** | **77.12%** | 7.12 µm | ~37692s | **eff ↑+50%！本轮 F1 最高** |
+
+**可重复性结论**：GPU 端随机性未控制（缺少 `torch.cuda.manual_seed_all()` + `cudnn.deterministic=True`）。各模型波动巨大（HGNN 46%→96%，InteractionNet 70%→52%→35%）。MLP 因主要受 CPU 操作主导而完全一致。
+
+---
 
 ### Benchmark v2（Job 4040917，2026-04-14~16，gwn244 A5000，10k 测试事件，1173 真实径迹，200 epochs + balanced_sampling）
 
