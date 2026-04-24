@@ -5,6 +5,7 @@
 | 日期 | 做了什么 | 结果 | 关键文件 |
 |------|---------|------|---------|
 | 04-23 | Benchmark v3 完成（Job 4123847） | MLP 完全一致（GPU seed 未控制！）；HGNN **96.68%/35.86%** F1=77%（本轮最高）；GNN 99.23%/87.88%；InteractionNet 34.78%（三轮下跌，放弃） | `logs/benchmark_run.log` |
+| 04-24 | **DDP 路线关闭** | 瓶颈=Polars CPU 加载（POLARS_MAX_THREADS=1 为 Lustre SIGSEGV 必要限制），加 GPU/CPU 均无效；单卡 165s/epoch，DDP 519s/epoch（3.1x 慢）；后续一律单卡 | — |
 | 04-22 | DDP no_sync() 修复提交 | AllReduce 次数 4000→40/epoch；加 --log-every CLI；提交修复验证 job 4135811 | `src/train.py`, `scripts/run_benchmark.py` |
 | 04-21 | DDP 2-GPU smoke test 通过 | gwn243 A5000×2，10 epochs，无 NCCL deadlock | `subs/ddp_test_2gpu.sh` |
 | 04-16 | 失效诊断分析完成 | ①图覆盖率100%；②model_miss=100%失效根因；GNN@0.1 in-graph TPR=97.1%，效率96.2%（超95%目标） | `scripts/analyze_diagnosis.py` |
