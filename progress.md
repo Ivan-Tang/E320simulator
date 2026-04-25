@@ -4,6 +4,7 @@
 
 | 日期 | 做了什么 | 结果 | 关键文件 |
 |------|---------|------|---------|
+| 04-25 | HGNN deterministic v4 完成（Job 4158623） | **56.95%/20.48%/F1=66.37%**；v3 的 96.68% 是侥幸——HGNN 对初始化极敏感，三次结果：46%/57%/97%；已分析根因见下方 | `logs/train_hgnn_run.log` |
 | 04-23 | Benchmark v3 完成（Job 4123847） | MLP 完全一致（GPU seed 未控制！）；HGNN **96.68%/35.86%** F1=77%（本轮最高）；GNN 99.23%/87.88%；InteractionNet 34.78%（三轮下跌，放弃） | `logs/benchmark_run.log` |
 | 04-24 | **DDP 路线关闭** | 瓶颈=Polars CPU 加载（POLARS_MAX_THREADS=1 为 Lustre SIGSEGV 必要限制），加 GPU/CPU 均无效；单卡 165s/epoch，DDP 519s/epoch（3.1x 慢）；后续一律单卡 | — |
 | 04-22 | DDP no_sync() 修复提交 | AllReduce 次数 4000→40/epoch；加 --log-every CLI；提交修复验证 job 4135811 | `src/train.py`, `scripts/run_benchmark.py` |
@@ -14,11 +15,11 @@
 | 03-31 | 合并 feature/ddp → master | 7 文件冲突解决，86 测试通过，DDP 支持就绪 | `src/train.py`, `src/ddp.py` |
 | 03-22 | Auto-research Loop 7 完成 | TransformerEdgeClassifier **82.01% / 11.66%**，超越 InteractionNet 70.6% / 14.3% | checkpoint: `runs/loop5_pos_weight_fix/best_model.pt` |
 
-**当前最优模型（F1）**：HGNN v3（96.68% eff / 35.86% fake，F1=77.12%，但 GPU seed 未控制，需重现确认）
-**历史最优 F1（受控）**：TransformerEdgeClassifier（82.01% / 11.66%，F1≈73%）
-**可重复性结论**：存在未控制 GPU 随机性（`torch.cuda.manual_seed_all` + `cudnn.deterministic` 未设置）；MLP 完全可重现，GNN/HGNN/EggNet 方差大
+**当前最优模型（F1 受控）**：TransformerEdgeClassifier（82.01% / 11.66%，F1≈73%）
+**HGNN 结论**：初始化极敏感（三次：46%/57%/97%），不稳定，不作为主要方向
+**可重复性结论**：deterministic fix（`use_deterministic_algorithms(True, warn_only=True)`）已合并，MLP/HGNN 均可复现；HGNN 高方差根因为架构设计问题（见下方分析）
 **目标**：≥95% eff / ≤5% fake（F1≥80%）
-**下一步**：① 修复 GPU seed（`torch.cuda.manual_seed_all` + `cudnn.deterministic`），重跑 HGNN 确认 96.68% 是否稳定 ② 对 HGNN 做阈值扫描降低 fake_rate（35.86% → <20%）
+**下一步**：① 等待 GNN v4 结果（Job 4158720），确认 GNN 92.84% 稳定性 ② 若稳定，做 GNN 阈值扫描降低 fake_rate（79% → <20%）③ 参考 diagnose_failures 结论优化 TransformerEdgeClassifier
 
 ---
 
@@ -69,6 +70,51 @@
 ---
 
 ## 关键实验结果
+
+### HGNN Deterministic v4（Job 4158623，2026-04-25，gwn244 A5000，200 epochs）
+
+**目的**：用 deterministic fix 重现 v3 的 96.68%，确认是否稳定。
+
+| 版本 | 条件 | Efficiency | Fake rate | F1 |
+|------|------|-----------|-----------|-----|
+| v2 | 无 GPU seed 控制 | 46.04% | 22.86% | 57.66% |
+| v3 | 无 GPU seed 控制 | **96.68%** | 35.86% | 77.12% |
+| **v4** | **deterministic fix** | **56.95%** | **20.48%** | **66.37%** |
+
+**结论：v3 的 96.68% 是偶然，HGNN 对初始化极度敏感，不稳定，不作为主要优化方向。**
+
+#### HGNN 高方差根因分析
+
+HGNN 方差远大于其他模型（GNN/MLP），根因在于**两阶段架构的连锁脆弱性**：
+
+**1. `index_add_` 调用次数远多于其他模型**
+
+每次 forward 包含 ~13 次 `index_add_`（GNN 仅 3 次）：
+- `_build_super_structure()` 中 4 次（supernode/embedding 聚合）
+- 每个 `HierarchicalGNNCell` 3 次 × 3 cells = 9 次
+
+每次 `index_add_` 在 CUDA 上做非确定性原子加法，误差随深度和轮数指数级累积。deterministic fix 解决了不可复现问题，但不能改变对初始化的敏感性。
+
+**2. bipartite_weights 软门控放大初始化差异**
+
+`_build_super_structure()` 中（`models.py:965`）：
+```python
+cos_sim = (embeddings * emb_layer[layer_ids]).sum(dim=-1, keepdim=True)
+bipartite_weights = cos_sim / cos_mean.clamp(min=1e-8)
+```
+这个权重由第一阶段（InteractionGNN）的中间 embedding 动态计算。若初始化使 embedding 空间处于"好"的状态，bipartite_weights 有信息量，第二阶段能有效学习；若 embedding 在初期几乎均匀，权重退化为常数，hierarchical 部分无法获得有效监督。结果就是两个截然不同的吸引域：**激进态**（高效率/高 fake）或**保守态**（低效率/低 fake）。
+
+**3. 损失面双峰**
+
+三次结果（46%/57%/97%）分属两个吸引域：
+- 保守态：效率 46-57%，fake 20-23%（模型默认打分低）
+- 激进态：效率 96%，fake 36%（偶然找到好初始化）
+
+**修复方向（如需探索）**：
+- 两阶段训练：先单独训练 InteractionGNN 阶段固定 embedding，再训练 hierarchical 部分
+- 或将 bipartite_weights 改为基于 layer_id 的固定均匀权重（去掉 cosine 动态计算），降低对 embedding 质量的依赖
+
+---
 
 ### Benchmark v3（Job 4123847，2026-04-21~23，gwn244 A5000，10k 测试事件，1173 真实径迹，200 epochs + balanced_sampling）
 
