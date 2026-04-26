@@ -66,6 +66,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--sim_dir",     default=SIM_DIR)
     p.add_argument("--model-name",  default=None,
                    help="Display name for the model (derived from checkpoint if omitted)")
+    p.add_argument("--n-events",    type=int, default=None,
+                   help="Limit to first N events (for fast sweeps; default: all)")
     return p.parse_args()
 
 
@@ -377,7 +379,7 @@ def plot_edge_keep_rate(results: list[dict], save_path: str, model_name: str) ->
 # Main
 # ──────────────────────────────────────────────────────────────────────────────
 
-def main(checkpoint_path: str, device: str, sim_dir: str, model_name: str | None) -> None:
+def main(checkpoint_path: str, device: str, sim_dir: str, model_name: str | None, args_n_events: int | None = None) -> None:
     # ── load data ─────────────────────────────────────────────────────────────
     clusters_path = f"{sim_dir}/sim_clusters_test.parquet"
     tracks_path   = f"{sim_dir}/sim_tracks_test.parquet"
@@ -415,6 +417,12 @@ def main(checkpoint_path: str, device: str, sim_dir: str, model_name: str | None
             sx_arr[s:s+c_], sy_arr[s:s+c_], s_arr[s:s+c_],
             tid_arr[s:s+c_] if has_truth else None,
         ))
+
+    if args_n_events is not None:
+        event_slices = event_slices[:args_n_events]
+        n_truth = tracks_df.filter(
+            pl.col("event_id").is_in([e[0] for e in event_slices])
+        ).height
 
     print(f"Loaded {len(event_slices)} events  {clusters_df.height:,} clusters  {n_truth} truth tracks")
 
@@ -493,4 +501,4 @@ def main(checkpoint_path: str, device: str, sim_dir: str, model_name: str | None
 
 if __name__ == "__main__":
     args = _parse_args()
-    main(args.checkpoint, args.device, args.sim_dir, args.model_name)
+    main(args.checkpoint, args.device, args.sim_dir, args.model_name, args.n_events)
