@@ -4,6 +4,8 @@
 
 | 日期 | 做了什么 | 结果 | 关键文件 |
 |------|---------|------|---------|
+| 04-28 | Benchmark v5（A6000, 24h walltime 被杀） | MLP **79.5%/31.7%/F1=73.5%**（首个干净 MLP 结果）；GNN 78.3%/80.3%（与 v4 完全一致，deterministic 验证）；walltime 不足，InteractionNet+ 未跑完 | `logs/benchmark_a6000_run.log` |
+| 04-27 | Benchmark v4（A5000，deterministic+seed=42） + GNN 阈值扫描 | InteractionNet **77.15%/22.12%/F1=77.52%**；EggNet 71.61%/44%；HGNN 56.95%/20.48%；GNN 78.35%/80.31%（阈值无法解决 fake_rate，是结构性问题）；MLP SIGSEGV | `logs/benchmark_run.log`, `logs/threshold_sweep_gnn_run.log` |
 | 04-25 | HGNN deterministic v4 完成（Job 4158623） | **56.95%/20.48%/F1=66.37%**；v3 的 96.68% 是侥幸——HGNN 对初始化极敏感，三次结果：46%/57%/97%；已分析根因见下方 | `logs/train_hgnn_run.log` |
 | 04-23 | Benchmark v3 完成（Job 4123847） | MLP 完全一致（GPU seed 未控制！）；HGNN **96.68%/35.86%** F1=77%（本轮最高）；GNN 99.23%/87.88%；InteractionNet 34.78%（三轮下跌，放弃） | `logs/benchmark_run.log` |
 | 04-24 | **DDP 路线关闭** | 瓶颈=Polars CPU 加载（POLARS_MAX_THREADS=1 为 Lustre SIGSEGV 必要限制），加 GPU/CPU 均无效；单卡 165s/epoch，DDP 519s/epoch（3.1x 慢）；后续一律单卡 | — |
@@ -15,11 +17,12 @@
 | 03-31 | 合并 feature/ddp → master | 7 文件冲突解决，86 测试通过，DDP 支持就绪 | `src/train.py`, `src/ddp.py` |
 | 03-22 | Auto-research Loop 7 完成 | TransformerEdgeClassifier **82.01% / 11.66%**，超越 InteractionNet 70.6% / 14.3% | checkpoint: `runs/loop5_pos_weight_fix/best_model.pt` |
 
-**当前最优模型（F1 受控）**：TransformerEdgeClassifier（82.01% / 11.66%，F1≈73%）
+**当前最优模型（F1 受控）**：TransformerEdgeClassifier（82.01% / 11.66%，来自 auto-research）；在最新 benchmark 中 InteractionNet F1=77.52% 是次优
 **HGNN 结论**：初始化极敏感（三次：46%/57%/97%），不稳定，不作为主要方向
-**可重复性结论**：deterministic fix（`use_deterministic_algorithms(True, warn_only=True)`）已合并，MLP/HGNN 均可复现；HGNN 高方差根因为架构设计问题（见下方分析）
+**GNN 结论**：fake_rate 结构性问题（80%+），阈值扫描（0.01→0.85，1000 events）无效，fake_rate 仅从 89.5%→83.8%
+**可重复性结论**：deterministic fix 有效；GNN A5000 vs A6000 结果完全一致（78.3%/80.3%）
 **目标**：≥95% eff / ≤5% fake（F1≥80%）
-**下一步**：① 等待 GNN v4 结果（Job 4158720），确认 GNN 92.84% 稳定性 ② 若稳定，做 GNN 阈值扫描降低 fake_rate（79% → <20%）③ 参考 diagnose_failures 结论优化 TransformerEdgeClassifier
+**下一步**：① 重提 benchmark_a6000.sh（改 walltime=72h）完成所有模型 ② 或直接聚焦 InteractionNet/Transformer 优化（诊断失效根因）
 
 ---
 
@@ -113,6 +116,48 @@ bipartite_weights = cos_sim / cos_mean.clamp(min=1e-8)
 **修复方向（如需探索）**：
 - 两阶段训练：先单独训练 InteractionGNN 阶段固定 embedding，再训练 hierarchical 部分
 - 或将 bipartite_weights 改为基于 layer_id 的固定均匀权重（去掉 cosine 动态计算），降低对 embedding 质量的依赖
+
+---
+
+### Benchmark v5（Job 4171289，2026-04-28，A6000/RTX6000Ada 49GB，24h walltime 限制）
+
+**目的**：在 A6000 上确认 MLP（v4 SIGSEGV）结果，并验证 deterministic 跨节点一致性。
+
+**结果（24h 内完成两个模型后被 PBS 杀死）：**
+
+| 方法 | 径迹效率 | 误判率 | F1 | 备注 |
+|------|----------|--------|-----|------|
+| MLP | **79.5%** | **31.7%** | **73.5%** | v4 SIGSEGV 后首个干净结果；与历史 v2/v3 完全一致 |
+| GNN | 78.3% | 80.3% | 31.4% | 与 v4（A5000）完全一致，deterministic 跨节点验证通过 |
+| InteractionNet+ | — | — | — | walltime=24h 不足，未启动 |
+
+**结论**：每个模型约 9-10h（A6000 单卡），5 个模型需 ≥50h。需重提 walltime=72h 版本。
+
+---
+
+### GNN v4 阈值扫描（Job ~4170xxx，2026-04-27，1000 events，27 阈值 0.01→0.85）
+
+**目的**：通过调整 edge-threshold 降低 GNN 的 fake_rate（结构性 80%+）。
+
+**结论：阈值无效，GNN fake_rate 是结构性问题。**
+
+- 阈值范围 0.01→0.85，fake_rate 仅从 89.5% 降至 83.8%（↓仅 5.7 pp）
+- 高阈值下 efficiency 急剧下降，无任何可用工作点
+- 根因：GNN 对 fake edges 打分与 true edges 打分重叠严重，分离度不足
+
+---
+
+### Benchmark v4（Job 4167031，2026-04-27，gwn243 A5000，deterministic fix + seed=42）
+
+**目的**：在 deterministic 条件下建立全量模型干净基线。
+
+| 方法 | 径迹效率 | 误判率 | F1 | 备注 |
+|------|----------|--------|-----|------|
+| MLP | SIGSEGV | — | — | A5000 OOM（CUBLAS workspace 4GiB × workers + Polars）|
+| GNN | 78.35% | 80.31% | 31.47% | 独立 job 完成（确定性验证通过）|
+| **InteractionNet** | **77.15%** | **22.12%** | **77.52%** | ★ 当前 benchmark 最优 F1 |
+| EggNet | 71.61% | 44.00% | 62.85% | 效率回升但 fake 偏高 |
+| HGNN | 56.95% | 20.48% | 66.37% | 保守吸引域，与单独训练结果一致 |
 
 ---
 
@@ -243,12 +288,17 @@ DDP 参数 `--ddp-nproc` 默认为 1（单卡），无需特殊配置。
 
 ---
 
-## 下一步计划（2026-04-16 更新）
+## 下一步计划（2026-04-28 更新）
 
-1. **【优先】运行 `scripts/diagnose_failures.py`**：拆解效率损失三类根因（图构建覆盖率不足 / 模型打分低 / 后处理丢失），再决定后续优化方向
-2. **GNN 阈值/后处理调优**：GNN 效率已达 92.84%，但 fake_rate 79.48% 过高；尝试降低 edge-threshold 或加强 chi2 后处理，寻找效率-纯度最优工作点
-3. **排查 InteractionNet 回退**：70.6%→52% 可能是本次训练质量差或 balanced_sampling 副作用，单独重训一次验证
-4. **重新训练 Transformer（TrackFormer-Seed）**：现有 checkpoint 完全失效（99.7% fake），需从头设计针对 E320 低信噪比的训练流程
+**已确认结论：**
+- GNN fake_rate 结构性问题，阈值无法解决 → 放弃 GNN 作为优化方向
+- HGNN 初始化极敏感，不稳定 → 不作为主要方向
+- InteractionNet（77.15%/22.12%/F1=77.52%）和 Transformer（82.01%/11.66%，历史最优）是最值得投入的方向
+
+**待办：**
+1. **【可选】重提完整 benchmark**：`benchmark_a6000.sh` 改 `walltime=72:00:00` 后重提，获取 InteractionNet/EggNet/HGNN/Transformer 在 A6000 上的 deterministic 结果
+2. **【优先】失效案例诊断**：运行 `scripts/diagnose_failures.py`，拆解 InteractionNet/Transformer 效率损失三类根因（图覆盖率不足 / 模型打分低 / 后处理丢失）
+3. **TransformerEdgeClassifier 优化**：在诊断结论指导下，针对性改进（hard negative mining / 更多物理特征 / 更大模型）
 
 ---
 
