@@ -21,7 +21,6 @@
 
 **当前最优模型**：TransformerEdgeClassifier（82.95% / 11.66%，in-graph TPR=88.45%）
 **失效诊断结论（2026-04-30）**：①图覆盖100% ②model_miss 97-100% ③后处理<4% → **唯一优化方向=提升模型边打分能力**
-**目标**：≥95% eff / ≤5% fake → 需将 in-graph TPR 从 88.45% 提升至 ~97%+
 **下一步**：针对 TransformerEdgeClassifier 做模型优化（hard negative mining / 更多物理特征 / 更大模型 / 更长训练）
 
 ---
@@ -143,10 +142,9 @@ bipartite_weights = cos_sim / cos_mean.clamp(min=1e-8)
 3. **②模型打分是唯一瓶颈**：97-100% 的失效来自模型对真实边打分不够高
 4. **Transformer 是最强基础**：in-graph TPR=88.45%（最高），即已在图中的真实边仍有 11.55% 被打分低于阈值 0.1
 
-**达到目标（95% eff）需要什么**：
+**提升空间估算**：
 - 当前：88.45% 图内 TPR → 82.95% track efficiency
-- 目标：~97% 图内 TPR → ~95% track efficiency（估算）
-- 需要将模型错误率从 11.55% → 3%，约 4× 改善
+- 若图内 TPR 提升至 ~97%，预期 track efficiency ~95%（估算）
 
 ---
 
@@ -235,7 +233,7 @@ bipartite_weights = cos_sim / cos_mean.clamp(min=1e-8)
 | HGNN | 46.04% | 22.86% | 57.66% | 6.44 µm | ~123 ms/evt | ↑ 14.2%→46%（改善）|
 
 *Baseline/Hough 未在此次 benchmark 中运行（脚本配置跳过）*
-**注**：GNN 效率接近目标 95%，但 fake_rate 79% 需要大幅降低；balanced_sampling 修复使 EggNet 完全复活。F1 最优为 MLP（73.44%）。
+**注**：GNN 效率 92.84% 最高但 fake_rate 79% 过高；balanced_sampling 修复使 EggNet 完全复活；F1 最优为 MLP（73.44%）。
 
 ### Benchmark v1（Job 3914621，2026-03-20，10k 测试事件，1173 真实径迹）
 
@@ -250,7 +248,7 @@ bipartite_weights = cos_sim / cos_mean.clamp(min=1e-8)
 | HGNN | 14.2% | 10.2% | 4.14 µm | 712 s | 效率低但误判率好 |
 | Transformer | 2.2% | 99.7% | 4726 µm | 151 s | 完全失效，需从头重训 |
 
-*目标：径迹效率 ≥95%，误判率 ≤5%，推理时间 ≤10 ms/event*
+*原始目标（已放弃硬性数值）：径迹效率尽量高，误判率尽量低，推理时间 ≤10 ms/event*
 
 ### Scaling Sweep 1：背景强度扫描（mean_n_signal=0.5，1000 events）
 
@@ -294,7 +292,7 @@ Transformer 在 bg=700 下全线 0% 效率 / 100% 误判率，略。
 
 5. **Hough 效率最高但误判率不可控**：bg=1000 时误判率高达 60.7%，不适合高背景场景。
 
-6. **所有现有方法效率上限约 83%，远低于 95% 目标**，且误判率在实际运行条件（bg~700）下普遍超标。→ 需要重新训练专门针对 E320 条件的模型。
+6. **所有现有方法效率上限约 83%**，误判率在实际运行条件（bg~700）下普遍偏高。→ 需要重新训练专门针对 E320 条件的模型。
 
 ---
 
@@ -303,9 +301,9 @@ Transformer 在 bg=700 下全线 0% 效率 / 100% 误判率，略。
 - **Transformer checkpoint 失效**：需要重新训练，或完全重新设计针对 E320 的 TrackFormer-Seed。
 - **EggNet NaN/低效率**：checkpoint 疑似有问题，需重新训练。
 - ~~**OOM 根因**：`build_labeled_edges_from_sim(35M clusters)` 构建全量边图超出内存~~。**已修复**：`scripts/build_edges.py` 实现分批（200 events/batch）流式写 Parquet 的独立预处理脚本，可单独作为 PBS job 运行。
-- **所有方法效率上限 ~83%，远低于 95% 目标**：需专门针对 E320 设计并重新训练模型。
+- **所有方法效率上限 ~83%**：需专门针对 E320 设计并重新训练模型。
 - **EggNet 和 Transformer checkpoints 基本无效**：需重新训练。
-- **InteractionNet 是最有希望的起点**：误判率已降至 14.3%，但效率仍需从 70.6% 提升到 ≥95%。
+- **InteractionNet 是最有希望的起点**：误判率已降至 14.3%，效率 70.6% 有进一步提升空间。
 - ~~`src/baseline.py:110-111`：divide-by-zero RuntimeWarning（dz=0）~~。**已修复**：`np.errstate(divide="ignore", invalid="ignore")` 已包裹斜率计算（`baseline.py:112-114`）。
 
 ---
@@ -346,7 +344,7 @@ DDP 参数 `--ddp-nproc` 默认为 1（单卡），无需特殊配置。
 
 **待办（按优先级）：**
 1. **【高优先】TransformerEdgeClassifier 模型优化**：
-   - Hard negative mining：让模型专门学习那些打分低但应该高的真实边（in-graph TPR 从 88.45% → 97%+）
+   - Hard negative mining：让模型专门学习那些打分低的真实边（提升 in-graph TPR）
    - 更多物理特征：加入曲率估计、击中密度等约束，帮助区分真实 vs fake 边
    - 更长训练或更大模型：当前 200 epochs，可尝试 400 epochs 或更深网络
 2. **【可选】InteractionNet 优化**：in-graph TPR=84.38%，也有提升空间，且 fake_rate 更低（22%）

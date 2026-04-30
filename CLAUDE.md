@@ -378,7 +378,7 @@ cd ~/E320simulator && git worktree remove ~/research/<slug> --force
 
 ## 下一步研究方向（2026-04-01 更新）
 
-> **当前最优**：TransformerEdgeClassifier 82.01% / 11.66%，目标 ≥95% / ≤5%
+> **当前最优**：TransformerEdgeClassifier 82.95% / 11.66%（in-graph TPR=88.45%）
 >
 > **任务类型说明**：失效诊断和 DDP 修复适合 session 内直接做，**不适合套 auto-research loop**。
 > auto-research 以「提交 PBS 训练 job → 等结果 → 改模型」为循环单位，调试/分析类任务不匹配。
