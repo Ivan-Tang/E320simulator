@@ -4,6 +4,7 @@
 
 | 日期 | 做了什么 | 结果 | 关键文件 |
 |------|---------|------|---------|
+| 04-30 | Benchmark v6（A5000 gwn243，workers=4 并行，24h 完成全部 5 模型） | 结果与 v4 完全一致（deterministic 三次验证通过）；MLP 79.45%/31.72%，InteractionNet 77.15%/22.12%/F1=77.52%，HGNN 56.95%/20.48%；PBS 又落在 A5000，A6000 速度对比仍待测 | `logs/benchmark_a6000_run.log` |
 | 04-28 | Benchmark v5（A6000, 24h walltime 被杀） | MLP **79.5%/31.7%/F1=73.5%**（首个干净 MLP 结果）；GNN 78.3%/80.3%（与 v4 完全一致，deterministic 验证）；walltime 不足，InteractionNet+ 未跑完 | `logs/benchmark_a6000_run.log` |
 | 04-27 | Benchmark v4（A5000，deterministic+seed=42） + GNN 阈值扫描 | InteractionNet **77.15%/22.12%/F1=77.52%**；EggNet 71.61%/44%；HGNN 56.95%/20.48%；GNN 78.35%/80.31%（阈值无法解决 fake_rate，是结构性问题）；MLP SIGSEGV | `logs/benchmark_run.log`, `logs/threshold_sweep_gnn_run.log` |
 | 04-25 | HGNN deterministic v4 完成（Job 4158623） | **56.95%/20.48%/F1=66.37%**；v3 的 96.68% 是侥幸——HGNN 对初始化极敏感，三次结果：46%/57%/97%；已分析根因见下方 | `logs/train_hgnn_run.log` |
@@ -119,19 +120,35 @@ bipartite_weights = cos_sim / cos_mean.clamp(min=1e-8)
 
 ---
 
-### Benchmark v5（Job 4171289，2026-04-28，A6000/RTX6000Ada 49GB，24h walltime 限制）
+### Benchmark v6（Job 4175662，2026-04-28~30，gwn243 A5000，workers=4 并行）
 
-**目的**：在 A6000 上确认 MLP（v4 SIGSEGV）结果，并验证 deterministic 跨节点一致性。
+**目的**：完整运行所有 5 个 ML 模型，确认 deterministic 可重复性，同时尝试在 A6000 上跑（实际仍落在 A5000）。
+
+**结果（全部完成，与 v4 完全一致）：**
+
+| 方法 | 效率 | fake率 | F1 | 训练时间 |
+|------|------|--------|----|---------|
+| MLP | **79.45%** | **31.72%** | **73.44%** | 8.5h（30675s）|
+| GNN | 78.35% | 80.31% | 31.47% | 9.4h（33885s）|
+| **InteractionNet** | **77.15%** | **22.12%** | **77.52%** | 9.1h（32866s）|
+| EggNet | 71.61% | 44.00% | 62.85% | 10.2h（36768s）|
+| HGNN | 56.95% | 20.48% | 66.37% | 12.6h（45208s）|
+
+**workers=4 效果**：4 个模型同时并行跑（MLP/GNN/InteractionNet/EggNet 并行，HGNN 单独），总 wall time ≈ max(10.2h, 9.4h, 9.1h, 8.5h) + 12.6h ≈ 22.8h，实际 24h 完成全部。
+
+**结论**：3 次 benchmark（v4/v5/v6）结果完全一致，deterministic fix（seed=42 + use_deterministic_algorithms）在 A5000 上完全可重复。A6000 速度对比因 PBS 调度仍未测到。
+
+---
+
+### Benchmark v5（Job 4171289，2026-04-28，gwn243 A5000，24h walltime 限制）
 
 **结果（24h 内完成两个模型后被 PBS 杀死）：**
 
-| 方法 | 径迹效率 | 误判率 | F1 | 备注 |
-|------|----------|--------|-----|------|
-| MLP | **79.5%** | **31.7%** | **73.5%** | v4 SIGSEGV 后首个干净结果；与历史 v2/v3 完全一致 |
-| GNN | 78.3% | 80.3% | 31.4% | 与 v4（A5000）完全一致，deterministic 跨节点验证通过 |
+| 方法 | 效率 | fake率 | F1 | 备注 |
+|------|------|--------|----|------|
+| MLP | 79.5% | 31.7% | 73.5% | 首个干净 MLP 结果（v4 SIGSEGV 后）|
+| GNN | 78.3% | 80.3% | 31.4% | 与 v4 完全一致 |
 | InteractionNet+ | — | — | — | walltime=24h 不足，未启动 |
-
-**结论**：每个模型约 9-10h（A6000 单卡），5 个模型需 ≥50h。需重提 walltime=72h 版本。
 
 ---
 
@@ -296,7 +313,7 @@ DDP 参数 `--ddp-nproc` 默认为 1（单卡），无需特殊配置。
 - InteractionNet（77.15%/22.12%/F1=77.52%）和 Transformer（82.01%/11.66%，历史最优）是最值得投入的方向
 
 **待办：**
-1. **【可选】重提完整 benchmark**：`benchmark_a6000.sh` 改 `walltime=72:00:00` 后重提，获取 InteractionNet/EggNet/HGNN/Transformer 在 A6000 上的 deterministic 结果
+1. **【可选】A6000 速度测试**：需在 `benchmark_a6000.sh` 加 `#PBS -l gputype=RTX6000Ada`（或正确的 A6000 gputype 字符串）才能真正路由到 A6000 节点
 2. **【优先】失效案例诊断**：运行 `scripts/diagnose_failures.py`，拆解 InteractionNet/Transformer 效率损失三类根因（图覆盖率不足 / 模型打分低 / 后处理丢失）
 3. **TransformerEdgeClassifier 优化**：在诊断结论指导下，针对性改进（hard negative mining / 更多物理特征 / 更大模型）
 
