@@ -4,7 +4,7 @@
 
 | 日期 | 做了什么 | 结果 | 关键文件 |
 |------|---------|------|---------|
-| 04-30 | **背景/信号 Scaling Sweep 启动**（6 扫点，bg_per_layer=0/100/300/700/1200/2000，mean_n_signal=0.12 固定） | Job 4184288（bg0）+ 4184289（bg300）已提交运行；脚本 `scripts/run_scaling_full.py`，PBS 脚本 `subs/scaling_full_bg*.sh`；每批最多 2 个并行，CronCreate 跟进（5月2日10:17） | `scripts/run_scaling_full.py`, `subs/scaling_full_bg*.sh` |
+| 04-30 | **2D Scaling Sweep 启动**（Sweep A：固定 sig=0.12 扫 bg；Sweep B：固定 bg=700 扫 sig） | Sweep A：bg∈[0,100,300,700,1200,2000]，Job 4184288（bg0）+4184289（bg300）运行中；Sweep B：sig∈[0.05,0.12,0.30,0.50,1.00,2.00]，脚本已写好待提交；CronCreate 跟进 5月2日10:17 | `scripts/run_scaling_full.py`, `subs/scaling_full_bg*.sh`, `subs/scaling_full_sig*.sh` |
 | 04-30 | **失效诊断完成（Job 4183755，全模型）** | **①图覆盖100%（无需改kNN），③后处理<4%，②model_miss占97-100%失效** — 唯一优化方向是模型打分能力；Transformer in-graph TPR=88.45% 最高 | `outputs/diagnose/*.json` |
 | 04-30 | Benchmark v6（A5000 gwn243，workers=4 并行，24h 完成全部 5 模型） | 结果与 v4 完全一致（deterministic 三次验证通过）；MLP 79.45%/31.72%，InteractionNet 77.15%/22.12%/F1=77.52%，HGNN 56.95%/20.48%；PBS 又落在 A5000，A6000 速度对比仍待测 | `logs/benchmark_a6000_run.log` |
 | 04-28 | Benchmark v5（A6000, 24h walltime 被杀） | MLP **79.5%/31.7%/F1=73.5%**（首个干净 MLP 结果）；GNN 78.3%/80.3%（与 v4 完全一致，deterministic 验证）；walltime 不足，InteractionNet+ 未跑完 | `logs/benchmark_a6000_run.log` |
@@ -22,7 +22,18 @@
 
 **当前最优模型**：TransformerEdgeClassifier（82.95% / 11.66%，in-graph TPR=88.45%）
 **失效诊断结论（2026-04-30）**：①图覆盖100% ②model_miss 97-100% ③后处理<4% → **唯一优化方向=提升模型边打分能力**
-**下一步**：等待 Scaling Sweep 第一批（bg0/bg300，Job 4184288/4184289）完成；结果出来后依次提交 bg100/bg700、bg1200/bg2000
+**下一步（Scaling Sweep 提交计划）**：
+
+| 批次 | 扫点 | 状态 | 提交命令 |
+|------|------|------|---------|
+| A-1 | bg0, bg300 | ✅ 运行中（Job 4184288/4184289） | — |
+| A-2 | bg100, bg700 | 待 A-1 完成 | `qsub subs/scaling_full_bg100.sh && qsub subs/scaling_full_bg700.sh` |
+| A-3 | bg1200, bg2000 | 待 A-2 完成 | `qsub subs/scaling_full_bg1200.sh && qsub subs/scaling_full_bg2000.sh` |
+| B-1 | sig005, sig012 | 待 A 系列有空位 | `qsub subs/scaling_full_sig005.sh && qsub subs/scaling_full_sig012.sh` |
+| B-2 | sig030, sig050 | 待 B-1 完成 | `qsub subs/scaling_full_sig030.sh && qsub subs/scaling_full_sig050.sh` |
+| B-3 | sig100, sig200 | 待 B-2 完成 | `qsub subs/scaling_full_sig100.sh && qsub subs/scaling_full_sig200.sh` |
+
+注：`bg700_sig012` 与 `bg700_sig012`（Sweep B）是同一配置，Sweep B 的 sig012 结果可复用 Sweep A 的 bg700 结果（无需重跑）。
 
 ---
 
