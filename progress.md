@@ -4,6 +4,7 @@
 
 | 日期 | 做了什么 | 结果 | 关键文件 |
 |------|---------|------|---------|
+| 04-30 | **失效诊断完成（Job 4183755，全模型）** | **①图覆盖100%（无需改kNN），③后处理<4%，②model_miss占97-100%失效** — 唯一优化方向是模型打分能力；Transformer in-graph TPR=88.45% 最高 | `outputs/diagnose/*.json` |
 | 04-30 | Benchmark v6（A5000 gwn243，workers=4 并行，24h 完成全部 5 模型） | 结果与 v4 完全一致（deterministic 三次验证通过）；MLP 79.45%/31.72%，InteractionNet 77.15%/22.12%/F1=77.52%，HGNN 56.95%/20.48%；PBS 又落在 A5000，A6000 速度对比仍待测 | `logs/benchmark_a6000_run.log` |
 | 04-28 | Benchmark v5（A6000, 24h walltime 被杀） | MLP **79.5%/31.7%/F1=73.5%**（首个干净 MLP 结果）；GNN 78.3%/80.3%（与 v4 完全一致，deterministic 验证）；walltime 不足，InteractionNet+ 未跑完 | `logs/benchmark_a6000_run.log` |
 | 04-27 | Benchmark v4（A5000，deterministic+seed=42） + GNN 阈值扫描 | InteractionNet **77.15%/22.12%/F1=77.52%**；EggNet 71.61%/44%；HGNN 56.95%/20.48%；GNN 78.35%/80.31%（阈值无法解决 fake_rate，是结构性问题）；MLP SIGSEGV | `logs/benchmark_run.log`, `logs/threshold_sweep_gnn_run.log` |
@@ -18,12 +19,10 @@
 | 03-31 | 合并 feature/ddp → master | 7 文件冲突解决，86 测试通过，DDP 支持就绪 | `src/train.py`, `src/ddp.py` |
 | 03-22 | Auto-research Loop 7 完成 | TransformerEdgeClassifier **82.01% / 11.66%**，超越 InteractionNet 70.6% / 14.3% | checkpoint: `runs/loop5_pos_weight_fix/best_model.pt` |
 
-**当前最优模型（F1 受控）**：TransformerEdgeClassifier（82.01% / 11.66%，来自 auto-research）；在最新 benchmark 中 InteractionNet F1=77.52% 是次优
-**HGNN 结论**：初始化极敏感（三次：46%/57%/97%），不稳定，不作为主要方向
-**GNN 结论**：fake_rate 结构性问题（80%+），阈值扫描（0.01→0.85，1000 events）无效，fake_rate 仅从 89.5%→83.8%
-**可重复性结论**：deterministic fix 有效；GNN A5000 vs A6000 结果完全一致（78.3%/80.3%）
-**目标**：≥95% eff / ≤5% fake（F1≥80%）
-**下一步**：① 重提 benchmark_a6000.sh（改 walltime=72h）完成所有模型 ② 或直接聚焦 InteractionNet/Transformer 优化（诊断失效根因）
+**当前最优模型**：TransformerEdgeClassifier（82.95% / 11.66%，in-graph TPR=88.45%）
+**失效诊断结论（2026-04-30）**：①图覆盖100% ②model_miss 97-100% ③后处理<4% → **唯一优化方向=提升模型边打分能力**
+**目标**：≥95% eff / ≤5% fake → 需将 in-graph TPR 从 88.45% 提升至 ~97%+
+**下一步**：针对 TransformerEdgeClassifier 做模型优化（hard negative mining / 更多物理特征 / 更大模型 / 更长训练）
 
 ---
 
@@ -117,6 +116,37 @@ bipartite_weights = cos_sim / cos_mean.clamp(min=1e-8)
 **修复方向（如需探索）**：
 - 两阶段训练：先单独训练 InteractionGNN 阶段固定 embedding，再训练 hierarchical 部分
 - 或将 bipartite_weights 改为基于 layer_id 的固定均匀权重（去掉 cosine 动态计算），降低对 embedding 质量的依赖
+
+---
+
+### 失效诊断（Job 4183755，2026-04-30，gwn243 A5000，全模型，10k 测试事件）
+
+**目的**：拆解各模型效率损失的三类根因，确定优化方向。
+
+**结果：**
+
+| 模型 | 效率 | ①图构建缺失 | ②模型打分低 | ③后处理丢失 | 图内TPR |
+|------|------|------------|------------|------------|--------|
+| graph_only | — | 0 (0%) | — | — | — |
+| Transformer (t=0.1) | **82.95%** | 0 (0%) | 193 (96.5%) | 7 (3.5%) | **88.45%** |
+| InteractionNet (t=0.5) | 77.15% | 0 (0%) | 265 (98.9%) | 3 (1.1%) | 84.38% |
+| MLP (t=0.5) | 79.45% | 0 (0%) | 237 (98.3%) | 4 (1.7%) | 81.56% |
+| GNN (t=0.5) | 78.35% | 0 (0%) | 253 (99.6%) | 1 (0.4%) | 81.69% |
+| EggNet (t=0.5) | 71.61% | 0 (0%) | 333 (100%) | 0 (0%) | 74.1% |
+| HGNN (t=0.5) | 56.95% | 0 (0%) | 502 (99.4%) | 3 (0.6%) | 70.99% |
+
+所有模型边图覆盖率：**100%**（kNN 图包含全部真实邻层边）
+
+**关键结论：**
+1. **①图构建完美**：kNN 图 100% 覆盖所有真实边，无需改 k 或图构建策略
+2. **③后处理几乎无影响**：chi2/NMS 导致的失效 <4%，无需改后处理
+3. **②模型打分是唯一瓶颈**：97-100% 的失效来自模型对真实边打分不够高
+4. **Transformer 是最强基础**：in-graph TPR=88.45%（最高），即已在图中的真实边仍有 11.55% 被打分低于阈值 0.1
+
+**达到目标（95% eff）需要什么**：
+- 当前：88.45% 图内 TPR → 82.95% track efficiency
+- 目标：~97% 图内 TPR → ~95% track efficiency（估算）
+- 需要将模型错误率从 11.55% → 3%，约 4× 改善
 
 ---
 
@@ -312,10 +342,14 @@ DDP 参数 `--ddp-nproc` 默认为 1（单卡），无需特殊配置。
 - HGNN 初始化极敏感，不稳定 → 不作为主要方向
 - InteractionNet（77.15%/22.12%/F1=77.52%）和 Transformer（82.01%/11.66%，历史最优）是最值得投入的方向
 
-**待办：**
-1. **【可选】A6000 速度测试**：需在 `benchmark_a6000.sh` 加 `#PBS -l gputype=RTX6000Ada`（或正确的 A6000 gputype 字符串）才能真正路由到 A6000 节点
-2. **【优先】失效案例诊断**：运行 `scripts/diagnose_failures.py`，拆解 InteractionNet/Transformer 效率损失三类根因（图覆盖率不足 / 模型打分低 / 后处理丢失）
-3. **TransformerEdgeClassifier 优化**：在诊断结论指导下，针对性改进（hard negative mining / 更多物理特征 / 更大模型）
+**诊断已完成（2026-04-30）**：唯一优化方向为提升模型边打分能力（②model_miss 占 97-100%）。
+
+**待办（按优先级）：**
+1. **【高优先】TransformerEdgeClassifier 模型优化**：
+   - Hard negative mining：让模型专门学习那些打分低但应该高的真实边（in-graph TPR 从 88.45% → 97%+）
+   - 更多物理特征：加入曲率估计、击中密度等约束，帮助区分真实 vs fake 边
+   - 更长训练或更大模型：当前 200 epochs，可尝试 400 epochs 或更深网络
+2. **【可选】InteractionNet 优化**：in-graph TPR=84.38%，也有提升空间，且 fake_rate 更低（22%）
 
 ---
 
